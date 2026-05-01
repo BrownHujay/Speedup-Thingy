@@ -49,21 +49,25 @@ class ShortlistHead(nn.Module):
         max_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         width = candidates.shape[-1]
-        idx = torch.arange(width, device=candidates.device, dtype=torch.long)
-        positions = idx.view(1, 1, -1).expand_as(candidates)
-        pair_key = candidates.long() * (width + 1) + positions
-        _, pair_order = pair_key.sort(dim=-1, stable=True)
-        sorted_tokens = candidates.gather(-1, pair_order)
-        group_start = torch.ones_like(sorted_tokens, dtype=torch.bool)
-        group_start[..., 1:] = sorted_tokens[..., 1:] != sorted_tokens[..., :-1]
-        keep = torch.empty_like(group_start)
-        keep.scatter_(-1, pair_order, group_start)
-        duplicate_count = (~keep).float().sum()
-        rank = keep.long().cumsum(dim=-1) - 1
-        order = torch.where(keep, rank, width + idx.view(1, 1, -1))
-        sorted_idx = order.argsort(dim=-1, stable=True)
-        packed = candidates.gather(-1, sorted_idx)
-        return packed[..., :max_tokens].contiguous(), duplicate_count
+        flat = candidates.reshape(-1, width).long()
+        positions = torch.arange(width, device=candidates.device, dtype=torch.float32).view(1, -1)
+        first_pos = torch.full(
+            (flat.shape[0], self.vocab_size),
+            float(width + max_tokens),
+            dtype=torch.float32,
+            device=candidates.device,
+        )
+        first_pos.scatter_reduce_(
+            1,
+            flat,
+            positions.expand_as(flat),
+            reduce="amin",
+            include_self=True,
+        )
+        present = first_pos < width
+        duplicate_count = (width - present.sum(dim=-1)).float().sum()
+        _, shortlist = first_pos.topk(k=max_tokens, dim=-1, largest=False, sorted=True)
+        return shortlist.view(*candidates.shape[:-1], max_tokens).contiguous(), duplicate_count
 
     def build_shortlist(
         self,

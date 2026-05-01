@@ -29,6 +29,7 @@ class AuditEngine:
         self.recipe_audit_ema: torch.Tensor | None = None
         self.last_candidate_count = 0
         self.last_capped_fraction = 0.0
+        self.last_sample_mode = "bernoulli"
 
     def state_dict(self) -> dict[str, object]:
         return {
@@ -36,6 +37,7 @@ class AuditEngine:
             "recipe_audit_ema": self.recipe_audit_ema,
             "last_candidate_count": self.last_candidate_count,
             "last_capped_fraction": self.last_capped_fraction,
+            "last_sample_mode": self.last_sample_mode,
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
@@ -44,6 +46,7 @@ class AuditEngine:
         self.recipe_audit_ema = ema if isinstance(ema, torch.Tensor) else None
         self.last_candidate_count = int(state.get("last_candidate_count", 0))
         self.last_capped_fraction = float(state.get("last_capped_fraction", 0.0))
+        self.last_sample_mode = str(state.get("last_sample_mode", "bernoulli"))
 
     def _recipe_coverage_deficit(self, recipe_ids: torch.Tensor, recipe_count: int) -> torch.Tensor:
         if self.recipe_audit_ema is None or self.recipe_audit_ema.numel() != recipe_count:
@@ -82,10 +85,27 @@ class AuditEngine:
         )
         return p.clamp(self.config.audit_p_min, self.config.audit_p_max)
 
-    def sample_mask(self, p: torch.Tensor, seed: int) -> torch.Tensor:
+    def sample_mask_with_prob(self, p: torch.Tensor, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
         gen = torch.Generator(device=p.device)
         gen.manual_seed(seed)
+        fixed_count = self.config.audit_fixed_count_per_batch
+        if fixed_count is not None:
+            n = p.numel()
+            k = min(int(fixed_count), n)
+            mask = torch.zeros_like(p, dtype=torch.bool)
+            inclusion_p = torch.zeros_like(p)
+            self.last_sample_mode = "fixed_count"
+            self.last_candidate_count = k
+            self.last_capped_fraction = 0.0
+            if k > 0 and n > 0:
+                chosen = torch.randperm(n, device=p.device, generator=gen)[:k]
+                mask[chosen] = True
+                inclusion_p.fill_(float(k) / float(n))
+            return mask, inclusion_p
+
+        self.last_sample_mode = "bernoulli"
         mask = torch.bernoulli(p, generator=gen).bool()
+        inclusion_p = p.clone()
         self.last_candidate_count = int(mask.sum().detach().cpu())
         self.last_capped_fraction = 0.0
         if self.config.audit_cap is not None and int(mask.sum()) > self.config.audit_cap:
@@ -96,8 +116,12 @@ class AuditEngine:
             capped[chosen] = True
             dropped = selected.numel() - self.config.audit_cap
             self.last_capped_fraction = float(dropped / max(selected.numel(), 1))
+            inclusion_p = p * (float(self.config.audit_cap) / float(selected.numel()))
             mask = capped
-        return mask
+        return mask, inclusion_p
+
+    def sample_mask(self, p: torch.Tensor, seed: int) -> torch.Tensor:
+        return self.sample_mask_with_prob(p, seed=seed)[0]
 
     def run_exact_subset(
         self,
@@ -149,8 +173,8 @@ class AuditEngine:
     ) -> AuditResult:
         if hot.loss_per_sample is None:
             raise ValueError("hot output must include per-sample losses")
-        p_audit = self.compute_audit_prob(hot.meta)
-        mask = self.sample_mask(p_audit, seed=seed)
+        requested_p_audit = self.compute_audit_prob(hot.meta)
+        mask, p_audit = self.sample_mask_with_prob(requested_p_audit, seed=seed)
         corrected = hot.loss_per_sample.clone()
         macro_aux: dict[str, torch.Tensor] = {
             "hid": hot.loss_per_sample.new_zeros(()),
@@ -160,9 +184,16 @@ class AuditEngine:
         }
         metrics: dict[str, torch.Tensor] = {
             "audit_probability": p_audit.mean(),
+            "audit_requested_probability": requested_p_audit.mean(),
             "audit_rate": mask.float().mean(),
             "audit_candidate_count": p_audit.new_tensor(float(self.last_candidate_count)),
             "audit_capped_fraction": p_audit.new_tensor(self.last_capped_fraction),
+            "audit_fixed_count": p_audit.new_tensor(
+                float(self.config.audit_fixed_count_per_batch or 0)
+            ),
+            "audit_is_gradient_corrected": p_audit.new_tensor(
+                1.0 if self.config.audit_mode == "gradient_corrected" else 0.0
+            ),
         }
         if self.recipe_audit_ema is not None:
             ema = self.recipe_audit_ema.to(p_audit.device)
@@ -170,7 +201,8 @@ class AuditEngine:
             metrics["coverage_max_recipe_audit_ema"] = ema.max()
         exact = None
         if mask.any():
-            context = nullcontext() if self.config.audit_gradient_correction else torch.no_grad()
+            gradient_corrected = self.config.audit_mode == "gradient_corrected"
+            context = nullcontext() if gradient_corrected else torch.no_grad()
             with context:
                 exact = self.run_exact_subset(model, tokens, targets, mask, hot.meta)
             if exact.loss_per_sample is None:
@@ -182,9 +214,10 @@ class AuditEngine:
                     -self.config.audit_residual_clip,
                     self.config.audit_residual_clip,
                 )
-            if not self.config.audit_gradient_correction:
+            if not gradient_corrected:
                 residual = residual.detach()
-            corrected[mask] = hot_subset + residual / p_audit[mask]
+            if self.config.audit_mode != "distill_only":
+                corrected[mask] = hot_subset + residual / p_audit[mask].clamp_min(1e-12)
             hot_hidden = hot.meta.hidden[mask] if hot.meta.hidden is not None else None
             if hot_hidden is not None and exact.meta.hidden is not None:
                 losses = macro_distill_loss(

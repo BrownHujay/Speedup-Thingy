@@ -65,6 +65,10 @@ class TrainingConfig:
     loss_normalization: Literal["token_mean", "sample_sum"] = "token_mean"
     optimizer: Literal["adamw"] = "adamw"
     lr: float = 3e-4
+    lr_schedule: Literal["constant", "linear_decay_after"] = "constant"
+    lr_decay_start_tokens: int | None = None
+    lr_decay_end_tokens: int | None = None
+    lr_final_scale: float = 1.0
     weight_decay: float = 0.1
     batch_size: int = 4
     seq_len: int = 32
@@ -78,6 +82,8 @@ class TrainingConfig:
     audit_beta: float = 0.08
     audit_gamma: float = 0.08
     audit_cap: int | None = None
+    audit_fixed_count_per_batch: int | None = None
+    audit_mode: Literal["metric_only", "gradient_corrected", "distill_only"] = "gradient_corrected"
     audit_residual_clip: float | None = None
     audit_gradient_correction: bool = True
     target_speedup_vs_dense: float | None = None
@@ -107,8 +113,29 @@ class TrainingConfig:
     def __post_init__(self) -> None:
         if self.grad_accum_steps < 1:
             raise ValueError("grad_accum_steps must be >= 1")
+        if self.lr_final_scale <= 0:
+            raise ValueError("lr_final_scale must be positive")
+        if self.lr_schedule == "linear_decay_after":
+            if self.lr_decay_start_tokens is None or self.lr_decay_end_tokens is None:
+                raise ValueError("linear_decay_after requires lr_decay_start_tokens and lr_decay_end_tokens")
+            if self.lr_decay_end_tokens <= self.lr_decay_start_tokens:
+                raise ValueError("lr_decay_end_tokens must be greater than lr_decay_start_tokens")
         if self.audit_cap is not None and self.audit_cap < 0:
             raise ValueError("audit_cap must be non-negative when provided")
+        if self.audit_fixed_count_per_batch is not None:
+            if self.audit_fixed_count_per_batch < 0:
+                raise ValueError("audit_fixed_count_per_batch must be non-negative when provided")
+            if self.audit_fixed_count_per_batch > self.batch_size:
+                raise ValueError("audit_fixed_count_per_batch must be <= batch_size")
+        if (
+            self.audit_mode == "gradient_corrected"
+            and not self.audit_gradient_correction
+            and self.audit_p_max > 0
+        ):
+            raise ValueError(
+                "audit_mode='gradient_corrected' requires audit_gradient_correction=true "
+                "when audits are enabled"
+            )
         if self.target_speedup_vs_dense is not None and self.target_speedup_vs_dense <= 0:
             raise ValueError("target_speedup_vs_dense must be positive")
         if (
@@ -134,6 +161,7 @@ class OutputConfig:
 class DataConfig:
     dataset: Literal["tinystories", "wikitext103", "local", "synthetic"] = "synthetic"
     tokenizer: Literal["gpt2_bpe", "byte"] = "gpt2_bpe"
+    vocab_projection: Literal["filter", "modulo"] = "filter"
     cache_dir: str = ".cache/rte"
     local_text_path: str | None = None
     train_split: str = "train"

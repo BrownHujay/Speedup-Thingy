@@ -14,9 +14,12 @@ from recursive_training_engine.config import ExperimentConfig, ModelConfig, load
 from recursive_training_engine.ablations import build_ablation_configs
 from recursive_training_engine.data import load_token_streams
 from recursive_training_engine.kernels import optimized, reference
+from recursive_training_engine.macro import macro_distill_loss
 from recursive_training_engine.metrics import (
     build_fairness_report,
     dense_param_count,
+    hidden_cosine,
+    logit_kl,
     recursive_param_count,
     solve_banks_for_fairness,
 )
@@ -154,6 +157,116 @@ def cmd_benchmark_kernels(args: argparse.Namespace) -> None:
     _print_json(rows)
 
 
+def cmd_train_macro_teacher(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    fixed_depth = args.fixed_depth
+    fixed_recipe = args.fixed_recipe
+    if fixed_depth is None:
+        fixed_depth = config.training.fixed_depth
+    if fixed_recipe is None:
+        fixed_recipe = config.training.fixed_recipe
+    if fixed_depth is None or fixed_recipe is None:
+        raise SystemExit("train-macro-teacher requires fixed_recipe and fixed_depth")
+    config = dataclasses.replace(
+        config,
+        model=dataclasses.replace(config.model, topology="recursive"),
+        training=dataclasses.replace(
+            config.training,
+            mode="recursive_macro",
+            fixed_depth=fixed_depth,
+            fixed_recipe=fixed_recipe,
+            audit_p_min=0.0,
+            audit_p_max=0.0,
+        ),
+    )
+    set_seed(config.training.seed)
+    streams = load_token_streams(config.data, config.training, config.model.vocab_size)
+    device = default_device()
+    model = RecursiveModel(config.model, config.output).to(device)
+    for param in model.parameters():
+        param.requires_grad_(False)
+    for param in model.macro.parameters():
+        param.requires_grad_(True)
+    optimizer = torch.optim.AdamW(
+        model.macro.parameters(),
+        lr=args.lr if args.lr is not None else config.training.lr,
+        weight_decay=config.training.weight_decay,
+    )
+    batches = streams.train_batches(config.training)
+    rows = []
+    for step in range(1, args.steps + 1):
+        tokens, targets = next(batches)
+        tokens = tokens.to(device)
+        targets = targets.to(device)
+        with torch.no_grad():
+            exact = model.forward_exact(
+                tokens,
+                targets,
+                return_loss_per_sample=True,
+                fixed_recipe=fixed_recipe,
+                fixed_depth=fixed_depth,
+            )
+        hot = model.forward_macro(
+            tokens,
+            targets,
+            return_loss_per_sample=True,
+            fixed_recipe=fixed_recipe,
+            fixed_depth=fixed_depth,
+        )
+        if hot.meta.hidden is None or exact.meta.hidden is None:
+            raise RuntimeError("macro teacher requires hidden states")
+        losses = macro_distill_loss(
+            hot.meta.hidden,
+            exact.meta.hidden,
+            hot.meta.logits,
+            exact.meta.logits,
+            lambda_hid=args.lambda_hid,
+            lambda_cos=args.lambda_cos,
+            lambda_kl=args.lambda_kl,
+        )
+        loss = sum(losses.values())
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if config.training.grad_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.macro.parameters(), config.training.grad_clip_norm)
+        optimizer.step()
+        if step == 1 or step % args.log_every == 0 or step == args.steps:
+            with torch.no_grad():
+                cos = hidden_cosine(hot.meta.hidden, exact.meta.hidden).mean()
+                kl = (
+                    logit_kl(exact.meta.logits, hot.meta.logits).mean()
+                    if exact.meta.logits is not None and hot.meta.logits is not None
+                    else torch.zeros((), device=device)
+                )
+            row = {
+                "event": "macro_teacher",
+                "step": step,
+                "fixed_recipe": fixed_recipe,
+                "fixed_depth": fixed_depth,
+                "loss": float(loss.detach().float().cpu()),
+                "hidden_cosine": float(cos.detach().float().cpu()),
+                "logit_kl": float(kl.detach().float().cpu()),
+                **{
+                    f"macro_{key}": float(value.detach().float().cpu())
+                    for key, value in losses.items()
+                },
+            }
+            rows.append(row)
+            print(json.dumps(row, sort_keys=True), flush=True)
+    if args.save_checkpoint:
+        path = Path(args.save_checkpoint)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "config": config,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "rows": rows,
+            },
+            path,
+        )
+
+
 def cmd_run_ablations(args: argparse.Namespace) -> None:
     base = load_config(args.config)
     results = []
@@ -253,6 +366,19 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--config", required=True)
     bench.add_argument("--iters", type=int, default=10)
     bench.set_defaults(func=cmd_benchmark_kernels)
+
+    teacher = sub.add_parser("train-macro-teacher")
+    teacher.add_argument("--config", required=True)
+    teacher.add_argument("--steps", type=int, default=100)
+    teacher.add_argument("--fixed-recipe", type=int)
+    teacher.add_argument("--fixed-depth", type=int)
+    teacher.add_argument("--lr", type=float)
+    teacher.add_argument("--lambda-hid", type=float, default=1.0)
+    teacher.add_argument("--lambda-cos", type=float, default=1.0)
+    teacher.add_argument("--lambda-kl", type=float, default=0.05)
+    teacher.add_argument("--log-every", type=int, default=10)
+    teacher.add_argument("--save-checkpoint")
+    teacher.set_defaults(func=cmd_train_macro_teacher)
 
     ablate = sub.add_parser("run-ablations")
     ablate.add_argument("--config", required=True)

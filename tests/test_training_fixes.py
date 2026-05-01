@@ -99,6 +99,30 @@ def test_active_budget_is_enforced(tmp_path: Path) -> None:
         engine.close()
 
 
+def test_linear_lr_schedule_updates_by_tokens(tmp_path: Path) -> None:
+    cfg = _dense_cfg(tmp_path, batch_size=2, grad_accum_steps=1, run_name="lr-schedule")
+    tokens_per_step = cfg.training.batch_size * cfg.training.seq_len
+    cfg = dataclasses.replace(
+        cfg,
+        training=dataclasses.replace(
+            cfg.training,
+            lr=0.01,
+            lr_schedule="linear_decay_after",
+            lr_decay_start_tokens=0,
+            lr_decay_end_tokens=tokens_per_step,
+            lr_final_scale=0.25,
+        ),
+    )
+    engine = TrainEngine(cfg, device=torch.device("cpu"))
+    try:
+        first = engine.train_step(_batch(2, cfg.training.seq_len, cfg.model.vocab_size))
+        second = engine.train_step(_batch(2, cfg.training.seq_len, cfg.model.vocab_size, offset=3))
+        assert first.metrics["lr"] == pytest.approx(0.01)
+        assert second.metrics["lr"] == pytest.approx(0.0025)
+    finally:
+        engine.close()
+
+
 def test_checkpoint_resume_matches_continuous(tmp_path: Path) -> None:
     cfg = _dense_cfg(tmp_path, batch_size=2, grad_accum_steps=1, run_name="continuous")
     batch1 = _batch(2, cfg.training.seq_len, cfg.model.vocab_size)

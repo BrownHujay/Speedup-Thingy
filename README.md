@@ -25,13 +25,87 @@ Local Mac/CPU runs verify the PyTorch reference system. CUDA/Triton performance
 benchmarks are skipped unless a CUDA GPU and Triton are available. Any run using
 the PyTorch fallback reports that fallback mode in its manifest/backend status.
 
-## Current Local Results
+## Current Local Results And Audit Notes
 
-These are the current measured numbers from the local Apple MPS machine on
-April 30, 2026. They are useful for development sanity checks, not final CUDA
-claims. CUDA/Triton runs are still required before claiming GPU speedups.
+These are measured numbers from the local Apple MPS machine. They are useful
+for development sanity checks, not final CUDA claims. CUDA/Triton runs are still
+required before claiming GPU speedups. The local backend is currently
+`torch_reference_fallback`, so any speed result below is a PyTorch/MPS reference
+result, not a proof of the intended optimized engine.
 
-### No-Audit Hot-Path Training Speed
+Important: some historical runs used different token projections. Do not compare
+their NLLs as if they came from the same data stream.
+
+- `filter`: keep GPT-2 token IDs below the configured small vocab size. This
+  makes the local 2048-vocab proof stream easier and historically produced
+  lower NLLs.
+- `modulo`: map all GPT-2 token IDs into the configured small vocab by modulo.
+  This keeps the requested token count but changes the distribution and produced
+  higher NLLs.
+
+The current clean comparison uses a full 6M-token TinyStories/GPT-2 stream,
+batch size 128, sequence length 64, 5,005,312 train tokens per run, and 65,536
+eval tokens. Recursive rows use fixed semantic depth 4, one macro physical pass,
+and exact recurrent evaluation as the source-of-truth metric.
+
+### Clean 5M-Token Matrix
+
+Run artifact: `runs/clean_filter_vs_modulo_dense_vs_thingy_5m.jsonl`
+
+Labels in the artifact may include the old ad-hoc word `thingy`; future labels
+should use `recursive_macro_*`.
+
+#### Filter Lane
+
+Dataset fingerprint: `tinystories:gpt2_bpe:6000000`
+
+| Mode | Train tokens/sec | Speedup vs dense | Exact eval NLL/token | Hot eval NLL/token | Notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `dense_exact` | 21,246 | 1.00x | 3.411 | n/a | Dense baseline, LR 0.001 |
+| `recursive_macro` no audit | 77,225 | 3.63x | 4.012 | 3.158 | Fast, but exact/hot gap is large |
+| `recursive_macro` fixed audit 1/128 | 45,399 | 2.14x | 3.588 | 3.372 | Faster than dense, closer exact loss, still worse exact NLL |
+
+#### Modulo Lane
+
+Dataset fingerprint: `tinystories:gpt2_bpe_mod2048:6000000`
+
+| Mode | Train tokens/sec | Speedup vs dense | Exact eval NLL/token | Hot eval NLL/token | Notes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `dense_exact` | 18,617 | 1.00x | 4.085 | n/a | Dense baseline, LR 0.001 |
+| `recursive_macro` no audit | 68,004 | 3.65x | 4.518 | 4.245 | Fast, but exact/hot gap remains |
+| `recursive_macro` fixed audit 1/128 | 35,135 | 1.89x | 4.298 | 4.479 | Exact loss improves vs no-audit, still worse than dense |
+
+Current interpretation:
+
+- Raw macro training is locally faster than dense on MPS/reference.
+- Exact-path validation is still worse than dense.
+- Fixed gradient-corrected audit reduces exact-path damage, but does not yet
+  close the dense quality gap.
+- Hot-path NLL can look much better than exact-path NLL. Hot-path NLL is not the
+  proof metric.
+- The main model failure is exact/hot divergence: the macro/coda path can learn
+  a representation that decodes well on the hot path but does not match the
+  exact recurrent path.
+
+### Isolated Speed Diagnostic
+
+Run context: filtered TinyStories/GPT-2 stream, batch 128, sequence 64, no eval,
+20 warmup steps, 80 measured synchronized train steps.
+
+| Mode | Median train tokens/sec | Mean train tokens/sec | Notes |
+| --- | ---: | ---: | --- |
+| `dense_exact` | 14,462 | 14,712 | MPS speed was noisy in this session |
+| `recursive_macro` no audit | 103,076 | 97,511 | Raw hot path remains fast |
+| `recursive_macro` fixed audit 1/128 | 47,894 | 46,430 | Audit tax is substantial but still faster than dense in this diagnostic |
+
+This diagnostic confirms that the raw macro path was not globally nerfed. The
+speed numbers vary significantly on Apple MPS, especially across long sequential
+runs, so local speed should be treated as approximate.
+
+### Historical No-Audit Hot-Path Training Speed
+
+These numbers are kept for context only and should not be mixed with the clean
+matrix above.
 
 Config: `configs/medium_mac_real_speed.yaml`
 
@@ -62,7 +136,7 @@ The best local macro throughput in this probe was batch 128, which is now saved
 as `configs/medium_mac_real_hotpath.yaml`. Batch 256 still ran, but throughput
 fell off, so it is not the current default.
 
-### 1M-Token Loss Snapshot
+### Historical 1M-Token Loss Snapshot
 
 Config: `configs/medium_mac_real_1m.yaml`
 
@@ -84,19 +158,71 @@ fixed audited recursive macro run was stable and converging, ending at 3.601
 exact-path NLL/token and 3.353 hot-path NLL/token in 338 seconds, about 2,962
 tokens/sec since start.
 
-Current interpretation: the no-audit macro path is genuinely faster locally,
-especially versus the full recursive exact loop. The audited convergence path is
-now stable after the NaN fix, but this small Mac run does not yet show a
-time-to-quality win over dense exact. Larger CUDA/Triton runs, bigger vocabularies,
-and better audit/distillation scheduling are the next places to look for a real
-end-to-end training speedup.
+These historical 1M-token runs used older configs and should not be treated as
+current proof. They are useful for regression hunting only.
+
+## Recent Fixes For Auditability
+
+Recent local changes made after audit feedback:
+
+- `recursive_macro_shortlist` no longer computes full-vocab logits before the
+  shortlist branch. The shortlist path now runs coda hidden only and keeps
+  `meta.logits=None` for hot shortlist outputs.
+- Added a regression test that fails if the shortlist path calls the full logits
+  path.
+- Audit sampling now has explicit modes:
+  `metric_only`, `gradient_corrected`, and `distill_only`.
+- Fixed audit-cap correction math. When Bernoulli sampling is capped, the
+  correction now divides by the effective two-stage inclusion probability rather
+  than the original Bernoulli probability.
+- Added fixed-count audit sampling for exactly one audited sample per batch,
+  used by the current 1/128 audit configs.
+- Added `rte train-macro-teacher` for fixed-route macro endpoint distillation.
+- Added `benchmarks/speed_audit.py --proof`, which refuses to report speed proof
+  when the backend is using the reference fallback.
+
+## Known Problems / Audit Targets
+
+This repo is still a research harness, not a proven speed engine.
+
+Known model and system problems:
+
+- Exact/hot divergence remains the central model failure. No-audit macro can
+  produce attractive hot NLL while exact recurrent eval is much worse.
+- The router is still hard argmax for active recipe/depth execution. The
+  straight-through one-hot tensors exist, but the main execution path does not
+  yet use a differentiable mixture or policy-gradient training signal.
+- Macro operators are still weak relative to the intended compiled recurrence.
+  They need teacher pretraining against exact recurrent endpoints before being
+  trusted as the main training path.
+- Shortlist is now logically separated from full logits, but the local PyTorch
+  shortlist implementation is not fast on MPS. It is correctness scaffolding
+  until a fused CUDA/Triton shortlist kernel exists.
+- Optimized kernels are still mostly dispatch wrappers over PyTorch reference
+  implementations. The CUDA/Triton grouped kernels required for the real speed
+  engine are not implemented yet.
+- Active parameter-equivalent accounting exists, but the full budget ledger is
+  incomplete. Prelude, coda, output, optimizer bytes, audit amortization, and
+  kernel wall time all need to be reported together before any 500x claim.
+- Apple MPS timings are noisy and should not be used as final proof.
+
+Recommended next proof loop:
+
+1. Use fixed routing first: `fixed_recipe=1`, `fixed_depth=4`.
+2. Train exact recurrent teacher on the same stream.
+3. Run `rte train-macro-teacher` to train `Phi_4` against exact endpoints.
+4. Run macro LM training only after macro endpoint cosine/KL improves.
+5. Compare exact-path validation NLL only.
+6. Repeat for depth 8, then 16, before returning to learned routing.
+7. Do not report speed proof unless `benchmarks/speed_audit.py --proof` passes
+   on a non-reference CUDA/Triton backend.
 
 ## Current Status
 
 Proven locally:
 
 - no-audit macro hot-path training can run faster than the same-size dense
-  baseline on Apple MPS
+  baseline on Apple MPS/reference
 - exact replay audits are stable after the NaN fix
 - config validation, audit-cap sampling, gradient accumulation, active-budget
   assertions, run manifests, summaries, and checkpoint/resume are tested

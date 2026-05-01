@@ -63,11 +63,11 @@ def _load_texts(config: DataConfig) -> list[str]:
 
         if config.dataset == "tinystories":
             ds = load_dataset("roneneldan/TinyStories", split=config.train_split, streaming=True)
-            sample_count = max(512, min(20_000, config.max_tokens // 128 + 512))
+            sample_count = max(512, min(100_000, config.max_tokens // 96 + 2_048))
             return [str(x["text"]) for x in islice(ds, sample_count)]
         if config.dataset == "wikitext103":
             ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="train", streaming=True)
-            sample_count = max(1024, min(30_000, config.max_tokens // 96 + 1024))
+            sample_count = max(1024, min(100_000, config.max_tokens // 80 + 2_048))
             return [str(x["text"]) for x in islice(ds, sample_count)]
     except Exception:
         return [
@@ -94,7 +94,11 @@ def load_token_streams(config: DataConfig, training: TrainingConfig, vocab_size:
         )
     texts = _load_texts(config)
     tokens, tokenizer_name = _encode_with_gpt2_bpe(texts, Path(config.cache_dir))
-    tokens = tokens[tokens < vocab_size]
+    if config.vocab_projection == "modulo":
+        tokens = tokens.remainder(vocab_size)
+        tokenizer_name = f"{tokenizer_name}_mod{vocab_size}"
+    else:
+        tokens = tokens[tokens < vocab_size]
     if tokens.numel() < training.seq_len * 4:
         tokens = _synthetic_tokens(vocab_size, config.synthetic_tokens, training.seed)
         tokenizer_name = f"{tokenizer_name}+synthetic_fill"

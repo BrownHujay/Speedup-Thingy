@@ -64,6 +64,31 @@ def test_recursive_exact_matches_manual_loop_with_fixed_route() -> None:
     assert hidden.shape == h.shape
 
 
+def test_recursive_exact_subset_can_reuse_cached_prelude() -> None:
+    cfg = tiny_config("recursive_macro")
+    model = RecursiveModel(cfg.model, cfg.output)
+    tokens, targets = sample_batch(cfg)
+    hot = model.forward_macro(tokens, targets, return_loss_per_sample=True, return_states=True)
+    mask = torch.tensor([True, False])
+    replay = model.forward_exact_subset(
+        tokens,
+        targets,
+        mask,
+        reuse_router_decisions=hot.meta.router,
+        cached_h0=hot.meta.h0,
+        return_loss_per_sample=True,
+    )
+    fresh = model.forward_exact_subset(
+        tokens,
+        targets,
+        mask,
+        reuse_router_decisions=hot.meta.router,
+        return_loss_per_sample=True,
+    )
+    assert replay.loss_per_sample is not None and fresh.loss_per_sample is not None
+    assert torch.allclose(replay.loss_per_sample, fresh.loss_per_sample, atol=1e-5)
+
+
 def test_recursive_macro_returns_per_sample_loss() -> None:
     cfg = tiny_config("recursive_macro")
     model = RecursiveModel(cfg.model, cfg.output)
@@ -85,6 +110,28 @@ def test_shortlist_includes_targets() -> None:
         [torch.unique(row).numel() for row in shortlist.reshape(-1, shortlist.shape[-1])]
     )
     assert torch.equal(unique_counts, torch.full_like(unique_counts, shortlist.shape[-1]))
+
+
+def test_macro_shortlist_does_not_call_full_logits_path() -> None:
+    cfg = tiny_config("recursive_macro_shortlist")
+    model = RecursiveModel(cfg.model, cfg.output)
+    tokens, targets = sample_batch(cfg)
+
+    def forbidden_full_logits(_h: torch.Tensor):
+        raise AssertionError("shortlist path called full-vocab logits")
+
+    model._coda_logits = forbidden_full_logits
+    out = model.forward_macro(
+        tokens,
+        targets,
+        return_loss_per_sample=True,
+        shortlist=True,
+    )
+    assert out.loss_per_sample is not None
+    assert out.meta.logits is None
+    assert out.meta.shortlist is not None
+    assert out.logits is not None
+    assert out.logits.shape[-1] == cfg.output.shortlist_max_tokens
 
 
 def test_train_step_all_modes_cpu() -> None:

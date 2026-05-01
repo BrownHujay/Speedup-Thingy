@@ -88,6 +88,7 @@ class TrainEngine:
         self.logger = JsonlLogger(self.run_dir / "metrics.jsonl")
         self.global_step = 0
         self.global_micro_step = 0
+        self.tokens_seen = 0
         self.last_metrics: dict[str, Any] | None = None
 
     def _maybe_log(self, metrics: dict[str, Any]) -> None:
@@ -164,6 +165,28 @@ class TrainEngine:
             self.global_step += 1
         return should_step
 
+    def _lr_scale(self) -> float:
+        tr = self.config.training
+        if tr.lr_schedule == "constant":
+            return 1.0
+        if tr.lr_schedule == "linear_decay_after":
+            assert tr.lr_decay_start_tokens is not None and tr.lr_decay_end_tokens is not None
+            if self.tokens_seen <= tr.lr_decay_start_tokens:
+                return 1.0
+            if self.tokens_seen >= tr.lr_decay_end_tokens:
+                return tr.lr_final_scale
+            progress = (self.tokens_seen - tr.lr_decay_start_tokens) / (
+                tr.lr_decay_end_tokens - tr.lr_decay_start_tokens
+            )
+            return 1.0 + progress * (tr.lr_final_scale - 1.0)
+        raise ValueError(tr.lr_schedule)
+
+    def _apply_lr_schedule(self) -> float:
+        lr = self.config.training.lr * self._lr_scale()
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+        return lr
+
     def _accum_metrics(self, tokens: torch.Tensor, optimizer_step: bool) -> dict[str, Any]:
         tr = self.config.training
         return {
@@ -213,6 +236,7 @@ class TrainEngine:
         if self.dense_model is None:
             raise ValueError("dense model is not available")
         tokens, targets = self._move_batch(batch)
+        current_lr = self._apply_lr_schedule()
         with WallTimer() as timer:
             with self._autocast():
                 out = self.dense_model(tokens, targets, return_loss_per_sample=True)
@@ -227,8 +251,11 @@ class TrainEngine:
             "tokens_per_sec": tokens.numel() / max(timer.elapsed, 1e-9),
             "peak_vram": maybe_peak_memory(self.device),
             "stored_params": dense_param_count(self.config.model),
+            "tokens_seen": self.tokens_seen,
+            "lr": current_lr,
             **self._accum_metrics(tokens, stepped),
         }
+        self.tokens_seen += int(tokens.numel())
         self._maybe_log(metrics)
         return TrainStepResult(loss=loss, model_output=out, metrics=metrics)
 
@@ -237,6 +264,7 @@ class TrainEngine:
             raise ValueError("recursive model is not available")
         tokens, targets = self._move_batch(batch)
         tr = self.config.training
+        current_lr = self._apply_lr_schedule()
         with WallTimer() as timer:
             with self._autocast():
                 out = self.recursive_model.forward_exact(
@@ -270,11 +298,14 @@ class TrainEngine:
             "tokens_per_sec": tokens.numel() / max(timer.elapsed, 1e-9),
             "peak_vram": maybe_peak_memory(self.device),
             "stored_params": recursive_param_count(self.config.model),
+            "tokens_seen": self.tokens_seen,
+            "lr": current_lr,
             "active_touches_per_token": out.meta.active_touches.mean() if out.meta.active_touches is not None else 0.0,
             "avg_depth": out.meta.depths.float().mean() if out.meta.depths is not None else 0.0,
             **self._accum_metrics(tokens, stepped),
             **{f"aux_{k}": v for k, v in aux.items()},
         }
+        self.tokens_seen += int(tokens.numel())
         self._maybe_log(metrics)
         return TrainStepResult(loss=loss, model_output=out, metrics=metrics)
 
@@ -295,6 +326,7 @@ class TrainEngine:
         tokens, targets = self._move_batch(batch)
         tr = self.config.training
         mode = "recursive_macro_shortlist" if shortlist else "recursive_macro"
+        current_lr = self._apply_lr_schedule()
         with WallTimer() as timer:
             with self._autocast():
                 hot = self.recursive_model.forward_macro(
@@ -349,6 +381,8 @@ class TrainEngine:
             "tokens_per_sec": tokens.numel() / max(timer.elapsed, 1e-9),
             "peak_vram": maybe_peak_memory(self.device),
             "stored_params": recursive_param_count(self.config.model),
+            "tokens_seen": self.tokens_seen,
+            "lr": current_lr,
             "active_touches_per_token": hot.meta.active_touches.mean() if hot.meta.active_touches is not None else 0.0,
             "avg_depth": hot.meta.depths.float().mean() if hot.meta.depths is not None else 0.0,
             "physical_passes": hot.meta.macro_trace.physical_passes.mean() if hot.meta.macro_trace is not None else 0.0,
@@ -361,6 +395,7 @@ class TrainEngine:
             **{f"macro_{k}": v for k, v in audit.macro_aux.items()},
             **{f"aux_{k}": v for k, v in aux_router.items()},
         }
+        self.tokens_seen += int(tokens.numel())
         self._maybe_log(metrics)
         return TrainStepResult(loss=loss, model_output=hot, metrics=metrics, audit=audit)
 
@@ -384,6 +419,7 @@ class TrainEngine:
             "optimizer": self.optimizer.state_dict(),
             "global_step": self.global_step,
             "global_micro_step": self.global_micro_step,
+            "tokens_seen": self.tokens_seen,
             "audit": self.audit_engine.state_dict(),
             "data_cursor": data_cursor,
             "torch_rng_state": torch.get_rng_state(),
@@ -402,6 +438,7 @@ class TrainEngine:
         self.optimizer.load_state_dict(payload["optimizer"])
         self.global_step = int(payload.get("global_step", 0))
         self.global_micro_step = int(payload.get("global_micro_step", 0))
+        self.tokens_seen = int(payload.get("tokens_seen", 0))
         self.audit_engine.load_state_dict(payload.get("audit", {}))
         if "torch_rng_state" in payload:
             torch.set_rng_state(payload["torch_rng_state"].detach().cpu())

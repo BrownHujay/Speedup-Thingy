@@ -49,6 +49,53 @@ def test_audit_cap_random_subsample_is_position_balanced() -> None:
     assert torch.allclose(counts.mean(), torch.tensor(100.0), atol=10.0)
 
 
+def test_audit_cap_reports_two_stage_inclusion_probability() -> None:
+    cfg = _recursive_cfg(audit_p_min=1.0, audit_p_max=1.0, audit_cap=2)
+    audit = AuditEngine(cfg.training)
+    p = torch.ones(8)
+    mask, inclusion_p = audit.sample_mask_with_prob(p, seed=123)
+    assert int(mask.sum()) == 2
+    assert torch.allclose(inclusion_p[mask], torch.full((2,), 0.25))
+    assert audit.last_capped_fraction == 0.75
+
+
+def test_fixed_count_audit_sampler_has_exact_count_and_correct_probability() -> None:
+    cfg = _recursive_cfg(
+        batch_size=8,
+        audit_p_min=0.125,
+        audit_p_max=0.125,
+        audit_cap=None,
+        audit_fixed_count_per_batch=1,
+    )
+    audit = AuditEngine(cfg.training)
+    p = torch.full((8,), 0.125)
+    counts = torch.zeros_like(p)
+    for seed in range(800):
+        mask, inclusion_p = audit.sample_mask_with_prob(p, seed=seed)
+        assert int(mask.sum()) == 1
+        assert torch.allclose(inclusion_p, torch.full_like(p, 0.125))
+        counts += mask.float()
+    assert counts.max() - counts.min() < 45
+    assert torch.allclose(counts.mean(), torch.tensor(100.0), atol=1e-6)
+
+
+def test_distill_only_audit_keeps_hot_loss_value() -> None:
+    cfg = _recursive_cfg(
+        audit_p_min=1.0,
+        audit_p_max=1.0,
+        audit_mode="distill_only",
+        audit_gradient_correction=False,
+    )
+    model = RecursiveModel(cfg.model, cfg.output)
+    tokens, targets = _batch(cfg)
+    hot = model.forward_macro(tokens, targets, return_loss_per_sample=True, return_states=True)
+    assert hot.loss_per_sample is not None
+    audit = AuditEngine(cfg.training)
+    result = audit.correction(model, tokens, targets, hot, seed=3)
+    assert torch.allclose(result.corrected_loss_per_sample, hot.loss_per_sample)
+    assert result.metrics["audit_is_gradient_corrected"].item() == 0.0
+
+
 def test_coverage_deficit_increases_audit_probability() -> None:
     cfg = _recursive_cfg(
         audit_p_min=0.1,

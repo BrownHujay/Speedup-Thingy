@@ -101,6 +101,7 @@ class RecursiveModel(nn.Module):
             self.lm_head = None
         self.shortlist_head = ShortlistHead(config.d_model, config.vocab_size, self.output_config)
         self._prelude_fast = None
+        self._coda_hidden_fast = None
         self._coda_logits_fast = None
 
     @property
@@ -111,6 +112,7 @@ class RecursiveModel(nn.Module):
         if not hasattr(torch, "compile"):
             return
         self._prelude_fast = torch.compile(self._prelude_impl, mode=mode)
+        self._coda_hidden_fast = torch.compile(self._coda_hidden_impl, mode=mode)
         self._coda_logits_fast = torch.compile(self._coda_logits_impl, mode=mode)
 
     def _prelude_impl(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -134,10 +136,18 @@ class RecursiveModel(nn.Module):
         return self.router(h0, fixed_recipe=fixed_recipe, fixed_depth=fixed_depth)
 
     def _coda_logits_impl(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        z = self.coda(h)
-        hidden = self.final_norm(z)
+        hidden = self._coda_hidden_impl(h)
         logits = hidden @ self.vocab_weight.t()
         return hidden, logits
+
+    def _coda_hidden_impl(self, h: torch.Tensor) -> torch.Tensor:
+        z = self.coda(h)
+        return self.final_norm(z)
+
+    def _coda_hidden(self, h: torch.Tensor) -> torch.Tensor:
+        if self._coda_hidden_fast is not None:
+            return self._coda_hidden_fast(h)
+        return self._coda_hidden_impl(h)
 
     def _coda_logits(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self._coda_logits_fast is not None:
@@ -156,6 +166,27 @@ class RecursiveModel(nn.Module):
         fixed_depth: int | None = None,
     ) -> ModelOutput:
         h0 = self._prelude(tokens)
+        return self.forward_exact_from_h0(
+            h0,
+            targets,
+            return_states=return_states,
+            return_loss_per_sample=return_loss_per_sample,
+            router_decisions=router_decisions,
+            fixed_recipe=fixed_recipe,
+            fixed_depth=fixed_depth,
+        )
+
+    def forward_exact_from_h0(
+        self,
+        h0: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        return_states: bool = False,
+        return_loss_per_sample: bool = False,
+        *,
+        router_decisions: RouterOutput | None = None,
+        fixed_recipe: int | None = None,
+        fixed_depth: int | None = None,
+    ) -> ModelOutput:
         route = self._route(
             h0,
             fixed_recipe=fixed_recipe,
@@ -195,6 +226,7 @@ class RecursiveModel(nn.Module):
         audit_mask: torch.Tensor,
         *,
         reuse_router_decisions: RouterOutput,
+        cached_h0: torch.Tensor | None = None,
         return_states: bool = True,
         return_loss_per_sample: bool = True,
     ) -> ModelOutput:
@@ -218,6 +250,14 @@ class RecursiveModel(nn.Module):
             depth_entropy=reuse_router_decisions.depth_entropy[audit_mask],
             expected_depth=reuse_router_decisions.expected_depth[audit_mask],
         )
+        if cached_h0 is not None:
+            return self.forward_exact_from_h0(
+                cached_h0[audit_mask],
+                subset_targets,
+                return_states=return_states,
+                return_loss_per_sample=return_loss_per_sample,
+                router_decisions=subset_route,
+            )
         return self.forward_exact(
             subset_tokens,
             subset_targets,
@@ -241,14 +281,16 @@ class RecursiveModel(nn.Module):
         h0 = self._prelude(tokens)
         route = self.router(h0, fixed_recipe=fixed_recipe, fixed_depth=fixed_depth)
         h, trace = self.macro(h0, h0, route.recipe_id, route.depth, return_states=return_states)
-        hidden, full_logits = self._coda_logits(h)
         shortlist_result = None
-        logits = full_logits
         if shortlist and targets is not None:
+            hidden = self._coda_hidden(h)
+            full_logits = None
             shortlist_result = self.shortlist_head.loss(hidden, targets, self.vocab_weight, seed=seed)
             loss_per_sample = shortlist_result.loss_per_sample
             logits = shortlist_result.logits
         else:
+            hidden, full_logits = self._coda_logits(h)
+            logits = full_logits
             loss_per_sample = lm_loss_per_sample(full_logits, targets) if targets is not None else None
         loss = loss_per_sample.mean() if loss_per_sample is not None else None
         if not return_loss_per_sample:

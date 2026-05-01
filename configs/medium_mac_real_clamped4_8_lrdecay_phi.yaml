@@ -1,0 +1,78 @@
+run_name: medium_mac_real_clamped4_8_lrdecay_phi
+output_dir: runs
+model:
+  topology: recursive
+  vocab_size: 2048
+  d_model: 64
+  n_heads: 8
+  d_ff: 256
+  n_dense_layers: 11
+  n_prelude: 1
+  n_coda: 1
+  t_max: 8
+  depth_choices: [4, 8]
+  attn_banks: 1
+  ffn_banks: 2
+  head_groups: 8
+  ffn_groups: 16
+  active_head_groups: 2
+  active_ffn_groups: 2
+  recipe_count: 16
+  tie_embeddings: true
+  use_rope: true
+  use_recursive_input_skip: true
+  fairness_tolerance: 0.01
+  macro_rank: 16
+  macro_update_scale: 0.02
+  macro_decomposition: direct
+  router_hidden: 64
+training:
+  mode: recursive_macro
+  optimizer: adamw
+  lr: 0.002
+  lr_schedule: linear_decay_after
+  lr_decay_start_tokens: 2000000
+  lr_decay_end_tokens: 5000000
+  lr_final_scale: 0.6
+  weight_decay: 0.1
+  batch_size: 128
+  seq_len: 64
+  grad_accum_steps: 1
+  grad_clip_norm: 1.0
+  seed: 1337
+  precision: fp32
+  compile_model: false
+  compile_mode: reduce-overhead
+  fused_optimizer: false
+  foreach_optimizer: false
+  allow_tf32: false
+  strict_cuda: false
+  require_triton: false
+  require_flash_attention: false
+  audit_p_min: 0.0078125
+  audit_p_max: 0.0078125
+  audit_alpha: 0.0
+  audit_beta: 0.0
+  audit_gamma: 0.0
+  audit_cap:
+  audit_fixed_count_per_batch: 1
+  audit_gradient_correction: true
+  audit_residual_clip:
+  lambda_hid: 0.05
+  lambda_cos: 0.05
+  lambda_kl: 0.005
+  lambda_cons: 0.02
+  log_every: 10
+output:
+  mode: full
+  num_clusters: 128
+  shortlist_top_clusters: 2
+  shortlist_max_tokens: 128
+  hard_negatives: 32
+  random_negatives: 32
+data:
+  dataset: tinystories
+  tokenizer: gpt2_bpe
+  vocab_projection: modulo
+  max_tokens: 6000000
+  eval_tokens: 200000
