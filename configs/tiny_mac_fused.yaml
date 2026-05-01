@@ -1,0 +1,65 @@
+run_name: tiny_mac_fused
+output_dir: runs
+model:
+  topology: recursive
+  vocab_size: 128
+  d_model: 16
+  n_heads: 4
+  d_ff: 64
+  n_dense_layers: 5
+  n_prelude: 1
+  n_coda: 1
+  t_max: 4
+  depth_choices: [1, 2, 4]
+  attn_banks: 1
+  ffn_banks: 3
+  head_groups: 4
+  ffn_groups: 4
+  active_head_groups: 1
+  active_ffn_groups: 1
+  recipe_count: 4
+  tie_embeddings: true
+  use_rope: true
+  use_recursive_input_skip: true
+  fairness_tolerance: 0.01
+  macro_rank: 2
+  router_hidden: 16
+training:
+  mode: recursive_macro_shortlist
+  optimizer: adamw
+  lr: 0.0005
+  weight_decay: 0.01
+  batch_size: 4
+  seq_len: 24
+  grad_accum_steps: 1
+  seed: 1337
+  precision: fp32
+  compile_model: false
+  compile_mode: reduce-overhead
+  fused_optimizer: false
+  foreach_optimizer: false
+  allow_tf32: false
+  strict_cuda: false
+  require_triton: false
+  require_flash_attention: false
+  audit_p_min: 0.01
+  audit_p_max: 0.05
+  audit_cap: 1
+  lambda_depth: 0.0001
+  lambda_load: 0.01
+  lambda_cover: 0.01
+  lambda_hid: 0.01
+  lambda_cos: 0.01
+  lambda_kl: 0.01
+  lambda_cons: 0.001
+output:
+  mode: shortlist
+  num_clusters: 8
+  shortlist_top_clusters: 2
+  shortlist_max_tokens: 16
+  hard_negatives: 4
+  random_negatives: 4
+data:
+  dataset: synthetic
+  tokenizer: gpt2_bpe
+  synthetic_tokens: 8192

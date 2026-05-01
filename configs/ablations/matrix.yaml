@@ -1,0 +1,27 @@
+topology:
+  - name: dense_baseline
+    mode: dense_exact
+  - name: recursive_exact_dense_fallback
+    mode: recursive_exact
+    fixed_recipe: 0
+  - name: recursive_exact_sparse
+    mode: recursive_exact
+  - name: recursive_macro_sparse
+    mode: recursive_macro
+  - name: recursive_macro_shortlist
+    mode: recursive_macro_shortlist
+routing:
+  - fixed_recipe
+  - routed_recipe
+  - fixed_depth
+  - routed_depth
+  - dense_fallback_recipe_only
+macro:
+  - exact_recurrence_only
+  - strides_1_2_4
+  - strides_1_2_4_8_16
+  - full_stride_set
+output:
+  - exact_full_vocab
+  - shortlist_without_audit_correction
+  - shortlist_with_audit_correction

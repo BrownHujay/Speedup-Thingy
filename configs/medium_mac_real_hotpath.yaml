@@ -1,0 +1,64 @@
+run_name: medium_mac_real_hotpath
+output_dir: runs
+model:
+  topology: recursive
+  vocab_size: 2048
+  d_model: 64
+  n_heads: 8
+  d_ff: 256
+  n_dense_layers: 11
+  n_prelude: 1
+  n_coda: 1
+  t_max: 64
+  depth_choices: [1, 2, 4, 8, 16, 32, 64]
+  attn_banks: 1
+  ffn_banks: 2
+  head_groups: 8
+  ffn_groups: 16
+  active_head_groups: 2
+  active_ffn_groups: 2
+  recipe_count: 16
+  tie_embeddings: true
+  use_rope: true
+  use_recursive_input_skip: true
+  fairness_tolerance: 0.01
+  macro_rank: 16
+  macro_update_scale: 0.02
+  router_hidden: 64
+training:
+  mode: recursive_macro
+  optimizer: adamw
+  lr: 0.0003
+  weight_decay: 0.1
+  batch_size: 128
+  seq_len: 64
+  grad_accum_steps: 1
+  grad_clip_norm: 1.0
+  seed: 1337
+  precision: fp32
+  compile_model: false
+  compile_mode: reduce-overhead
+  fused_optimizer: false
+  foreach_optimizer: false
+  allow_tf32: false
+  strict_cuda: false
+  require_triton: false
+  require_flash_attention: false
+  audit_p_min: 0.0
+  audit_p_max: 0.0
+  audit_cap: 0
+  audit_gradient_correction: false
+  lambda_cons: 0.0
+  log_every: 10
+output:
+  mode: full
+  num_clusters: 128
+  shortlist_top_clusters: 2
+  shortlist_max_tokens: 128
+  hard_negatives: 32
+  random_negatives: 32
+data:
+  dataset: tinystories
+  tokenizer: gpt2_bpe
+  max_tokens: 100000
+  eval_tokens: 20000

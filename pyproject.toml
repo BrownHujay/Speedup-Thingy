@@ -1,0 +1,35 @@
+[project]
+name = "recursive-training-engine"
+version = "0.1.0"
+description = "Dense Transformer baseline plus recursive sparse macro training testbed."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "torch>=2.5",
+  "numpy>=1.26",
+  "pyyaml>=6.0",
+  "tokenizers>=0.21",
+  "datasets>=3.0",
+]
+
+[project.optional-dependencies]
+cuda = ["triton>=3.0"]
+dev = ["pytest>=8.0", "ruff>=0.8"]
+
+[project.scripts]
+rte = "recursive_training_engine.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/recursive_training_engine"]

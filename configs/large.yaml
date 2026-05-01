@@ -1,0 +1,58 @@
+run_name: large
+output_dir: runs
+model:
+  topology: recursive
+  vocab_size: 8192
+  d_model: 128
+  n_heads: 8
+  d_ff: 512
+  n_dense_layers: 18
+  n_prelude: 1
+  n_coda: 1
+  t_max: 64
+  depth_choices: [1, 2, 4, 8, 16, 32, 64]
+  attn_banks: 1
+  ffn_banks: 2
+  head_groups: 8
+  ffn_groups: 16
+  active_head_groups: 2
+  active_ffn_groups: 2
+  recipe_count: 32
+  tie_embeddings: true
+  use_rope: true
+  use_recursive_input_skip: true
+  fairness_tolerance: 0.01
+  macro_rank: 32
+  router_hidden: 128
+training:
+  mode: recursive_macro_shortlist
+  optimizer: adamw
+  lr: 0.0002
+  weight_decay: 0.1
+  batch_size: 16
+  seq_len: 128
+  grad_accum_steps: 1
+  seed: 1337
+  precision: bf16
+  compile_model: true
+  compile_mode: max-autotune
+  fused_optimizer: true
+  foreach_optimizer: true
+  allow_tf32: true
+  strict_cuda: true
+  require_triton: false
+  require_flash_attention: true
+  audit_p_min: 0.01
+  audit_p_max: 0.25
+output:
+  mode: shortlist
+  num_clusters: 256
+  shortlist_top_clusters: 2
+  shortlist_max_tokens: 256
+  hard_negatives: 64
+  random_negatives: 64
+data:
+  dataset: tinystories
+  tokenizer: gpt2_bpe
+  max_tokens: 5000000
+  eval_tokens: 100000
