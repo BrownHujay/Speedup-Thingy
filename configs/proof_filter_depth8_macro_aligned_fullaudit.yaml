@@ -1,0 +1,77 @@
+run_name: proof_filter_depth8_macro_aligned_fullaudit
+output_dir: runs
+model:
+  topology: recursive
+  vocab_size: 2048
+  d_model: 64
+  n_heads: 8
+  d_ff: 256
+  n_dense_layers: 11
+  n_prelude: 1
+  n_coda: 1
+  t_max: 8
+  depth_choices: [1, 2, 4, 8]
+  attn_banks: 1
+  ffn_banks: 2
+  head_groups: 8
+  ffn_groups: 16
+  active_head_groups: 2
+  active_ffn_groups: 2
+  recipe_count: 16
+  tie_embeddings: true
+  use_rope: true
+  use_recursive_input_skip: true
+  fairness_tolerance: 0.01
+  macro_rank: 32
+  macro_hidden_mult: 2
+  macro_use_gated_update: true
+  macro_update_scale: 0.05
+  macro_update_scale_init: 0.1
+  macro_include_delta_to_h0: true
+  macro_use_depth_embedding: true
+  macro_decomposition: direct
+  router_hidden: 64
+training:
+  mode: recursive_macro_lm_aligned
+  lr: 0.001
+  lr_base: 0.001
+  lr_macro: 0.003
+  lr_coda: 0.0003
+  lr_output: 0.0003
+  lr_router: 0.0
+  weight_decay: 0.1
+  batch_size: 128
+  seq_len: 64
+  grad_clip_norm: 1.0
+  seed: 1234
+  audit_p_min: 1.0
+  audit_p_max: 1.0
+  audit_alpha: 0.0
+  audit_beta: 0.0
+  audit_gamma: 0.0
+  audit_mode: gradient_corrected
+  audit_gradient_correction: true
+  lambda_hidden_mse: 2.0
+  lambda_hidden_cosine: 1.0
+  lambda_logit_kl: 0.25
+  lambda_norm: 0.05
+  distill_temperature: 2.0
+  fixed_recipe: 1
+  fixed_depth: 8
+  disable_router_aux: true
+  debug_force_full_output: true
+  coda_warmup_steps: 200
+  log_every: 10
+  fused_optimizer: false
+  foreach_optimizer: false
+  require_flash_attention: false
+output:
+  mode: full
+data:
+  dataset: tinystories
+  tokenizer: gpt2_bpe
+  vocab_projection: filter
+  projection_lane: filter
+  train_tokens: 6000000
+  eval_tokens: 65536
+  seed: 1234

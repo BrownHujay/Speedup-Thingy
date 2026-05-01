@@ -20,6 +20,7 @@ class ModelMeta:
     recipe_ids: torch.Tensor | None = None
     depths: torch.Tensor | None = None
     h0: torch.Tensor | None = None
+    recurrent_hidden: torch.Tensor | None = None
     hidden: torch.Tensor | None = None
     logits: torch.Tensor | None = None
     states: dict[int, torch.Tensor] | None = None
@@ -212,6 +213,7 @@ class RecursiveModel(nn.Module):
             recipe_ids=route.recipe_id,
             depths=route.depth,
             h0=h0,
+            recurrent_hidden=h,
             hidden=hidden,
             logits=logits,
             states=states if return_states else None,
@@ -300,6 +302,7 @@ class RecursiveModel(nn.Module):
             recipe_ids=route.recipe_id,
             depths=route.depth,
             h0=h0,
+            recurrent_hidden=h,
             hidden=hidden,
             logits=full_logits,
             states=trace.states if return_states else None,

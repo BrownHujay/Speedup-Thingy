@@ -35,10 +35,43 @@ class MacroOperators(nn.Module):
         k = len(self.strides)
         d = config.d_model
         m = config.macro_rank
+        input_dim = 3 * d
+        if config.macro_include_delta_to_h0:
+            input_dim += d
+        if config.macro_use_depth_embedding:
+            input_dim += d
+            self.depth_embed = nn.Parameter(torch.randn(k, d) * (1.0 / max(d, 1) ** 0.5))
+        else:
+            self.register_parameter("depth_embed", None)
+        hidden = max(m, m * config.macro_hidden_mult)
         self.d_gain = nn.Parameter(torch.zeros(r, k, d))
-        self.v = nn.Parameter(torch.randn(r, k, 3 * d, m) * (1.0 / (3 * d) ** 0.5))
-        self.u = nn.Parameter(torch.zeros(r, k, m, d))
+        self.v = nn.Parameter(torch.randn(r, k, input_dim, hidden) * (1.0 / input_dim**0.5))
+        if hidden != m:
+            self.v2 = nn.Parameter(torch.randn(r, k, hidden, m) * (1.0 / hidden**0.5))
+        else:
+            self.register_parameter("v2", None)
+        self.u = nn.Parameter(torch.randn(r, k, m, d) * 1e-3)
+        update_scale = torch.full((r, k, d), float(config.macro_update_scale_init))
+        legacy_shape = (
+            config.macro_hidden_mult == 1
+            and not config.macro_use_gated_update
+            and not config.macro_include_delta_to_h0
+            and not config.macro_use_depth_embedding
+            and config.macro_update_scale_init == 1.0
+        )
+        if legacy_shape:
+            self.register_buffer("update_scale", update_scale, persistent=True)
+        else:
+            self.update_scale = nn.Parameter(update_scale)
         self.bias = nn.Parameter(torch.zeros(r, k, d))
+        if config.macro_use_gated_update:
+            self.gate_v = nn.Parameter(torch.randn(r, k, input_dim, m) * (1.0 / input_dim**0.5))
+            self.gate_u = nn.Parameter(torch.randn(r, k, m, d) * 1e-3)
+            self.gate_bias = nn.Parameter(torch.zeros(r, k, d))
+        else:
+            self.register_parameter("gate_v", None)
+            self.register_parameter("gate_u", None)
+            self.register_parameter("gate_bias", None)
         self.register_buffer(
             "depth_values", torch.tensor(self.strides, dtype=torch.long), persistent=False
         )
@@ -95,12 +128,31 @@ class MacroOperators(nn.Module):
         v = self.v[recipe_ids, stride_ids]
         u = self.u[recipe_ids, stride_ids]
         bias = self.bias[recipe_ids, stride_ids]
+        scale = self.update_scale[recipe_ids, stride_ids]
         normed = h * torch.rsqrt(h.float().pow(2).mean(dim=-1, keepdim=True) + 1e-5).to(h.dtype)
+        normed_h0 = h0 * torch.rsqrt(h0.float().pow(2).mean(dim=-1, keepdim=True) + 1e-5).to(h0.dtype)
         pooled = normed.mean(dim=1, keepdim=True).expand_as(normed)
-        z = torch.cat([normed, pooled, h0], dim=-1)
-        low = torch.bmm(F.silu(torch.bmm(z, v)), u)
+        parts = [normed, pooled, h0]
+        if self.config.macro_include_delta_to_h0:
+            parts.append(normed - normed_h0)
+        if self.depth_embed is not None:
+            depth = self.depth_embed[stride_ids].unsqueeze(1).expand_as(normed)
+            parts.append(depth)
+        z = torch.cat(parts, dim=-1)
+        low = F.silu(torch.bmm(z, v))
+        if self.v2 is not None:
+            v2 = self.v2[recipe_ids, stride_ids]
+            low = F.silu(torch.bmm(low, v2))
+        low = torch.bmm(low, u)
         update = gain.unsqueeze(1) * h + low + bias.unsqueeze(1)
-        return h + self.config.macro_update_scale * torch.tanh(update)
+        if self.gate_v is not None and self.gate_u is not None and self.gate_bias is not None:
+            gate_v = self.gate_v[recipe_ids, stride_ids]
+            gate_u = self.gate_u[recipe_ids, stride_ids]
+            gate_bias = self.gate_bias[recipe_ids, stride_ids]
+            gate = torch.sigmoid(torch.bmm(F.silu(torch.bmm(z, gate_v)), gate_u) + gate_bias.unsqueeze(1))
+        else:
+            gate = 1.0
+        return h + self.config.macro_update_scale * scale.unsqueeze(1) * gate * torch.tanh(update)
 
     def _forward_decomposed(
         self,
@@ -224,6 +276,8 @@ def macro_distill_loss(
     lambda_hid: float,
     lambda_cos: float,
     lambda_kl: float,
+    lambda_norm: float = 0.0,
+    temperature: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     exact_hidden = exact_hidden.detach()
     if exact_logits is not None:
@@ -231,13 +285,18 @@ def macro_distill_loss(
     hid = F.mse_loss(hot_hidden, exact_hidden)
     cos = 1.0 - F.cosine_similarity(hot_hidden.flatten(1), exact_hidden.flatten(1), dim=-1).mean()
     if hot_logits is not None and exact_logits is not None and hot_logits.shape == exact_logits.shape:
-        exact_logp = F.log_softmax(exact_logits, dim=-1)
-        hot_logp = F.log_softmax(hot_logits, dim=-1)
-        kl = F.kl_div(hot_logp, exact_logp.exp(), reduction="batchmean")
+        temp = max(float(temperature), 1e-6)
+        exact_logp = F.log_softmax(exact_logits / temp, dim=-1)
+        hot_logp = F.log_softmax(hot_logits / temp, dim=-1)
+        kl = F.kl_div(hot_logp, exact_logp.exp(), reduction="batchmean") * (temp**2)
     else:
         kl = hot_hidden.new_zeros(())
+    hot_rms = hot_hidden.float().pow(2).mean(dim=-1).sqrt()
+    exact_rms = exact_hidden.float().pow(2).mean(dim=-1).sqrt()
+    norm = (hot_rms - exact_rms).abs().mean().to(hot_hidden.dtype)
     return {
         "hid": lambda_hid * hid,
         "cos": lambda_cos * cos,
         "kl": lambda_kl * kl,
+        "norm": lambda_norm * norm,
     }

@@ -16,9 +16,12 @@ from recursive_training_engine.metrics import (
     dense_param_count,
     estimate_hot_active_param_equiv_per_token,
     estimate_hot_flops_per_token,
+    hidden_cosine,
+    logit_kl,
     recursive_param_count,
     router_aux_losses,
 )
+from recursive_training_engine.macro import macro_distill_loss
 from recursive_training_engine.models import DenseModel, ModelOutput, RecursiveModel
 from recursive_training_engine.reporting import JsonlLogger
 from recursive_training_engine.utils import WallTimer, default_device, maybe_peak_memory, set_seed
@@ -74,12 +77,8 @@ class TrainEngine:
                 )
             if self.recursive_model is not None:
                 self.recursive_model.compile_hot_paths(mode=config.training.compile_mode)
-        params = []
-        if self.dense_model is not None:
-            params.extend(self.dense_model.parameters())
-        if self.recursive_model is not None:
-            params.extend(self.recursive_model.parameters())
-        self.optimizer = self._build_optimizer(params)
+        self._apply_trainable_policy()
+        self.optimizer = self._build_optimizer(self._optimizer_param_groups())
         self.optimizer.zero_grad(set_to_none=True)
         self.audit_engine = AuditEngine(config.training)
         self.run_dir = Path(config.output_dir) / config.run_name
@@ -90,6 +89,7 @@ class TrainEngine:
         self.global_micro_step = 0
         self.tokens_seen = 0
         self.last_metrics: dict[str, Any] | None = None
+        self.last_grad_metrics: dict[str, Any] = {}
 
     def _maybe_log(self, metrics: dict[str, Any]) -> None:
         self.last_metrics = metrics
@@ -101,9 +101,80 @@ class TrainEngine:
     def write_run_manifest(self, extra: dict[str, Any] | None = None) -> None:
         write_json(self.run_dir / "manifest.json", build_manifest(self.config, extra=extra))
 
-    def _build_optimizer(self, params: list[torch.nn.Parameter]) -> torch.optim.Optimizer:
+    def _apply_trainable_policy(self) -> None:
+        if self.recursive_model is None:
+            return
+        if self.config.training.mode == "recursive_macro_distill_only":
+            for param in self.recursive_model.parameters():
+                param.requires_grad_(False)
+            for param in self.recursive_model.macro.parameters():
+                param.requires_grad_(True)
+
+    def _set_coda_trainable_for_schedule(self) -> None:
+        if self.recursive_model is None:
+            return
+        tr = self.config.training
+        if tr.mode != "recursive_macro_lm_aligned" or tr.coda_warmup_steps <= 0:
+            return
+        trainable = self.global_step >= tr.coda_warmup_steps
+        for module in (self.recursive_model.coda, self.recursive_model.final_norm):
+            for param in module.parameters():
+                param.requires_grad_(trainable)
+        if self.recursive_model.lm_head is not None:
+            for param in self.recursive_model.lm_head.parameters():
+                param.requires_grad_(trainable)
+
+    def _dedupe_params(self, params: list[torch.nn.Parameter], seen: set[int]) -> list[torch.nn.Parameter]:
+        out = []
+        for param in params:
+            ident = id(param)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            out.append(param)
+        return out
+
+    def _optimizer_param_groups(self) -> list[dict[str, Any]]:
+        tr = self.config.training
+        if self.dense_model is not None:
+            return [
+                {
+                    "params": list(self.dense_model.parameters()),
+                    "lr": tr.effective_lr_base,
+                    "base_lr": tr.effective_lr_base,
+                    "name": "dense",
+                }
+            ]
+        if self.recursive_model is None:
+            return []
+        model = self.recursive_model
+        seen: set[int] = set()
+        specs: list[tuple[str, float, list[torch.nn.Parameter]]] = [
+            ("embedding", tr.effective_lr_base, list(model.embed.parameters())),
+            ("prelude", tr.effective_lr_base, list(model.prelude.parameters())),
+            ("core", tr.effective_lr_base, list(model.core.parameters())),
+            ("macro", tr.effective_lr_macro, list(model.macro.parameters())),
+            (
+                "coda",
+                tr.effective_lr_coda,
+                [*model.coda.parameters(), *model.final_norm.parameters()],
+            ),
+            (
+                "output",
+                tr.effective_lr_output,
+                list(model.lm_head.parameters()) if model.lm_head is not None else [],
+            ),
+            ("router", tr.effective_lr_router, list(model.router.parameters())),
+        ]
+        groups: list[dict[str, Any]] = []
+        for name, lr, params in specs:
+            unique = self._dedupe_params(params, seen)
+            if unique:
+                groups.append({"params": unique, "lr": lr, "base_lr": lr, "name": name})
+        return groups
+
+    def _build_optimizer(self, params: list[dict[str, Any]]) -> torch.optim.Optimizer:
         kwargs: dict[str, Any] = {
-            "lr": self.config.training.lr,
             "weight_decay": self.config.training.weight_decay,
         }
         if self.device.type == "cuda" and self.config.training.fused_optimizer:
@@ -147,8 +218,30 @@ class TrainEngine:
             return float(targets.shape[1])
         return 1.0
 
+    def _optimizer_grad_metrics(self) -> dict[str, Any]:
+        metrics: dict[str, Any] = {}
+        for group in self.optimizer.param_groups:
+            name = str(group.get("name", "group"))
+            grad_sq = 0.0
+            param_sq = 0.0
+            for param in group["params"]:
+                param_sq += float(param.detach().float().square().sum().cpu())
+                if param.grad is not None:
+                    grad_sq += float(param.grad.detach().float().square().sum().cpu())
+            grad_norm = grad_sq**0.5
+            param_norm = param_sq**0.5
+            metrics[f"grad_norm_{name}"] = grad_norm
+            metrics[f"update_ratio_{name}"] = float(group["lr"]) * grad_norm / max(param_norm, 1e-12)
+        return metrics
+
     def _finish_step(self, loss: torch.Tensor) -> bool:
         accum = self.config.training.grad_accum_steps
+        self.last_grad_metrics = {}
+        if not torch.isfinite(loss.detach()):
+            self.optimizer.zero_grad(set_to_none=True)
+            self.global_micro_step += 1
+            self.last_grad_metrics = {"skipped_nonfinite_loss": 1.0}
+            return False
         (loss / accum).backward()
         self.global_micro_step += 1
         should_step = self.global_micro_step % accum == 0
@@ -160,6 +253,7 @@ class TrainEngine:
                 params.extend(self.recursive_model.parameters())
             torch.nn.utils.clip_grad_norm_(params, self.config.training.grad_clip_norm)
         if should_step:
+            self.last_grad_metrics = self._optimizer_grad_metrics()
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.global_step += 1
@@ -184,7 +278,7 @@ class TrainEngine:
     def _apply_lr_schedule(self) -> float:
         lr = self.config.training.lr * self._lr_scale()
         for group in self.optimizer.param_groups:
-            group["lr"] = lr
+            group["lr"] = float(group.get("base_lr", lr)) * self._lr_scale()
         return lr
 
     def _accum_metrics(self, tokens: torch.Tensor, optimizer_step: bool) -> dict[str, Any]:
@@ -196,6 +290,24 @@ class TrainEngine:
             "effective_batch_size": tr.batch_size * tr.grad_accum_steps,
             "accumulated_tokens": tokens.numel() * tr.grad_accum_steps,
         }
+
+    def _router_aux_losses(
+        self,
+        recipe_probs: torch.Tensor,
+        expected_depth: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if self.recursive_model is None:
+            raise ValueError("recursive model is not available")
+        tr = self.config.training
+        if tr.disable_router_aux:
+            zero = recipe_probs.new_zeros(())
+            return {"load": zero, "cover": zero, "depth": zero}
+        return router_aux_losses(
+            recipe_probs,
+            expected_depth,
+            self.recursive_model.recipe_bank.usage_ema,
+            tr,
+        )
 
     def _enforce_hot_budget(
         self,
@@ -235,6 +347,7 @@ class TrainEngine:
     def train_step_dense(self, batch: tuple[torch.Tensor, torch.Tensor]) -> TrainStepResult:
         if self.dense_model is None:
             raise ValueError("dense model is not available")
+        self._set_coda_trainable_for_schedule()
         tokens, targets = self._move_batch(batch)
         current_lr = self._apply_lr_schedule()
         with WallTimer() as timer:
@@ -253,6 +366,7 @@ class TrainEngine:
             "stored_params": dense_param_count(self.config.model),
             "tokens_seen": self.tokens_seen,
             "lr": current_lr,
+            **self.last_grad_metrics,
             **self._accum_metrics(tokens, stepped),
         }
         self.tokens_seen += int(tokens.numel())
@@ -262,6 +376,7 @@ class TrainEngine:
     def train_step_recursive_exact(self, batch: tuple[torch.Tensor, torch.Tensor]) -> TrainStepResult:
         if self.recursive_model is None:
             raise ValueError("recursive model is not available")
+        self._set_coda_trainable_for_schedule()
         tokens, targets = self._move_batch(batch)
         tr = self.config.training
         current_lr = self._apply_lr_schedule()
@@ -276,11 +391,9 @@ class TrainEngine:
                     fixed_depth=tr.fixed_depth,
                 )
             assert out.loss_per_sample is not None and out.meta.router is not None
-            aux = router_aux_losses(
+            aux = self._router_aux_losses(
                 out.meta.router.recipe_probs,
                 out.meta.router.expected_depth,
-                self.recursive_model.recipe_bank.usage_ema,
-                tr,
             )
             lm_loss = out.loss_per_sample.mean() / self._loss_scale(targets)
             loss = lm_loss + sum(aux.values())
@@ -303,6 +416,7 @@ class TrainEngine:
             "active_touches_per_token": out.meta.active_touches.mean() if out.meta.active_touches is not None else 0.0,
             "avg_depth": out.meta.depths.float().mean() if out.meta.depths is not None else 0.0,
             **self._accum_metrics(tokens, stepped),
+            **self.last_grad_metrics,
             **{f"aux_{k}": v for k, v in aux.items()},
         }
         self.tokens_seen += int(tokens.numel())
@@ -323,9 +437,16 @@ class TrainEngine:
     ) -> TrainStepResult:
         if self.recursive_model is None:
             raise ValueError("recursive model is not available")
+        if shortlist and self.config.training.debug_force_full_output:
+            raise RuntimeError("debug_force_full_output forbids recursive_macro_shortlist")
+        self._set_coda_trainable_for_schedule()
         tokens, targets = self._move_batch(batch)
         tr = self.config.training
-        mode = "recursive_macro_shortlist" if shortlist else "recursive_macro"
+        mode = "recursive_macro_shortlist" if shortlist else tr.mode
+        if mode == "recursive_macro_lm_aligned":
+            mode = "recursive_macro_lm_aligned"
+        elif mode not in {"recursive_macro_shortlist", "recursive_macro"}:
+            mode = "recursive_macro"
         current_lr = self._apply_lr_schedule()
         with WallTimer() as timer:
             with self._autocast():
@@ -348,11 +469,9 @@ class TrainEngine:
                     hot,
                     seed=tr.seed + 10_000 + self.global_step,
                 )
-            aux_router = router_aux_losses(
+            aux_router = self._router_aux_losses(
                 hot.meta.router.recipe_probs,
                 hot.meta.router.expected_depth,
-                self.recursive_model.recipe_bank.usage_ema,
-                tr,
             )
             loss = (
                 audit.corrected_loss_per_sample.mean() / self._loss_scale(targets)
@@ -371,33 +490,182 @@ class TrainEngine:
             self.recursive_model.recipe_bank.update_usage(
                 hot.meta.recipe_ids, beta=tr.coverage_beta
             )
+        required_audit_metrics = {
+            key: audit.metrics[key]
+            for key in [
+                "audit_count",
+                "audit_inclusion_prob",
+                "audit_residual_mean",
+                "audit_residual_std",
+                "audit_residual_var",
+                "hidden_mse_exact_macro",
+                "hidden_cosine_exact_macro",
+                "logit_kl_exact_macro",
+            ]
+            if key in audit.metrics
+        }
         metrics = {
             "mode": mode,
             "loss": loss,
             "hot_lm_loss": hot.loss_per_sample.mean() / self._loss_scale(targets),
             "corrected_lm_loss": audit.corrected_loss_per_sample.mean() / self._loss_scale(targets),
             "nll_per_token": audit.corrected_loss_per_sample.mean() / float(targets.shape[1]),
+            "hot_eval_nll": hot.loss_per_sample.mean() / float(targets.shape[1]),
             "step_time": timer.elapsed,
             "tokens_per_sec": tokens.numel() / max(timer.elapsed, 1e-9),
             "peak_vram": maybe_peak_memory(self.device),
             "stored_params": recursive_param_count(self.config.model),
             "tokens_seen": self.tokens_seen,
             "lr": current_lr,
+            "macro_lr": next(
+                (group["lr"] for group in self.optimizer.param_groups if group.get("name") == "macro"),
+                current_lr,
+            ),
+            "coda_lr": next(
+                (group["lr"] for group in self.optimizer.param_groups if group.get("name") == "coda"),
+                current_lr,
+            ),
+            "coda_trainable": any(
+                param.requires_grad for param in self.recursive_model.coda.parameters()
+            ),
             "active_touches_per_token": hot.meta.active_touches.mean() if hot.meta.active_touches is not None else 0.0,
             "avg_depth": hot.meta.depths.float().mean() if hot.meta.depths is not None else 0.0,
+            "unique_recipes_per_batch": hot.meta.recipe_ids.unique().numel() if hot.meta.recipe_ids is not None else 0.0,
+            "fixed_depth": tr.fixed_depth or 0,
+            "fixed_recipe": tr.fixed_recipe or 0,
             "physical_passes": hot.meta.macro_trace.physical_passes.mean() if hot.meta.macro_trace is not None else 0.0,
             "macro_decomposition_error": hot.meta.macro_trace.decomposition_error if hot.meta.macro_trace is not None and hot.meta.macro_trace.decomposition_error is not None else 0.0,
             "shortlist_duplicate_count": hot.meta.shortlist.duplicate_count if hot.meta.shortlist is not None else 0.0,
             "shortlist_size": hot.meta.shortlist.shortlist.shape[-1] if hot.meta.shortlist is not None else self.config.model.vocab_size,
             **budget_metrics,
             **self._accum_metrics(tokens, stepped),
+            **self.last_grad_metrics,
+            **required_audit_metrics,
             **{f"audit_{k}": v for k, v in audit.metrics.items()},
             **{f"macro_{k}": v for k, v in audit.macro_aux.items()},
+            "macro_distill_loss": sum(audit.macro_aux.values()),
+            "macro_hidden_loss": audit.macro_aux.get("hid", hot.loss_per_sample.new_zeros(())),
+            "macro_logit_kl_loss": audit.macro_aux.get("kl", hot.loss_per_sample.new_zeros(())),
+            "macro_consistency_loss": audit.macro_aux.get("cons", hot.loss_per_sample.new_zeros(())),
             **{f"aux_{k}": v for k, v in aux_router.items()},
         }
         self.tokens_seen += int(tokens.numel())
         self._maybe_log(metrics)
         return TrainStepResult(loss=loss, model_output=hot, metrics=metrics, audit=audit)
+
+    def train_step_recursive_macro_distill_only(
+        self,
+        batch: tuple[torch.Tensor, torch.Tensor],
+    ) -> TrainStepResult:
+        if self.recursive_model is None:
+            raise ValueError("recursive model is not available")
+        self._apply_trainable_policy()
+        tokens, targets = self._move_batch(batch)
+        tr = self.config.training
+        current_lr = self._apply_lr_schedule()
+        with WallTimer() as timer:
+            with self._autocast(), torch.no_grad():
+                exact = self.recursive_model.forward_exact(
+                    tokens,
+                    targets,
+                    return_states=True,
+                    return_loss_per_sample=True,
+                    fixed_recipe=tr.fixed_recipe,
+                    fixed_depth=tr.fixed_depth,
+                )
+            with self._autocast():
+                hot = self.recursive_model.forward_macro(
+                    tokens,
+                    targets,
+                    return_states=True,
+                    return_loss_per_sample=True,
+                    shortlist=False,
+                    seed=tr.seed + self.global_step,
+                    fixed_recipe=tr.fixed_recipe,
+                    fixed_depth=tr.fixed_depth,
+                )
+            hot_endpoint = (
+                hot.meta.recurrent_hidden if hot.meta.recurrent_hidden is not None else hot.meta.hidden
+            )
+            exact_endpoint = (
+                exact.meta.recurrent_hidden if exact.meta.recurrent_hidden is not None else exact.meta.hidden
+            )
+            if hot_endpoint is None or exact_endpoint is None:
+                raise RuntimeError("macro distillation requires hidden states")
+            losses = macro_distill_loss(
+                hot_endpoint,
+                exact_endpoint,
+                hot.meta.logits,
+                exact.meta.logits,
+                lambda_hid=tr.effective_lambda_hid,
+                lambda_cos=tr.effective_lambda_cos,
+                lambda_kl=tr.effective_lambda_kl,
+                lambda_norm=tr.lambda_norm,
+                temperature=tr.distill_temperature,
+            )
+            if tr.lambda_cons != 0.0 and hot.meta.h0 is not None and hot.meta.recipe_ids is not None:
+                losses["cons"] = tr.lambda_cons * self.recursive_model.macro.consistency_loss(
+                    hot.meta.h0,
+                    hot.meta.h0,
+                    hot.meta.recipe_ids,
+                )
+            else:
+                losses["cons"] = hot.meta.hidden.new_zeros(())
+            loss = sum(losses.values())
+            stepped = self._finish_step(loss)
+        assert hot.loss_per_sample is not None and exact.loss_per_sample is not None
+        hot_endpoint = (
+            hot.meta.recurrent_hidden if hot.meta.recurrent_hidden is not None else hot.meta.hidden
+        )
+        exact_endpoint = (
+            exact.meta.recurrent_hidden if exact.meta.recurrent_hidden is not None else exact.meta.hidden
+        )
+        assert hot_endpoint is not None and exact_endpoint is not None
+        cos = hidden_cosine(hot_endpoint, exact_endpoint).mean()
+        kl = hot_endpoint.new_zeros(())
+        if hot.meta.logits is not None and exact.meta.logits is not None:
+            kl = logit_kl(exact.meta.logits, hot.meta.logits).mean()
+        hidden_mse = (hot_endpoint - exact_endpoint).square().mean()
+        exact_nll = exact.loss_per_sample.mean() / float(targets.shape[1])
+        hot_nll = hot.loss_per_sample.mean() / float(targets.shape[1])
+        metrics = {
+            "mode": "recursive_macro_distill_only",
+            "loss": loss,
+            "macro_distill_loss": loss,
+            "macro_hidden_loss": losses["hid"],
+            "macro_logit_kl_loss": losses["kl"],
+            "macro_consistency_loss": losses["cons"],
+            "macro_norm_loss": losses["norm"],
+            "exact_eval_nll": exact_nll,
+            "hot_eval_nll": hot_nll,
+            "hot_exact_nll_gap": hot_nll - exact_nll,
+            "hidden_mse_exact_macro": hidden_mse,
+            "hidden_cosine_exact_macro": cos,
+            "logit_kl_exact_macro": kl,
+            "step_time": timer.elapsed,
+            "tokens_per_sec": tokens.numel() / max(timer.elapsed, 1e-9),
+            "tokens_seen": self.tokens_seen,
+            "lr": current_lr,
+            "macro_lr": next(
+                (group["lr"] for group in self.optimizer.param_groups if group.get("name") == "macro"),
+                current_lr,
+            ),
+            "coda_lr": next(
+                (group["lr"] for group in self.optimizer.param_groups if group.get("name") == "coda"),
+                current_lr,
+            ),
+            "coda_trainable": any(
+                param.requires_grad for param in self.recursive_model.coda.parameters()
+            ),
+            "unique_recipes_per_batch": hot.meta.recipe_ids.unique().numel() if hot.meta.recipe_ids is not None else 0.0,
+            "fixed_depth": tr.fixed_depth or 0,
+            "fixed_recipe": tr.fixed_recipe or 0,
+            **self._accum_metrics(tokens, stepped),
+            **self.last_grad_metrics,
+        }
+        self.tokens_seen += int(tokens.numel())
+        self._maybe_log(metrics)
+        return TrainStepResult(loss=loss, model_output=hot, metrics=metrics)
 
     def train_step(self, batch: tuple[torch.Tensor, torch.Tensor]) -> TrainStepResult:
         mode = self.config.training.mode
@@ -407,8 +675,14 @@ class TrainEngine:
             return self.train_step_recursive_exact(batch)
         if mode == "recursive_macro":
             return self.train_step_recursive_macro(batch)
+        if mode == "recursive_macro_lm_aligned":
+            return self.train_step_recursive_macro(batch)
         if mode == "recursive_macro_shortlist":
             return self.train_step_recursive_macro_shortlist(batch)
+        if mode == "recursive_macro_distill_only":
+            return self.train_step_recursive_macro_distill_only(batch)
+        if mode == "recursive_macro_shadow_coda":
+            raise ValueError("recursive_macro_shadow_coda is diagnostic; use diagnose-coda-collusion")
         raise ValueError(mode)
 
     def save_checkpoint(self, path: str | Path, *, data_cursor: int | None = None) -> None:
@@ -435,7 +709,14 @@ class TrainEngine:
         model = self.dense_model if self.dense_model is not None else self.recursive_model
         if model is not None and payload.get("model") is not None:
             model.load_state_dict(payload["model"])
-        self.optimizer.load_state_dict(payload["optimizer"])
+        if payload.get("optimizer") is not None:
+            try:
+                self.optimizer.load_state_dict(payload["optimizer"])
+            except ValueError:
+                # Macro distillation checkpoints intentionally use a macro-only optimizer.
+                # Resuming them into aligned LM training should load weights and start a
+                # fresh optimizer with the current parameter groups.
+                pass
         self.global_step = int(payload.get("global_step", 0))
         self.global_micro_step = int(payload.get("global_micro_step", 0))
         self.tokens_seen = int(payload.get("tokens_seen", 0))

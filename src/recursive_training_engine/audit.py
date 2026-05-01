@@ -123,6 +123,32 @@ class AuditEngine:
     def sample_mask(self, p: torch.Tensor, seed: int) -> torch.Tensor:
         return self.sample_mask_with_prob(p, seed=seed)[0]
 
+    def maybe_update_fixed_count_schedule(self, metrics: dict[str, torch.Tensor], batch_size: int) -> None:
+        if not self.config.audit_schedule_enabled:
+            return
+        if self.config.audit_fixed_count_per_batch is None:
+            return
+        current = int(self.config.audit_fixed_count_per_batch)
+        if current <= 0:
+            return
+        min_count = self.config.audit_schedule_min_count
+        if min_count is None:
+            min_count = max(1, batch_size // 128)
+        hidden_cos = float(metrics.get("hidden_cosine_exact_macro", torch.tensor(0.0)).detach().cpu())
+        residual_var = float(metrics.get("audit_residual_var", torch.tensor(float("inf"))).detach().cpu())
+        loss_gap = abs(float(metrics.get("loss_residual", torch.tensor(float("inf"))).detach().cpu()))
+        good = (
+            loss_gap <= self.config.audit_schedule_gap_threshold
+            and hidden_cos >= self.config.audit_schedule_hidden_cosine_threshold
+            and residual_var <= self.config.audit_schedule_residual_var_threshold
+        )
+        if good:
+            next_count = max(min_count, current // 2)
+        else:
+            next_count = min(batch_size, max(current, min(batch_size, current * 2)))
+        self.config.audit_fixed_count_per_batch = next_count
+        self.config.audit_fixed_count = next_count
+
     def run_exact_subset(
         self,
         model: RecursiveModel,
@@ -138,20 +164,28 @@ class AuditEngine:
             targets,
             mask,
             reuse_router_decisions=cached_hot_meta.router,
+            cached_h0=cached_hot_meta.h0,
             return_states=True,
             return_loss_per_sample=True,
         )
 
     def compute_residual_metrics(self, hot_meta: ModelMeta, exact_meta: ModelMeta) -> dict[str, torch.Tensor]:
         metrics: dict[str, torch.Tensor] = {}
-        if hot_meta.hidden is not None and exact_meta.hidden is not None:
-            hot_hidden = hot_meta.hidden
-            exact_hidden = exact_meta.hidden
+        hot_endpoint = hot_meta.recurrent_hidden if hot_meta.recurrent_hidden is not None else hot_meta.hidden
+        exact_endpoint = (
+            exact_meta.recurrent_hidden if exact_meta.recurrent_hidden is not None else exact_meta.hidden
+        )
+        if hot_endpoint is not None and exact_endpoint is not None:
+            hot_hidden = hot_endpoint
+            exact_hidden = exact_endpoint
             if hot_hidden.shape[0] != exact_hidden.shape[0]:
                 hot_hidden = hot_hidden[: exact_hidden.shape[0]]
             cos = hidden_cosine(hot_hidden, exact_hidden)
+            mse = (hot_hidden - exact_hidden).square().mean()
             metrics["hidden_cosine"] = cos.mean()
-            metrics["hidden_residual_l2"] = (hot_hidden - exact_hidden).square().mean().sqrt()
+            metrics["hidden_cosine_exact_macro"] = cos.mean()
+            metrics["hidden_mse_exact_macro"] = mse
+            metrics["hidden_residual_l2"] = mse.sqrt()
             self.recent_residual = float((1.0 - cos.mean()).detach().clamp_min(0).cpu())
         if hot_meta.logits is not None and exact_meta.logits is not None:
             hot_logits = hot_meta.logits
@@ -159,7 +193,9 @@ class AuditEngine:
             if hot_logits.shape[0] != exact_logits.shape[0]:
                 hot_logits = hot_logits[: exact_logits.shape[0]]
             if hot_logits.shape == exact_logits.shape:
-                metrics["logit_kl"] = logit_kl(exact_logits, hot_logits).mean()
+                kl = logit_kl(exact_logits, hot_logits).mean()
+                metrics["logit_kl"] = kl
+                metrics["logit_kl_exact_macro"] = kl
         return metrics
 
     def correction(
@@ -180,6 +216,7 @@ class AuditEngine:
             "hid": hot.loss_per_sample.new_zeros(()),
             "cos": hot.loss_per_sample.new_zeros(()),
             "kl": hot.loss_per_sample.new_zeros(()),
+            "norm": hot.loss_per_sample.new_zeros(()),
             "cons": hot.loss_per_sample.new_zeros(()),
         }
         metrics: dict[str, torch.Tensor] = {
@@ -190,6 +227,16 @@ class AuditEngine:
             "audit_capped_fraction": p_audit.new_tensor(self.last_capped_fraction),
             "audit_fixed_count": p_audit.new_tensor(
                 float(self.config.audit_fixed_count_per_batch or 0)
+            ),
+            "audit_count": p_audit.new_tensor(float(mask.sum().detach().cpu())),
+            "audit_inclusion_prob": p_audit.mean(),
+            "audit_sampler_fixed_count": p_audit.new_tensor(
+                1.0 if self.last_sample_mode == "fixed_count" else 0.0
+            ),
+            "audit_unbiased_correction_known": p_audit.new_tensor(
+                0.0
+                if self.config.audit_cap is not None and self.last_sample_mode != "fixed_count"
+                else 1.0
             ),
             "audit_is_gradient_corrected": p_audit.new_tensor(
                 1.0 if self.config.audit_mode == "gradient_corrected" else 0.0
@@ -209,6 +256,9 @@ class AuditEngine:
                 raise ValueError("exact subset must include per-sample losses")
             hot_subset = hot.loss_per_sample[mask]
             residual = exact.loss_per_sample - hot_subset
+            metrics["audit_residual_mean"] = residual.mean()
+            metrics["audit_residual_std"] = residual.float().std(unbiased=False).to(residual.dtype)
+            metrics["audit_residual_var"] = residual.float().var(unbiased=False).to(residual.dtype)
             if self.config.audit_residual_clip is not None:
                 residual = residual.clamp(
                     -self.config.audit_residual_clip,
@@ -216,23 +266,48 @@ class AuditEngine:
                 )
             if not gradient_corrected:
                 residual = residual.detach()
-            if self.config.audit_mode != "distill_only":
+            corrected_metric = hot_subset + residual.detach() / p_audit[mask].clamp_min(1e-12)
+            metrics["corrected_metric_loss"] = corrected_metric.mean()
+            if self.config.audit_mode == "gradient_corrected":
                 corrected[mask] = hot_subset + residual / p_audit[mask].clamp_min(1e-12)
-            hot_hidden = hot.meta.hidden[mask] if hot.meta.hidden is not None else None
-            if hot_hidden is not None and exact.meta.hidden is not None:
+            hot_endpoint = (
+                hot.meta.recurrent_hidden[mask]
+                if hot.meta.recurrent_hidden is not None
+                else hot.meta.hidden[mask] if hot.meta.hidden is not None else None
+            )
+            exact_endpoint = (
+                exact.meta.recurrent_hidden
+                if exact.meta.recurrent_hidden is not None
+                else exact.meta.hidden
+            )
+            if hot_endpoint is not None and exact_endpoint is not None:
                 losses = macro_distill_loss(
-                    hot_hidden,
-                    exact.meta.hidden,
+                    hot_endpoint,
+                    exact_endpoint,
                     hot.meta.logits[mask] if hot.meta.logits is not None else None,
                     exact.meta.logits,
-                    lambda_hid=self.config.lambda_hid,
-                    lambda_cos=self.config.lambda_cos,
-                    lambda_kl=self.config.lambda_kl,
+                    lambda_hid=self.config.effective_lambda_hid,
+                    lambda_cos=self.config.effective_lambda_cos,
+                    lambda_kl=self.config.effective_lambda_kl,
+                    lambda_norm=self.config.lambda_norm,
+                    temperature=self.config.distill_temperature,
                 )
                 macro_aux.update(losses)
-            metrics.update(self.compute_residual_metrics(ModelMeta(hidden=hot_hidden, logits=hot.meta.logits[mask] if hot.meta.logits is not None else None), exact.meta))
+            metrics.update(
+                self.compute_residual_metrics(
+                    ModelMeta(
+                        recurrent_hidden=hot_endpoint,
+                        logits=hot.meta.logits[mask] if hot.meta.logits is not None else None,
+                    ),
+                    exact.meta,
+                )
+            )
             metrics["loss_residual"] = (exact.loss_per_sample - hot_subset).mean()
             metrics["clipped_loss_residual"] = residual.mean()
+            self.maybe_update_fixed_count_schedule(metrics, hot.loss_per_sample.shape[0])
+            metrics["audit_schedule_next_count"] = p_audit.new_tensor(
+                float(self.config.audit_fixed_count_per_batch or 0)
+            )
         if hot.meta.recipe_ids is not None:
             self._update_audit_coverage(hot.meta.recipe_ids, mask)
         if (

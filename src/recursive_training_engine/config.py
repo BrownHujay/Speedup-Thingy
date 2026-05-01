@@ -32,6 +32,11 @@ class ModelConfig:
     fairness_tolerance: float = 0.01
     macro_rank: int = 32
     macro_update_scale: float = 0.05
+    macro_hidden_mult: int = 1
+    macro_use_gated_update: bool = False
+    macro_update_scale_init: float = 1.0
+    macro_include_delta_to_h0: bool = False
+    macro_use_depth_embedding: bool = False
     macro_decomposition: Literal["direct", "binary", "greedy", "consistency_tree"] = "direct"
     router_hidden: int | None = None
 
@@ -52,6 +57,12 @@ class ModelConfig:
             raise ValueError("t_max must be present in depth_choices")
         if sorted(self.depth_choices) != self.depth_choices:
             raise ValueError("depth_choices must be sorted ascending")
+        if self.macro_rank < 1:
+            raise ValueError("macro_rank must be positive")
+        if self.macro_hidden_mult < 1:
+            raise ValueError("macro_hidden_mult must be positive")
+        if self.macro_update_scale_init < 0:
+            raise ValueError("macro_update_scale_init must be non-negative")
 
 
 @dataclass(slots=True)
@@ -61,10 +72,18 @@ class TrainingConfig:
         "recursive_exact",
         "recursive_macro",
         "recursive_macro_shortlist",
+        "recursive_macro_distill_only",
+        "recursive_macro_lm_aligned",
+        "recursive_macro_shadow_coda",
     ]
     loss_normalization: Literal["token_mean", "sample_sum"] = "token_mean"
     optimizer: Literal["adamw"] = "adamw"
     lr: float = 3e-4
+    lr_base: float | None = None
+    lr_macro: float | None = None
+    lr_coda: float | None = None
+    lr_output: float | None = None
+    lr_router: float | None = None
     lr_schedule: Literal["constant", "linear_decay_after"] = "constant"
     lr_decay_start_tokens: int | None = None
     lr_decay_end_tokens: int | None = None
@@ -81,11 +100,18 @@ class TrainingConfig:
     audit_alpha: float = 0.08
     audit_beta: float = 0.08
     audit_gamma: float = 0.08
+    audit_sampler: Literal["bernoulli", "fixed_count"] = "bernoulli"
+    audit_fixed_count: int | None = None
     audit_cap: int | None = None
     audit_fixed_count_per_batch: int | None = None
     audit_mode: Literal["metric_only", "gradient_corrected", "distill_only"] = "gradient_corrected"
     audit_residual_clip: float | None = None
     audit_gradient_correction: bool = True
+    audit_schedule_enabled: bool = False
+    audit_schedule_min_count: int | None = None
+    audit_schedule_gap_threshold: float = 0.05
+    audit_schedule_hidden_cosine_threshold: float = 0.98
+    audit_schedule_residual_var_threshold: float = 1.0
     target_speedup_vs_dense: float | None = None
     max_active_param_equiv_per_token: float | None = None
     max_hotpath_flops_per_token: float | None = None
@@ -95,11 +121,19 @@ class TrainingConfig:
     lambda_hid: float = 1e-2
     lambda_cos: float = 1e-2
     lambda_kl: float = 1e-2
+    lambda_hidden_mse: float | None = None
+    lambda_hidden_cosine: float | None = None
+    lambda_logit_kl: float | None = None
+    lambda_norm: float = 0.05
+    distill_temperature: float = 2.0
     lambda_cons: float = 1e-3
     coverage_min: float = 0.01
     coverage_beta: float = 0.98
     fixed_recipe: int | None = None
     fixed_depth: int | None = None
+    disable_router_aux: bool = False
+    debug_force_full_output: bool = False
+    coda_warmup_steps: int = 0
     log_every: int = 1
     compile_model: bool = False
     compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "reduce-overhead"
@@ -111,8 +145,18 @@ class TrainingConfig:
     require_flash_attention: bool = True
 
     def __post_init__(self) -> None:
+        if self.audit_fixed_count is not None:
+            self.audit_fixed_count_per_batch = self.audit_fixed_count
+        if self.audit_sampler == "fixed_count" and self.audit_fixed_count_per_batch is None:
+            raise ValueError("audit_sampler='fixed_count' requires audit_fixed_count")
+        if self.audit_fixed_count_per_batch is not None:
+            self.audit_sampler = "fixed_count"
         if self.grad_accum_steps < 1:
             raise ValueError("grad_accum_steps must be >= 1")
+        if self.coda_warmup_steps < 0:
+            raise ValueError("coda_warmup_steps must be non-negative")
+        if self.distill_temperature <= 0:
+            raise ValueError("distill_temperature must be positive")
         if self.lr_final_scale <= 0:
             raise ValueError("lr_final_scale must be positive")
         if self.lr_schedule == "linear_decay_after":
@@ -127,6 +171,8 @@ class TrainingConfig:
                 raise ValueError("audit_fixed_count_per_batch must be non-negative when provided")
             if self.audit_fixed_count_per_batch > self.batch_size:
                 raise ValueError("audit_fixed_count_per_batch must be <= batch_size")
+        if self.audit_schedule_min_count is not None and self.audit_schedule_min_count < 0:
+            raise ValueError("audit_schedule_min_count must be non-negative when provided")
         if (
             self.audit_mode == "gradient_corrected"
             and not self.audit_gradient_correction
@@ -146,6 +192,38 @@ class TrainingConfig:
         if self.max_hotpath_flops_per_token is not None and self.max_hotpath_flops_per_token <= 0:
             raise ValueError("max_hotpath_flops_per_token must be positive")
 
+    @property
+    def effective_lr_base(self) -> float:
+        return self.lr if self.lr_base is None else self.lr_base
+
+    @property
+    def effective_lr_macro(self) -> float:
+        return self.lr if self.lr_macro is None else self.lr_macro
+
+    @property
+    def effective_lr_coda(self) -> float:
+        return self.lr if self.lr_coda is None else self.lr_coda
+
+    @property
+    def effective_lr_output(self) -> float:
+        return self.lr if self.lr_output is None else self.lr_output
+
+    @property
+    def effective_lr_router(self) -> float:
+        return self.lr if self.lr_router is None else self.lr_router
+
+    @property
+    def effective_lambda_hid(self) -> float:
+        return self.lambda_hid if self.lambda_hidden_mse is None else self.lambda_hidden_mse
+
+    @property
+    def effective_lambda_cos(self) -> float:
+        return self.lambda_cos if self.lambda_hidden_cosine is None else self.lambda_hidden_cosine
+
+    @property
+    def effective_lambda_kl(self) -> float:
+        return self.lambda_kl if self.lambda_logit_kl is None else self.lambda_logit_kl
+
 
 @dataclass(slots=True)
 class OutputConfig:
@@ -162,13 +240,24 @@ class DataConfig:
     dataset: Literal["tinystories", "wikitext103", "local", "synthetic"] = "synthetic"
     tokenizer: Literal["gpt2_bpe", "byte"] = "gpt2_bpe"
     vocab_projection: Literal["filter", "modulo"] = "filter"
+    projection_lane: Literal["filter", "modulo"] | None = None
     cache_dir: str = ".cache/rte"
     local_text_path: str | None = None
     train_split: str = "train"
     eval_split: str = "validation"
+    seed: int | None = None
+    train_tokens: int | None = None
     max_tokens: int = 200_000
     eval_tokens: int = 20_000
     synthetic_tokens: int = 20_000
+
+    def __post_init__(self) -> None:
+        if self.projection_lane is None:
+            self.projection_lane = self.vocab_projection
+        elif self.projection_lane != self.vocab_projection:
+            raise ValueError("data.projection_lane and data.vocab_projection must match")
+        if self.train_tokens is not None:
+            self.max_tokens = self.train_tokens
 
 
 @dataclass(slots=True)
