@@ -229,7 +229,7 @@ class RecursiveModel(nn.Module):
         boundaries = set(self.config.depth_choices)
         for t in range(self.config.t_max):
             active = route.depth > t
-            h = self.core.forward_step(h, h0, route.recipe_id, active)
+            h = self.core.forward_step(h, h0, route.recipe_id, active, pass_idx=t)
             boundary = t + 1
             if return_states and boundary in boundaries:
                 states[boundary] = h.clone()

@@ -210,15 +210,36 @@ class BankedRecursiveCore(nn.Module):
         self.attn = BankedAttention(config, recipe_bank)
         self.norm2 = RMSNorm(config.d_model)
         self.mlp = BankedSwiGLU(config, recipe_bank)
+        self.pass_gamma1 = nn.Parameter(torch.zeros(config.t_max, config.d_model))
+        self.pass_beta1 = nn.Parameter(torch.zeros(config.t_max, config.d_model))
+        self.pass_gamma2 = nn.Parameter(torch.zeros(config.t_max, config.d_model))
+        self.pass_beta2 = nn.Parameter(torch.zeros(config.t_max, config.d_model))
+        self.pass_attn_scale = nn.Parameter(torch.full((config.t_max,), 1.0))
+        self.pass_mlp_scale = nn.Parameter(torch.full((config.t_max,), 1.0))
         if config.use_recursive_input_skip:
             self.alpha_inj = nn.Parameter(torch.tensor(0.1))
         else:
             self.register_parameter("alpha_inj", None)
 
-    def step_group(self, h: torch.Tensor, h0: torch.Tensor, spec: RecipeSpec) -> torch.Tensor:
+    def step_group(
+        self,
+        h: torch.Tensor,
+        h0: torch.Tensor,
+        spec: RecipeSpec,
+        pass_idx: int = 0,
+    ) -> torch.Tensor:
+        pass_idx = int(pass_idx)
         h_tilde = h if self.alpha_inj is None else h + self.alpha_inj * h0
-        u = h_tilde + self.attn(self.norm1(h_tilde), spec)
-        return u + self.mlp(self.norm2(u), spec)
+
+        n1 = self.norm1(h_tilde)
+        n1 = n1 * (1.0 + self.pass_gamma1[pass_idx]) + self.pass_beta1[pass_idx]
+        attn_out = self.attn(n1, spec)
+        u = h_tilde + self.pass_attn_scale[pass_idx] * attn_out
+
+        n2 = self.norm2(u)
+        n2 = n2 * (1.0 + self.pass_gamma2[pass_idx]) + self.pass_beta2[pass_idx]
+        mlp_out = self.mlp(n2, spec)
+        return u + self.pass_mlp_scale[pass_idx] * mlp_out
 
     def forward_step(
         self,
@@ -226,6 +247,7 @@ class BankedRecursiveCore(nn.Module):
         h0: torch.Tensor,
         recipe_ids: torch.Tensor,
         active_mask: torch.Tensor | None = None,
+        pass_idx: int = 0,
     ) -> torch.Tensor:
         out = h.clone()
         if active_mask is None:
@@ -234,5 +256,5 @@ class BankedRecursiveCore(nn.Module):
             mask = active_mask & (recipe_ids == int(rid))
             spec = self.recipe_bank.get_recipe(int(rid))
             assert isinstance(spec, RecipeSpec)
-            out[mask] = self.step_group(h[mask], h0[mask], spec)
+            out[mask] = self.step_group(h[mask], h0[mask], spec, pass_idx=pass_idx)
         return out
