@@ -64,6 +64,35 @@ def test_recursive_exact_matches_manual_loop_with_fixed_route() -> None:
     assert hidden.shape == h.shape
 
 
+def test_recursive_exact_uses_fixed_recipe_schedule_per_pass() -> None:
+    cfg = tiny_config("recursive_exact")
+    model = RecursiveModel(cfg.model, cfg.output)
+    tokens, targets = sample_batch(cfg)
+    seen: list[tuple[int, torch.Tensor]] = []
+
+    def record_step(
+        h: torch.Tensor,
+        h0: torch.Tensor,
+        recipe_ids: torch.Tensor,
+        active_mask: torch.Tensor | None = None,
+        pass_idx: int = 0,
+    ) -> torch.Tensor:
+        del h0, active_mask
+        seen.append((pass_idx, recipe_ids.detach().cpu().clone()))
+        return h
+
+    model.core.forward_step = record_step
+    model.forward_exact(
+        tokens,
+        targets,
+        fixed_recipe=1,
+        fixed_recipe_schedule=[1, 2, 3, 1],
+        fixed_depth=4,
+    )
+    assert [pass_idx for pass_idx, _ in seen] == [0, 1, 2, 3]
+    assert [int(recipe_ids.unique().item()) for _, recipe_ids in seen] == [1, 2, 3, 1]
+
+
 def test_recursive_exact_subset_can_reuse_cached_prelude() -> None:
     cfg = tiny_config("recursive_macro")
     model = RecursiveModel(cfg.model, cfg.output)

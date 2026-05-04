@@ -159,6 +159,7 @@ class TrainingConfig:
     coverage_min: float = 0.01
     coverage_beta: float = 0.98
     fixed_recipe: int | None = None
+    fixed_recipe_schedule: list[int] | None = None
     fixed_depth: int | None = None
     disable_router_aux: bool = False
     debug_force_full_output: bool = False
@@ -241,6 +242,11 @@ class TrainingConfig:
             raise ValueError("max_active_param_equiv_per_token must be positive")
         if self.max_hotpath_flops_per_token is not None and self.max_hotpath_flops_per_token <= 0:
             raise ValueError("max_hotpath_flops_per_token must be positive")
+        if self.fixed_recipe_schedule is not None:
+            if not self.fixed_recipe_schedule:
+                raise ValueError("fixed_recipe_schedule must not be empty when provided")
+            if any(recipe < 0 for recipe in self.fixed_recipe_schedule):
+                raise ValueError("fixed_recipe_schedule entries must be non-negative")
         if self.macro_rms_clamp_min <= 0 or self.macro_rms_clamp_max <= 0:
             raise ValueError("macro_rms_clamp_min/max must be positive")
         if self.macro_rms_clamp_max < self.macro_rms_clamp_min:

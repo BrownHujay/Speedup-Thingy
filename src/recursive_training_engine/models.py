@@ -194,6 +194,7 @@ class RecursiveModel(nn.Module):
         *,
         router_decisions: RouterOutput | None = None,
         fixed_recipe: int | None = None,
+        fixed_recipe_schedule: list[int] | tuple[int, ...] | None = None,
         fixed_depth: int | None = None,
     ) -> ModelOutput:
         h0 = self._prelude(tokens)
@@ -204,8 +205,27 @@ class RecursiveModel(nn.Module):
             return_loss_per_sample=return_loss_per_sample,
             router_decisions=router_decisions,
             fixed_recipe=fixed_recipe,
+            fixed_recipe_schedule=fixed_recipe_schedule,
             fixed_depth=fixed_depth,
         )
+
+    def _validate_fixed_recipe_schedule(
+        self,
+        fixed_recipe_schedule: list[int] | tuple[int, ...] | None,
+    ) -> tuple[int, ...] | None:
+        if fixed_recipe_schedule is None:
+            return None
+        schedule = tuple(int(recipe_id) for recipe_id in fixed_recipe_schedule)
+        if len(schedule) < self.config.t_max:
+            raise ValueError(
+                f"fixed_recipe_schedule length {len(schedule)} is shorter than t_max={self.config.t_max}"
+            )
+        for recipe_id in schedule[: self.config.t_max]:
+            if recipe_id < 0 or recipe_id >= self.config.recipe_count:
+                raise ValueError(
+                    f"fixed_recipe_schedule recipe {recipe_id} is outside [0, {self.config.recipe_count})"
+                )
+        return schedule
 
     def forward_exact_from_h0(
         self,
@@ -216,8 +236,10 @@ class RecursiveModel(nn.Module):
         *,
         router_decisions: RouterOutput | None = None,
         fixed_recipe: int | None = None,
+        fixed_recipe_schedule: list[int] | tuple[int, ...] | None = None,
         fixed_depth: int | None = None,
     ) -> ModelOutput:
+        schedule = self._validate_fixed_recipe_schedule(fixed_recipe_schedule)
         route = self._route(
             h0,
             fixed_recipe=fixed_recipe,
@@ -229,10 +251,28 @@ class RecursiveModel(nn.Module):
         boundaries = set(self.config.depth_choices)
         for t in range(self.config.t_max):
             active = route.depth > t
-            h = self.core.forward_step(h, h0, route.recipe_id, active, pass_idx=t)
+            recipe_id_t = route.recipe_id
+            if schedule is not None:
+                recipe_id_t = torch.full_like(route.recipe_id, schedule[t])
+            h = self.core.forward_step(h, h0, recipe_id_t, active, pass_idx=t)
             boundary = t + 1
             if return_states and boundary in boundaries:
                 states[boundary] = h.clone()
+        active_touches = self.active_touch_table[route.recipe_id]
+        if schedule is not None:
+            schedule_ids = torch.tensor(
+                schedule[: self.config.t_max],
+                dtype=torch.long,
+                device=route.depth.device,
+            )
+            touch_values = self.active_touch_table[schedule_ids]
+            active_by_pass = torch.arange(self.config.t_max, device=route.depth.device).unsqueeze(
+                0
+            ) < route.depth.unsqueeze(1)
+            weights = active_by_pass.to(touch_values.dtype)
+            active_touches = (weights * touch_values.unsqueeze(0)).sum(dim=1) / weights.sum(
+                dim=1
+            ).clamp_min(1.0)
         hidden, logits = self._coda_logits(h)
         loss_per_sample = lm_loss_per_sample(logits, targets) if targets is not None else None
         loss = loss_per_sample.mean() if loss_per_sample is not None else None
@@ -247,7 +287,7 @@ class RecursiveModel(nn.Module):
             hidden=hidden,
             logits=logits,
             states=states if return_states else None,
-            active_touches=self.active_touch_table[route.recipe_id],
+            active_touches=active_touches,
         )
         return ModelOutput(loss=loss, loss_per_sample=loss_per_sample, logits=logits, meta=meta)
 

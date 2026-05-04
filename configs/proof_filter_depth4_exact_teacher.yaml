@@ -61,6 +61,7 @@ training:
   lambda_cons: 0.001
   distill_temperature: 2.0
   fixed_recipe: 1
+  fixed_recipe_schedule: [1, 5, 9, 13]
   fixed_depth: 4
   disable_router_aux: true
   debug_force_full_output: true

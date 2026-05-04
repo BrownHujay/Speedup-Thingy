@@ -370,6 +370,38 @@ class TrainEngine:
             param_norm = param_sq**0.5
             metrics[f"grad_norm_{name}"] = grad_norm
             metrics[f"update_ratio_{name}"] = float(group["lr"]) * grad_norm / max(param_norm, 1e-12)
+        if self.recursive_model is not None:
+            core_lr = next(
+                (
+                    float(group["lr"])
+                    for group in self.optimizer.param_groups
+                    if group.get("name") == "core"
+                ),
+                self.config.training.effective_lr_base,
+            )
+            pass_groups = {
+                "pass_film": (
+                    self.recursive_model.core.pass_gamma1,
+                    self.recursive_model.core.pass_beta1,
+                    self.recursive_model.core.pass_gamma2,
+                    self.recursive_model.core.pass_beta2,
+                ),
+                "pass_scale": (
+                    self.recursive_model.core.pass_attn_scale,
+                    self.recursive_model.core.pass_mlp_scale,
+                ),
+            }
+            for name, params in pass_groups.items():
+                grad_sq = 0.0
+                param_sq = 0.0
+                for param in params:
+                    param_sq += float(param.detach().float().square().sum().cpu())
+                    if param.grad is not None:
+                        grad_sq += float(param.grad.detach().float().square().sum().cpu())
+                grad_norm = grad_sq**0.5
+                param_norm = param_sq**0.5
+                metrics[f"grad_norm_{name}"] = grad_norm
+                metrics[f"update_ratio_{name}"] = core_lr * grad_norm / max(param_norm, 1e-12)
         return metrics
 
     def _finish_step(self, loss: torch.Tensor) -> bool:
@@ -526,6 +558,7 @@ class TrainEngine:
                     return_states=True,
                     return_loss_per_sample=True,
                     fixed_recipe=tr.fixed_recipe,
+                    fixed_recipe_schedule=tr.fixed_recipe_schedule,
                     fixed_depth=tr.fixed_depth,
                 )
             assert out.loss_per_sample is not None and out.meta.router is not None
@@ -553,6 +586,7 @@ class TrainEngine:
             "lr": current_lr,
             "active_touches_per_token": out.meta.active_touches.mean() if out.meta.active_touches is not None else 0.0,
             "avg_depth": out.meta.depths.float().mean() if out.meta.depths is not None else 0.0,
+            "fixed_recipe_schedule": tr.fixed_recipe_schedule or [],
             **self._accum_metrics(tokens, stepped),
             **self.last_grad_metrics,
             **{f"aux_{k}": v for k, v in aux.items()},

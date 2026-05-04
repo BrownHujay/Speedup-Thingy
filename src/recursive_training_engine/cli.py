@@ -182,6 +182,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
                     targets,
                     return_loss_per_sample=True,
                     fixed_recipe=config.training.fixed_recipe,
+                    fixed_recipe_schedule=config.training.fixed_recipe_schedule,
                     fixed_depth=config.training.fixed_depth,
                 )
             elif config.training.mode in {"recursive_macro", "recursive_macro_lm_aligned", "recursive_macro_distill_only"}:
