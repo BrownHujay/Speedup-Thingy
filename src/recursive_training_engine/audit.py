@@ -6,8 +6,11 @@ from dataclasses import dataclass
 import torch
 
 from recursive_training_engine.config import TrainingConfig
-from recursive_training_engine.macro import macro_distill_loss
-from recursive_training_engine.metrics import hidden_cosine, logit_kl
+from recursive_training_engine.macro import (
+    macro_alignment_metrics,
+    macro_distill_loss,
+)
+from recursive_training_engine.metrics import logit_kl
 from recursive_training_engine.models import ModelMeta, ModelOutput, RecursiveModel
 from recursive_training_engine.routing import RouterOutput
 
@@ -30,6 +33,8 @@ class AuditEngine:
         self.last_candidate_count = 0
         self.last_capped_fraction = 0.0
         self.last_sample_mode = "bernoulli"
+        self.last_hidden_mse: float | None = None
+        self.last_macro_norm: float | None = None
 
     def state_dict(self) -> dict[str, object]:
         return {
@@ -38,6 +43,8 @@ class AuditEngine:
             "last_candidate_count": self.last_candidate_count,
             "last_capped_fraction": self.last_capped_fraction,
             "last_sample_mode": self.last_sample_mode,
+            "last_hidden_mse": self.last_hidden_mse,
+            "last_macro_norm": self.last_macro_norm,
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
@@ -47,6 +54,10 @@ class AuditEngine:
         self.last_candidate_count = int(state.get("last_candidate_count", 0))
         self.last_capped_fraction = float(state.get("last_capped_fraction", 0.0))
         self.last_sample_mode = str(state.get("last_sample_mode", "bernoulli"))
+        last_mse = state.get("last_hidden_mse")
+        last_norm = state.get("last_macro_norm")
+        self.last_hidden_mse = float(last_mse) if last_mse is not None else None
+        self.last_macro_norm = float(last_norm) if last_norm is not None else None
 
     def _recipe_coverage_deficit(self, recipe_ids: torch.Tensor, recipe_count: int) -> torch.Tensor:
         if self.recipe_audit_ema is None or self.recipe_audit_ema.numel() != recipe_count:
@@ -136,10 +147,32 @@ class AuditEngine:
             min_count = max(1, batch_size // 128)
         hidden_cos = float(metrics.get("hidden_cosine_exact_macro", torch.tensor(0.0)).detach().cpu())
         residual_var = float(metrics.get("audit_residual_var", torch.tensor(float("inf"))).detach().cpu())
-        loss_gap = abs(float(metrics.get("loss_residual", torch.tensor(float("inf"))).detach().cpu()))
+        loss_gap_metric = metrics.get("hot_exact_nll_gap", metrics.get("loss_residual", torch.tensor(float("inf"))))
+        loss_gap = abs(float(loss_gap_metric.detach().cpu()))
+        delta_rms_ratio = float(metrics.get("delta_rms_ratio", torch.tensor(float("inf"))).detach().cpu())
+        hidden_mse = float(metrics.get("hidden_mse_exact_macro", torch.tensor(float("inf"))).detach().cpu())
+        macro_norm = float(metrics.get("macro_norm", torch.tensor(float("inf"))).detach().cpu())
+        exact_norm = float(metrics.get("exact_norm", torch.tensor(0.0)).detach().cpu())
+        norm_threshold = self.config.audit_schedule_macro_norm_threshold
+        if norm_threshold is None:
+            norm_threshold = self.config.audit_schedule_macro_norm_threshold_mult * exact_norm
+        hidden_mse_slope = 0.0 if self.last_hidden_mse is None else hidden_mse - self.last_hidden_mse
+        macro_norm_slope = 0.0 if self.last_macro_norm is None else macro_norm - self.last_macro_norm
         good = (
-            loss_gap <= self.config.audit_schedule_gap_threshold
+            loss_gap <= self.config.audit_schedule_nll_gap_threshold
             and hidden_cos >= self.config.audit_schedule_hidden_cosine_threshold
+            and delta_rms_ratio >= self.config.audit_schedule_delta_rms_ratio_min
+            and delta_rms_ratio <= self.config.audit_schedule_delta_rms_ratio_max
+            and hidden_mse <= self.config.audit_schedule_hidden_mse_threshold
+            and macro_norm <= norm_threshold
+            and (
+                not self.config.audit_schedule_require_negative_mse_slope
+                or hidden_mse_slope <= 0
+            )
+            and (
+                not self.config.audit_schedule_require_negative_norm_slope
+                or macro_norm_slope <= 0
+            )
             and residual_var <= self.config.audit_schedule_residual_var_threshold
         )
         if good:
@@ -148,6 +181,8 @@ class AuditEngine:
             next_count = min(batch_size, max(current, min(batch_size, current * 2)))
         self.config.audit_fixed_count_per_batch = next_count
         self.config.audit_fixed_count = next_count
+        self.last_hidden_mse = hidden_mse
+        self.last_macro_norm = macro_norm
 
     def run_exact_subset(
         self,
@@ -178,15 +213,24 @@ class AuditEngine:
         if hot_endpoint is not None and exact_endpoint is not None:
             hot_hidden = hot_endpoint
             exact_hidden = exact_endpoint
+            h0 = hot_meta.h0
             if hot_hidden.shape[0] != exact_hidden.shape[0]:
                 hot_hidden = hot_hidden[: exact_hidden.shape[0]]
-            cos = hidden_cosine(hot_hidden, exact_hidden)
-            mse = (hot_hidden - exact_hidden).square().mean()
-            metrics["hidden_cosine"] = cos.mean()
-            metrics["hidden_cosine_exact_macro"] = cos.mean()
-            metrics["hidden_mse_exact_macro"] = mse
-            metrics["hidden_residual_l2"] = mse.sqrt()
-            self.recent_residual = float((1.0 - cos.mean()).detach().clamp_min(0).cpu())
+                if h0 is not None:
+                    h0 = h0[: exact_hidden.shape[0]]
+            align = macro_alignment_metrics(
+                hot_hidden,
+                exact_hidden,
+                h0=h0,
+                hot_logits=hot_meta.logits,
+                exact_logits=exact_meta.logits,
+            )
+            metrics.update(align)
+            metrics["hidden_cosine"] = align["hidden_cosine_exact_macro"]
+            metrics["hidden_residual_l2"] = align["hidden_mse_exact_macro"].sqrt()
+            self.recent_residual = float(
+                (1.0 - align["hidden_cosine_exact_macro"]).detach().clamp_min(0).cpu()
+            )
         if hot_meta.logits is not None and exact_meta.logits is not None:
             hot_logits = hot_meta.logits
             exact_logits = exact_meta.logits
@@ -218,6 +262,11 @@ class AuditEngine:
             "kl": hot.loss_per_sample.new_zeros(()),
             "norm": hot.loss_per_sample.new_zeros(()),
             "cons": hot.loss_per_sample.new_zeros(()),
+            "delta_dir": hot.loss_per_sample.new_zeros(()),
+            "delta_rms": hot.loss_per_sample.new_zeros(()),
+            "endpoint_normed": hot.loss_per_sample.new_zeros(()),
+            "endpoint_raw": hot.loss_per_sample.new_zeros(()),
+            "rms_trust": hot.loss_per_sample.new_zeros(()),
         }
         metrics: dict[str, torch.Tensor] = {
             "audit_probability": p_audit.mean(),
@@ -286,10 +335,18 @@ class AuditEngine:
                     exact_endpoint,
                     hot.meta.logits[mask] if hot.meta.logits is not None else None,
                     exact.meta.logits,
+                    h0=hot.meta.h0[mask] if hot.meta.h0 is not None else None,
                     lambda_hid=self.config.effective_lambda_hid,
                     lambda_cos=self.config.effective_lambda_cos,
                     lambda_kl=self.config.effective_lambda_kl,
                     lambda_norm=self.config.lambda_norm,
+                    lambda_delta_dir=self.config.lambda_delta_dir,
+                    lambda_delta_rms=self.config.lambda_delta_rms,
+                    lambda_endpoint_normed=self.config.lambda_endpoint_normed,
+                    lambda_endpoint_raw=self.config.lambda_endpoint_raw,
+                    lambda_macro_rms_trust=self.config.lambda_macro_rms_trust
+                    if self.config.macro_rms_trust_region
+                    else 0.0,
                     temperature=self.config.distill_temperature,
                 )
                 macro_aux.update(losses)
@@ -298,6 +355,7 @@ class AuditEngine:
                     ModelMeta(
                         recurrent_hidden=hot_endpoint,
                         logits=hot.meta.logits[mask] if hot.meta.logits is not None else None,
+                        h0=hot.meta.h0[mask] if hot.meta.h0 is not None else None,
                     ),
                     exact.meta,
                 )

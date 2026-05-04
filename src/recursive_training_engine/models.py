@@ -37,6 +37,36 @@ class ModelOutput:
     meta: ModelMeta
 
 
+def load_compatible_state_dict(
+    model: nn.Module,
+    state: dict[str, torch.Tensor],
+    *,
+    skip_prefixes: tuple[str, ...] = (),
+) -> dict[str, list[str]]:
+    current = model.state_dict()
+    loaded: dict[str, torch.Tensor] = {}
+    skipped: list[str] = []
+    mismatched: list[str] = []
+    for key, value in state.items():
+        if any(key.startswith(prefix) for prefix in skip_prefixes):
+            skipped.append(key)
+            continue
+        if key not in current:
+            skipped.append(key)
+            continue
+        if current[key].shape != value.shape:
+            mismatched.append(key)
+            continue
+        loaded[key] = value
+    result = model.load_state_dict(loaded, strict=False)
+    return {
+        "missing": list(result.missing_keys),
+        "unexpected": list(result.unexpected_keys),
+        "skipped": skipped,
+        "mismatched": mismatched,
+    }
+
+
 def lm_loss_per_sample(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     token_loss = F.cross_entropy(logits.flatten(0, -2), targets.flatten(), reduction="none")
     return token_loss.view_as(targets).sum(dim=-1)

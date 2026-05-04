@@ -30,13 +30,19 @@ class ModelConfig:
     use_rope: bool = True
     use_recursive_input_skip: bool = True
     fairness_tolerance: float = 0.01
+    macro_type: Literal["bounded_residual", "v2_delta_radius"] = "bounded_residual"
     macro_rank: int = 32
     macro_update_scale: float = 0.05
     macro_hidden_mult: int = 1
     macro_use_gated_update: bool = False
     macro_update_scale_init: float = 1.0
     macro_include_delta_to_h0: bool = False
+    macro_use_delta_to_h0: bool = False
     macro_use_depth_embedding: bool = False
+    macro_use_recipe_embedding: bool = False
+    macro_radius_init_from_teacher: bool = False
+    macro_radius_clamp_mult_min: float = 0.25
+    macro_radius_clamp_mult_max: float = 4.0
     macro_decomposition: Literal["direct", "binary", "greedy", "consistency_tree"] = "direct"
     router_hidden: int | None = None
 
@@ -63,6 +69,12 @@ class ModelConfig:
             raise ValueError("macro_hidden_mult must be positive")
         if self.macro_update_scale_init < 0:
             raise ValueError("macro_update_scale_init must be non-negative")
+        if self.macro_radius_clamp_mult_min < 0:
+            raise ValueError("macro_radius_clamp_mult_min must be non-negative")
+        if self.macro_radius_clamp_mult_max <= 0:
+            raise ValueError("macro_radius_clamp_mult_max must be positive")
+        if self.macro_radius_clamp_mult_max < self.macro_radius_clamp_mult_min:
+            raise ValueError("macro_radius_clamp_mult_max must be >= macro_radius_clamp_mult_min")
 
 
 @dataclass(slots=True)
@@ -110,8 +122,16 @@ class TrainingConfig:
     audit_schedule_enabled: bool = False
     audit_schedule_min_count: int | None = None
     audit_schedule_gap_threshold: float = 0.05
+    audit_schedule_nll_gap_threshold: float = 0.05
     audit_schedule_hidden_cosine_threshold: float = 0.98
     audit_schedule_residual_var_threshold: float = 1.0
+    audit_schedule_delta_rms_ratio_min: float = 0.9
+    audit_schedule_delta_rms_ratio_max: float = 1.1
+    audit_schedule_hidden_mse_threshold: float = 1.0
+    audit_schedule_macro_norm_threshold: float | None = None
+    audit_schedule_macro_norm_threshold_mult: float = 2.0
+    audit_schedule_require_negative_mse_slope: bool = True
+    audit_schedule_require_negative_norm_slope: bool = True
     target_speedup_vs_dense: float | None = None
     max_active_param_equiv_per_token: float | None = None
     max_hotpath_flops_per_token: float | None = None
@@ -125,6 +145,15 @@ class TrainingConfig:
     lambda_hidden_cosine: float | None = None
     lambda_logit_kl: float | None = None
     lambda_norm: float = 0.05
+    lambda_delta_dir: float = 2.0
+    lambda_delta_rms: float = 2.0
+    lambda_endpoint_normed: float = 1.0
+    lambda_endpoint_raw: float = 0.05
+    macro_rms_trust_region: bool = False
+    macro_rms_clamp_early: bool = False
+    macro_rms_clamp_min: float = 0.5
+    macro_rms_clamp_max: float = 2.0
+    lambda_macro_rms_trust: float = 2.0
     distill_temperature: float = 2.0
     lambda_cons: float = 1e-3
     coverage_min: float = 0.01
@@ -134,6 +163,12 @@ class TrainingConfig:
     disable_router_aux: bool = False
     debug_force_full_output: bool = False
     coda_warmup_steps: int = 0
+    aligned_lm_teacher_checkpoint: str | None = None
+    aligned_lm_freeze_teacher: bool = True
+    aligned_lm_phase_a_train: list[str] = field(default_factory=lambda: ["macro"])
+    aligned_lm_phase_b_train: list[str] = field(default_factory=lambda: ["macro", "coda"])
+    aligned_lm_phase_c_train: list[str] = field(default_factory=lambda: ["macro", "coda", "output"])
+    unfreeze_prelude_core_after_gate: bool = True
     log_every: int = 1
     compile_model: bool = False
     compile_mode: Literal["default", "reduce-overhead", "max-autotune"] = "reduce-overhead"
@@ -173,6 +208,21 @@ class TrainingConfig:
                 raise ValueError("audit_fixed_count_per_batch must be <= batch_size")
         if self.audit_schedule_min_count is not None and self.audit_schedule_min_count < 0:
             raise ValueError("audit_schedule_min_count must be non-negative when provided")
+        if self.audit_schedule_delta_rms_ratio_min < 0:
+            raise ValueError("audit_schedule_delta_rms_ratio_min must be non-negative")
+        if self.audit_schedule_delta_rms_ratio_max < self.audit_schedule_delta_rms_ratio_min:
+            raise ValueError(
+                "audit_schedule_delta_rms_ratio_max must be >= audit_schedule_delta_rms_ratio_min"
+            )
+        if self.audit_schedule_hidden_mse_threshold < 0:
+            raise ValueError("audit_schedule_hidden_mse_threshold must be non-negative")
+        if (
+            self.audit_schedule_macro_norm_threshold is not None
+            and self.audit_schedule_macro_norm_threshold < 0
+        ):
+            raise ValueError("audit_schedule_macro_norm_threshold must be non-negative")
+        if self.audit_schedule_macro_norm_threshold_mult < 0:
+            raise ValueError("audit_schedule_macro_norm_threshold_mult must be non-negative")
         if (
             self.audit_mode == "gradient_corrected"
             and not self.audit_gradient_correction
@@ -191,6 +241,10 @@ class TrainingConfig:
             raise ValueError("max_active_param_equiv_per_token must be positive")
         if self.max_hotpath_flops_per_token is not None and self.max_hotpath_flops_per_token <= 0:
             raise ValueError("max_hotpath_flops_per_token must be positive")
+        if self.macro_rms_clamp_min <= 0 or self.macro_rms_clamp_max <= 0:
+            raise ValueError("macro_rms_clamp_min/max must be positive")
+        if self.macro_rms_clamp_max < self.macro_rms_clamp_min:
+            raise ValueError("macro_rms_clamp_max must be >= macro_rms_clamp_min")
 
     @property
     def effective_lr_base(self) -> float:

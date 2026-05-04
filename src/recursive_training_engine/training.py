@@ -16,13 +16,14 @@ from recursive_training_engine.metrics import (
     dense_param_count,
     estimate_hot_active_param_equiv_per_token,
     estimate_hot_flops_per_token,
-    hidden_cosine,
-    logit_kl,
     recursive_param_count,
     router_aux_losses,
 )
-from recursive_training_engine.macro import macro_distill_loss
-from recursive_training_engine.models import DenseModel, ModelOutput, RecursiveModel
+from recursive_training_engine.macro import (
+    macro_alignment_metrics,
+    macro_distill_loss,
+)
+from recursive_training_engine.models import DenseModel, ModelOutput, RecursiveModel, load_compatible_state_dict
 from recursive_training_engine.reporting import JsonlLogger
 from recursive_training_engine.utils import WallTimer, default_device, maybe_peak_memory, set_seed
 
@@ -62,6 +63,7 @@ class TrainEngine:
                 torch.backends.cudnn.allow_tf32 = True
         self.dense_model = dense_model
         self.recursive_model = recursive_model
+        self.teacher_model: RecursiveModel | None = None
         if dense_model is None and config.model.topology == "dense":
             self.dense_model = DenseModel(config.model)
         if recursive_model is None and config.model.topology == "recursive":
@@ -70,6 +72,25 @@ class TrainEngine:
             self.dense_model.to(self.device)
         if self.recursive_model is not None:
             self.recursive_model.to(self.device)
+        if (
+            config.training.mode == "recursive_macro_lm_aligned"
+            and config.training.aligned_lm_freeze_teacher
+            and config.training.aligned_lm_teacher_checkpoint is not None
+        ):
+            self.teacher_model = RecursiveModel(config.model, config.output).to(self.device)
+            payload = torch.load(
+                config.training.aligned_lm_teacher_checkpoint,
+                map_location=self.device,
+                weights_only=False,
+            )
+            if payload.get("model") is None:
+                raise RuntimeError(
+                    f"teacher checkpoint has no model state: {config.training.aligned_lm_teacher_checkpoint}"
+                )
+            load_compatible_state_dict(self.teacher_model, payload["model"], skip_prefixes=("macro.",))
+            self.teacher_model.eval()
+            for param in self.teacher_model.parameters():
+                param.requires_grad_(False)
         if config.training.compile_model and hasattr(torch, "compile") and self.device.type != "mps":
             if self.dense_model is not None:
                 self.dense_model = torch.compile(
@@ -77,6 +98,7 @@ class TrainEngine:
                 )
             if self.recursive_model is not None:
                 self.recursive_model.compile_hot_paths(mode=config.training.compile_mode)
+        self.aligned_lm_phase = "A"
         self._apply_trainable_policy()
         self.optimizer = self._build_optimizer(self._optimizer_param_groups())
         self.optimizer.zero_grad(set_to_none=True)
@@ -109,20 +131,136 @@ class TrainEngine:
                 param.requires_grad_(False)
             for param in self.recursive_model.macro.parameters():
                 param.requires_grad_(True)
+        if self.config.training.mode == "recursive_macro_lm_aligned":
+            self._set_recursive_trainable_modules(self.config.training.aligned_lm_phase_a_train)
+
+    def _set_recursive_trainable_modules(self, trainable_names: list[str]) -> None:
+        if self.recursive_model is None:
+            return
+        names = set(trainable_names)
+        for param in self.recursive_model.parameters():
+            param.requires_grad_(False)
+        module_params: dict[str, list[torch.nn.Parameter]] = {
+            "embedding": list(self.recursive_model.embed.parameters()),
+            "prelude": list(self.recursive_model.prelude.parameters()),
+            "core": list(self.recursive_model.core.parameters()),
+            "macro": list(self.recursive_model.macro.parameters()),
+            "coda": [*self.recursive_model.coda.parameters(), *self.recursive_model.final_norm.parameters()],
+            "router": list(self.recursive_model.router.parameters()),
+            "output": list(self.recursive_model.lm_head.parameters())
+            if self.recursive_model.lm_head is not None
+            else [],
+        }
+        for name in names:
+            for param in module_params.get(name, []):
+                param.requires_grad_(True)
+
+    def _metric_float(
+        self,
+        metrics: dict[str, Any] | None,
+        *names: str,
+        default: float | None = None,
+    ) -> float | None:
+        if metrics is None:
+            return default
+        for name in names:
+            if name not in metrics:
+                continue
+            value = metrics[name]
+            if isinstance(value, torch.Tensor):
+                return float(value.detach().float().cpu())
+            return float(value)
+        return default
+
+    def _aligned_lm_phase_a_gate(self, metrics: dict[str, Any]) -> bool:
+        tr = self.config.training
+        hidden_cos = self._metric_float(metrics, "hidden_cosine_exact_macro", "audit_hidden_cosine_exact_macro", default=0.0)
+        gap_value = self._metric_float(metrics, "hot_exact_nll_gap", default=float("inf"))
+        gap = abs(float("inf") if gap_value is None else gap_value)
+        delta_ratio = self._metric_float(metrics, "delta_rms_ratio", "audit_delta_rms_ratio", default=float("inf"))
+        hidden_mse = self._metric_float(metrics, "hidden_mse_exact_macro", "audit_hidden_mse_exact_macro", default=float("inf"))
+        macro_norm = self._metric_float(metrics, "macro_norm", "audit_macro_norm", default=float("inf"))
+        exact_norm = self._metric_float(metrics, "exact_norm", "audit_exact_norm", default=0.0) or 0.0
+        prev_mse = self._metric_float(
+            self.last_metrics,
+            "hidden_mse_exact_macro",
+            "audit_hidden_mse_exact_macro",
+            default=None,
+        )
+        prev_norm = self._metric_float(self.last_metrics, "macro_norm", "audit_macro_norm", default=None)
+        mse_ok = prev_mse is None or hidden_mse <= max(prev_mse + 0.05, 1.0)
+        norm_limit = tr.audit_schedule_macro_norm_threshold
+        if norm_limit is None:
+            norm_limit = tr.audit_schedule_macro_norm_threshold_mult * exact_norm
+        norm_ok = macro_norm <= norm_limit and (
+            prev_norm is None or macro_norm <= max(prev_norm * 1.05, prev_norm + 0.05)
+        )
+        return (
+            (0.0 if hidden_cos is None else hidden_cos) >= 0.95
+            and (float("inf") if delta_ratio is None else delta_ratio) >= 0.8
+            and (float("inf") if delta_ratio is None else delta_ratio) <= 1.25
+            and gap <= 0.25
+            and mse_ok
+            and norm_ok
+        )
+
+    def _aligned_lm_phase_b_gate(self, metrics: dict[str, Any]) -> bool:
+        tr = self.config.training
+        hidden_cos = self._metric_float(metrics, "hidden_cosine_exact_macro", "audit_hidden_cosine_exact_macro", default=0.0)
+        gap_value = self._metric_float(metrics, "hot_exact_nll_gap", default=float("inf"))
+        gap = abs(float("inf") if gap_value is None else gap_value)
+        delta_ratio = self._metric_float(metrics, "delta_rms_ratio", "audit_delta_rms_ratio", default=float("inf"))
+        hidden_mse = self._metric_float(metrics, "hidden_mse_exact_macro", "audit_hidden_mse_exact_macro", default=float("inf"))
+        macro_norm = self._metric_float(metrics, "macro_norm", "audit_macro_norm", default=float("inf"))
+        exact_norm = self._metric_float(metrics, "exact_norm", "audit_exact_norm", default=0.0) or 0.0
+        prev_mse = self._metric_float(
+            self.last_metrics,
+            "hidden_mse_exact_macro",
+            "audit_hidden_mse_exact_macro",
+            default=None,
+        )
+        norm_limit = tr.audit_schedule_macro_norm_threshold
+        if norm_limit is None:
+            norm_limit = tr.audit_schedule_macro_norm_threshold_mult * exact_norm
+        return (
+            (0.0 if hidden_cos is None else hidden_cos) >= tr.audit_schedule_hidden_cosine_threshold
+            and (float("inf") if delta_ratio is None else delta_ratio) >= tr.audit_schedule_delta_rms_ratio_min
+            and (float("inf") if delta_ratio is None else delta_ratio) <= tr.audit_schedule_delta_rms_ratio_max
+            and gap <= tr.audit_schedule_nll_gap_threshold
+            and (float("inf") if hidden_mse is None else hidden_mse) <= max(
+                tr.audit_schedule_hidden_mse_threshold,
+                (0.0 if prev_mse is None else prev_mse) + 0.05,
+            )
+            and (float("inf") if macro_norm is None else macro_norm) <= norm_limit
+        )
+
+    def _maybe_update_aligned_lm_phase(self, metrics: dict[str, Any]) -> None:
+        tr = self.config.training
+        if tr.mode != "recursive_macro_lm_aligned":
+            return
+        if self.aligned_lm_phase == "A":
+            if self.global_step >= tr.coda_warmup_steps and self._aligned_lm_phase_a_gate(metrics):
+                self.aligned_lm_phase = "B"
+        elif self.aligned_lm_phase == "B":
+            if not self._aligned_lm_phase_a_gate(metrics):
+                self.aligned_lm_phase = "A"
+            elif tr.unfreeze_prelude_core_after_gate and self._aligned_lm_phase_b_gate(metrics):
+                self.aligned_lm_phase = "C"
+        elif self.aligned_lm_phase == "C" and not self._aligned_lm_phase_b_gate(metrics):
+            self.aligned_lm_phase = "B"
 
     def _set_coda_trainable_for_schedule(self) -> None:
         if self.recursive_model is None:
             return
         tr = self.config.training
-        if tr.mode != "recursive_macro_lm_aligned" or tr.coda_warmup_steps <= 0:
+        if tr.mode != "recursive_macro_lm_aligned":
             return
-        trainable = self.global_step >= tr.coda_warmup_steps
-        for module in (self.recursive_model.coda, self.recursive_model.final_norm):
-            for param in module.parameters():
-                param.requires_grad_(trainable)
-        if self.recursive_model.lm_head is not None:
-            for param in self.recursive_model.lm_head.parameters():
-                param.requires_grad_(trainable)
+        phase_train = tr.aligned_lm_phase_a_train
+        if self.aligned_lm_phase == "B":
+            phase_train = tr.aligned_lm_phase_b_train
+        elif self.aligned_lm_phase == "C":
+            phase_train = tr.aligned_lm_phase_c_train
+        self._set_recursive_trainable_modules(phase_train)
 
     def _dedupe_params(self, params: list[torch.nn.Parameter], seen: set[int]) -> list[torch.nn.Parameter]:
         out = []
@@ -461,9 +599,10 @@ class TrainEngine:
                     fixed_depth=tr.fixed_depth,
                 )
             assert hot.loss_per_sample is not None and hot.meta.router is not None
+            audit_model = self.teacher_model if self.teacher_model is not None else self.recursive_model
             with self._autocast():
                 audit = self.audit_engine.correction(
-                    self.recursive_model,
+                    audit_model,
                     tokens,
                     targets,
                     hot,
@@ -528,6 +667,7 @@ class TrainEngine:
             "coda_trainable": any(
                 param.requires_grad for param in self.recursive_model.coda.parameters()
             ),
+            "aligned_lm_phase": self.aligned_lm_phase,
             "active_touches_per_token": hot.meta.active_touches.mean() if hot.meta.active_touches is not None else 0.0,
             "avg_depth": hot.meta.depths.float().mean() if hot.meta.depths is not None else 0.0,
             "unique_recipes_per_batch": hot.meta.recipe_ids.unique().numel() if hot.meta.recipe_ids is not None else 0.0,
@@ -547,9 +687,25 @@ class TrainEngine:
             "macro_hidden_loss": audit.macro_aux.get("hid", hot.loss_per_sample.new_zeros(())),
             "macro_logit_kl_loss": audit.macro_aux.get("kl", hot.loss_per_sample.new_zeros(())),
             "macro_consistency_loss": audit.macro_aux.get("cons", hot.loss_per_sample.new_zeros(())),
+            "macro_delta_dir_loss": audit.macro_aux.get("delta_dir", hot.loss_per_sample.new_zeros(())),
+            "macro_delta_rms_loss": audit.macro_aux.get("delta_rms", hot.loss_per_sample.new_zeros(())),
+            "macro_endpoint_normed_loss": audit.macro_aux.get(
+                "endpoint_normed",
+                hot.loss_per_sample.new_zeros(()),
+            ),
+            "macro_endpoint_raw_loss": audit.macro_aux.get(
+                "endpoint_raw",
+                hot.loss_per_sample.new_zeros(()),
+            ),
+            "macro_rms_trust_loss": audit.macro_aux.get("rms_trust", hot.loss_per_sample.new_zeros(())),
             **{f"aux_{k}": v for k, v in aux_router.items()},
         }
+        if audit.exact is not None and audit.exact.loss_per_sample is not None:
+            exact_eval_nll = audit.exact.loss_per_sample.mean() / float(targets.shape[1])
+            metrics["exact_eval_nll"] = exact_eval_nll
+            metrics["hot_exact_nll_gap"] = metrics["hot_eval_nll"] - exact_eval_nll
         self.tokens_seen += int(tokens.numel())
+        self._maybe_update_aligned_lm_phase(metrics)
         self._maybe_log(metrics)
         return TrainStepResult(loss=loss, model_output=hot, metrics=metrics, audit=audit)
 
@@ -573,6 +729,27 @@ class TrainEngine:
                     fixed_recipe=tr.fixed_recipe,
                     fixed_depth=tr.fixed_depth,
                 )
+            if (
+                self.config.model.macro_type == "v2_delta_radius"
+                and self.config.model.macro_radius_init_from_teacher
+                and exact.meta.h0 is not None
+                and exact.meta.recurrent_hidden is not None
+                and tr.fixed_recipe is not None
+                and tr.fixed_depth is not None
+            ):
+                radius = (
+                    exact.meta.recurrent_hidden.detach() - exact.meta.h0.detach()
+                ).float().pow(2).mean(dim=(1, 2)).sqrt().mean()
+                current = self.recursive_model.macro.teacher_delta_rms[
+                    tr.fixed_recipe,
+                    self.recursive_model.macro.stride_to_idx[tr.fixed_depth],
+                ]
+                if float(current.detach().cpu()) == 0.0:
+                    self.recursive_model.macro.initialize_radius_from_teacher_delta(
+                        tr.fixed_recipe,
+                        tr.fixed_depth,
+                        radius,
+                    )
             with self._autocast():
                 hot = self.recursive_model.forward_macro(
                     tokens,
@@ -597,10 +774,18 @@ class TrainEngine:
                 exact_endpoint,
                 hot.meta.logits,
                 exact.meta.logits,
+                h0=hot.meta.h0,
                 lambda_hid=tr.effective_lambda_hid,
                 lambda_cos=tr.effective_lambda_cos,
                 lambda_kl=tr.effective_lambda_kl,
                 lambda_norm=tr.lambda_norm,
+                lambda_delta_dir=tr.lambda_delta_dir,
+                lambda_delta_rms=tr.lambda_delta_rms,
+                lambda_endpoint_normed=tr.lambda_endpoint_normed,
+                lambda_endpoint_raw=tr.lambda_endpoint_raw,
+                lambda_macro_rms_trust=tr.lambda_macro_rms_trust
+                if tr.macro_rms_trust_region
+                else 0.0,
                 temperature=tr.distill_temperature,
             )
             if tr.lambda_cons != 0.0 and hot.meta.h0 is not None and hot.meta.recipe_ids is not None:
@@ -621,13 +806,17 @@ class TrainEngine:
             exact.meta.recurrent_hidden if exact.meta.recurrent_hidden is not None else exact.meta.hidden
         )
         assert hot_endpoint is not None and exact_endpoint is not None
-        cos = hidden_cosine(hot_endpoint, exact_endpoint).mean()
-        kl = hot_endpoint.new_zeros(())
-        if hot.meta.logits is not None and exact.meta.logits is not None:
-            kl = logit_kl(exact.meta.logits, hot.meta.logits).mean()
-        hidden_mse = (hot_endpoint - exact_endpoint).square().mean()
         exact_nll = exact.loss_per_sample.mean() / float(targets.shape[1])
         hot_nll = hot.loss_per_sample.mean() / float(targets.shape[1])
+        align_metrics = macro_alignment_metrics(
+            hot_endpoint,
+            exact_endpoint,
+            h0=hot.meta.h0,
+            hot_logits=hot.meta.logits,
+            exact_logits=exact.meta.logits,
+            hot_nll=hot_nll,
+            exact_nll=exact_nll,
+        )
         metrics = {
             "mode": "recursive_macro_distill_only",
             "loss": loss,
@@ -636,12 +825,14 @@ class TrainEngine:
             "macro_logit_kl_loss": losses["kl"],
             "macro_consistency_loss": losses["cons"],
             "macro_norm_loss": losses["norm"],
+            "macro_delta_dir_loss": losses["delta_dir"],
+            "macro_delta_rms_loss": losses["delta_rms"],
+            "macro_endpoint_normed_loss": losses["endpoint_normed"],
+            "macro_endpoint_raw_loss": losses["endpoint_raw"],
+            "macro_rms_trust_loss": losses["rms_trust"],
             "exact_eval_nll": exact_nll,
             "hot_eval_nll": hot_nll,
-            "hot_exact_nll_gap": hot_nll - exact_nll,
-            "hidden_mse_exact_macro": hidden_mse,
-            "hidden_cosine_exact_macro": cos,
-            "logit_kl_exact_macro": kl,
+            **align_metrics,
             "step_time": timer.elapsed,
             "tokens_per_sec": tokens.numel() / max(timer.elapsed, 1e-9),
             "tokens_seen": self.tokens_seen,
@@ -657,6 +848,7 @@ class TrainEngine:
             "coda_trainable": any(
                 param.requires_grad for param in self.recursive_model.coda.parameters()
             ),
+            "aligned_lm_phase": self.aligned_lm_phase,
             "unique_recipes_per_batch": hot.meta.recipe_ids.unique().numel() if hot.meta.recipe_ids is not None else 0.0,
             "fixed_depth": tr.fixed_depth or 0,
             "fixed_recipe": tr.fixed_recipe or 0,
@@ -695,6 +887,7 @@ class TrainEngine:
             "global_micro_step": self.global_micro_step,
             "tokens_seen": self.tokens_seen,
             "audit": self.audit_engine.state_dict(),
+            "aligned_lm_phase": self.aligned_lm_phase,
             "data_cursor": data_cursor,
             "torch_rng_state": torch.get_rng_state(),
         }
@@ -721,6 +914,7 @@ class TrainEngine:
         self.global_micro_step = int(payload.get("global_micro_step", 0))
         self.tokens_seen = int(payload.get("tokens_seen", 0))
         self.audit_engine.load_state_dict(payload.get("audit", {}))
+        self.aligned_lm_phase = str(payload.get("aligned_lm_phase", self.aligned_lm_phase))
         if "torch_rng_state" in payload:
             torch.set_rng_state(payload["torch_rng_state"].detach().cpu())
         if torch.cuda.is_available() and "cuda_rng_state_all" in payload:
