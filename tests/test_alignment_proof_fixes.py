@@ -8,9 +8,9 @@ import torch
 
 from recursive_training_engine.audit import AuditEngine
 from recursive_training_engine.cli import main as cli_main
-from recursive_training_engine.config import load_config
+from recursive_training_engine.config import load_config, save_config
 from recursive_training_engine.macro import MacroOperators
-from recursive_training_engine.models import RecursiveModel
+from recursive_training_engine.models import DenseModel, RecursiveModel
 from recursive_training_engine.training import TrainEngine
 
 
@@ -97,6 +97,77 @@ def test_train_macro_teacher_loads_checkpoint_weights(tmp_path: Path) -> None:
     )
     loaded = torch.load(distilled, map_location="cpu", weights_only=False)["model"]
     assert torch.allclose(loaded["embed.weight"], model.state_dict()["embed.weight"])
+
+
+def test_transplant_and_operator_clone_cli_smoke(tmp_path: Path) -> None:
+    cfg = load_config("configs/tiny.yaml")
+    cfg = dataclasses.replace(
+        cfg,
+        output_dir=str(tmp_path),
+        run_name="clone-test",
+        model=dataclasses.replace(
+            cfg.model,
+            topology="recursive",
+            use_global_lowrank_corrector=True,
+            global_corrector_rank=4,
+        ),
+        training=dataclasses.replace(
+            cfg.training,
+            batch_size=2,
+            seq_len=8,
+            fixed_recipe=1,
+            fixed_recipe_schedule=[1, 2, 3, 1],
+            fixed_depth=4,
+            log_every=1000,
+        ),
+    )
+    config_path = tmp_path / "tiny-recursive.yaml"
+    save_config(cfg, config_path)
+    dense = DenseModel(dataclasses.replace(cfg.model, topology="dense"))
+    dense_checkpoint = tmp_path / "dense.pt"
+    torch.save({"model": dense.state_dict()}, dense_checkpoint)
+    init_checkpoint = tmp_path / "init.pt"
+
+    cli_main(
+        [
+            "transplant-dense-to-recursive",
+            "--dense-checkpoint",
+            str(dense_checkpoint),
+            "--recursive-config",
+            str(config_path),
+            "--output",
+            str(init_checkpoint),
+            "--use-global-lowrank-corrector",
+            "--global-corrector-rank",
+            "4",
+        ]
+    )
+    loaded = torch.load(init_checkpoint, map_location="cpu", weights_only=False)["model"]
+    assert torch.allclose(loaded["embed.weight"], dense.state_dict()["embed.weight"])
+
+    cli_main(
+        [
+            "operator-clone",
+            "--dense-checkpoint",
+            str(dense_checkpoint),
+            "--recursive-checkpoint",
+            str(init_checkpoint),
+            "--config",
+            str(config_path),
+            "--run-dir",
+            str(tmp_path / "clone"),
+            "--steps",
+            "1",
+            "--depth",
+            "4",
+            "--use-global-lowrank-corrector",
+            "--global-corrector-rank",
+            "4",
+            "--log-every",
+            "1000",
+        ]
+    )
+    assert (tmp_path / "clone" / "checkpoint.pt").exists()
 
 
 def test_macro_distill_freezes_coda(tmp_path: Path) -> None:

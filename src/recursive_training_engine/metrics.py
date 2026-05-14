@@ -27,6 +27,9 @@ def recursive_param_count(config: ModelConfig) -> int:
     dense_blocks = (config.n_prelude + config.n_coda) * dense_block_param_count(config)
     d = config.d_model
     core = config.attn_banks * 4 * d * d + config.ffn_banks * 3 * d * config.d_ff
+    if config.use_global_lowrank_corrector:
+        r = config.global_corrector_rank
+        core += 3 * d + config.t_max * r + 3 * d * r + config.t_max * r + config.t_max
     router = 2 * (d * (config.router_hidden or max(32, d)) + (config.router_hidden or max(32, d)))
     macro = config.recipe_count * len(config.depth_choices) * (
         d + 3 * d * config.macro_rank + config.macro_rank * d + d

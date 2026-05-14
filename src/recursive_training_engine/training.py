@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from contextlib import nullcontext
+import math
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from recursive_training_engine.artifacts import build_manifest, write_json
 from recursive_training_engine.audit import AuditEngine, AuditResult
@@ -25,6 +27,7 @@ from recursive_training_engine.macro import (
 )
 from recursive_training_engine.models import DenseModel, ModelOutput, RecursiveModel, load_compatible_state_dict
 from recursive_training_engine.reporting import JsonlLogger
+from recursive_training_engine.routing import RouterOutput
 from recursive_training_engine.utils import WallTimer, default_device, maybe_peak_memory, set_seed
 
 
@@ -64,6 +67,7 @@ class TrainEngine:
         self.dense_model = dense_model
         self.recursive_model = recursive_model
         self.teacher_model: RecursiveModel | None = None
+        self.dense_teacher_model: DenseModel | None = None
         if dense_model is None and config.model.topology == "dense":
             self.dense_model = DenseModel(config.model)
         if recursive_model is None and config.model.topology == "recursive":
@@ -72,6 +76,29 @@ class TrainEngine:
             self.dense_model.to(self.device)
         if self.recursive_model is not None:
             self.recursive_model.to(self.device)
+        if config.training.mode == "recursive_exact_dense_hidden_distill":
+            if config.training.aligned_lm_teacher_checkpoint is None:
+                raise RuntimeError(
+                    "recursive_exact_dense_hidden_distill requires --teacher-checkpoint "
+                    "pointing at a dense_exact checkpoint"
+                )
+            self.dense_teacher_model = DenseModel(
+                replace(config.model, topology="dense")
+            ).to(self.device)
+            payload = torch.load(
+                config.training.aligned_lm_teacher_checkpoint,
+                map_location=self.device,
+                weights_only=False,
+            )
+            if payload.get("model") is None:
+                raise RuntimeError(
+                    f"dense teacher checkpoint has no model state: "
+                    f"{config.training.aligned_lm_teacher_checkpoint}"
+                )
+            self.dense_teacher_model.load_state_dict(payload["model"], strict=True)
+            self.dense_teacher_model.eval()
+            for param in self.dense_teacher_model.parameters():
+                param.requires_grad_(False)
         if (
             config.training.mode == "recursive_macro_lm_aligned"
             and config.training.aligned_lm_freeze_teacher
@@ -402,6 +429,17 @@ class TrainEngine:
                 param_norm = param_sq**0.5
                 metrics[f"grad_norm_{name}"] = grad_norm
                 metrics[f"update_ratio_{name}"] = core_lr * grad_norm / max(param_norm, 1e-12)
+            if self.recursive_model.core.global_corrector is not None:
+                grad_sq = 0.0
+                param_sq = 0.0
+                for param in self.recursive_model.core.global_corrector.parameters():
+                    param_sq += float(param.detach().float().square().sum().cpu())
+                    if param.grad is not None:
+                        grad_sq += float(param.grad.detach().float().square().sum().cpu())
+                grad_norm = grad_sq**0.5
+                param_norm = param_sq**0.5
+                metrics["grad_norm_global_corrector"] = grad_norm
+                metrics["update_ratio_global_corrector"] = core_lr * grad_norm / max(param_norm, 1e-12)
         return metrics
 
     def _finish_step(self, loss: torch.Tensor) -> bool:
@@ -478,6 +516,193 @@ class TrainEngine:
             self.recursive_model.recipe_bank.usage_ema,
             tr,
         )
+
+    def _route_depth(self) -> int:
+        if self.recursive_model is None:
+            raise ValueError("recursive model is not available")
+        return int(self.config.training.fixed_depth or self.recursive_model.config.t_max)
+
+    def _proposal_recipe_logits(self, route_logits: torch.Tensor) -> torch.Tensor:
+        tr = self.config.training
+        logits = route_logits.clone()
+        if not tr.route_em_allow_dense_fallback and logits.shape[-1] > 1:
+            logits[..., 0] = torch.finfo(logits.dtype).min
+        return logits
+
+    def _sample_route_candidates(
+        self,
+        h0: torch.Tensor,
+        *,
+        count: int,
+        proposal: str | None = None,
+    ) -> tuple[RouterOutput, torch.Tensor]:
+        if self.recursive_model is None:
+            raise ValueError("recursive model is not available")
+        tr = self.config.training
+        model = self.recursive_model
+        batch = h0.shape[0]
+        t_max = model.config.t_max
+        recipe_start = 0 if tr.route_em_allow_dense_fallback else 1
+        if recipe_start >= model.config.recipe_count:
+            raise ValueError("route-em needs at least one selectable sparse recipe")
+        route = model.router(h0.detach(), fixed_depth=self._route_depth())
+        proposal = tr.route_em_proposal if proposal is None else proposal
+        if proposal == "random" or route.recipe_logits_by_pass is None:
+            schedules = torch.randint(
+                recipe_start,
+                model.config.recipe_count,
+                (batch, count, t_max),
+                device=h0.device,
+                dtype=torch.long,
+            )
+            return route, schedules
+        logits = self._proposal_recipe_logits(route.recipe_logits_by_pass.detach())
+        probs = F.softmax(logits, dim=-1)
+        top = probs.argmax(dim=-1)
+        schedules = torch.empty(
+            batch,
+            count,
+            t_max,
+            device=h0.device,
+            dtype=torch.long,
+        )
+        schedules[:, 0, :] = top
+        if count > 1:
+            draws = torch.multinomial(
+                probs.reshape(batch * t_max, model.config.recipe_count),
+                num_samples=count - 1,
+                replacement=True,
+            )
+            schedules[:, 1:, :] = draws.view(batch, t_max, count - 1).permute(0, 2, 1)
+        return route, schedules
+
+    @torch.no_grad()
+    def _score_route_candidates(
+        self,
+        h0: torch.Tensor,
+        targets: torch.Tensor,
+        schedules: torch.Tensor,
+        *,
+        fixed_depth: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.recursive_model is None:
+            raise ValueError("recursive model is not available")
+        batch, candidates, t_max = schedules.shape
+        flat_h0 = h0.detach().unsqueeze(1).expand(-1, candidates, -1, -1).reshape(
+            batch * candidates,
+            h0.shape[1],
+            h0.shape[2],
+        )
+        flat_targets = targets.unsqueeze(1).expand(-1, candidates, -1).reshape(
+            batch * candidates,
+            targets.shape[1],
+        )
+        flat_schedules = schedules.reshape(batch * candidates, t_max)
+        out = self.recursive_model.forward_exact_from_h0(
+            flat_h0,
+            flat_targets,
+            return_loss_per_sample=True,
+            fixed_recipe=self.config.training.fixed_recipe,
+            fixed_depth=fixed_depth,
+            recipe_schedule=flat_schedules,
+        )
+        if out.loss_per_sample is None:
+            raise RuntimeError("route candidate scoring requires per-sample losses")
+        scores = out.loss_per_sample.view(batch, candidates)
+        return scores, scores / float(targets.shape[1])
+
+    def _target_sparse_schedule(self) -> list[int]:
+        if self.recursive_model is None:
+            raise ValueError("recursive model is not available")
+        tr = self.config.training
+        schedule = list(
+            tr.fixed_recipe_schedule
+            or [tr.fixed_recipe if tr.fixed_recipe is not None else 1]
+        )
+        if not schedule:
+            schedule = [1]
+        while len(schedule) < self.recursive_model.config.t_max:
+            schedule.append(schedule[-1])
+        return schedule[: self.recursive_model.config.t_max]
+
+    def _full_recipe_schedule(self) -> list[int]:
+        if self.recursive_model is None:
+            raise ValueError("recursive model is not available")
+        return [0 for _ in range(self.recursive_model.config.t_max)]
+
+    def _sample_sparse_schedule_tensor(self, batch: int, *, count: int) -> torch.Tensor:
+        if self.recursive_model is None:
+            raise ValueError("recursive model is not available")
+        if count < 1:
+            return torch.empty(
+                batch,
+                0,
+                self.recursive_model.config.t_max,
+                dtype=torch.long,
+                device=self.device,
+            )
+        recipe_start = 1
+        if recipe_start >= self.recursive_model.config.recipe_count:
+            raise ValueError("sandwich supernet needs at least one sparse recipe")
+        return torch.randint(
+            recipe_start,
+            self.recursive_model.config.recipe_count,
+            (batch, count, self.recursive_model.config.t_max),
+            dtype=torch.long,
+            device=self.device,
+        )
+
+    def _sandwich_kl(
+        self,
+        teacher_logits: torch.Tensor,
+        student_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        temperature = self.config.training.sandwich_temperature
+        teacher_logp = F.log_softmax(teacher_logits.detach() / temperature, dim=-1)
+        student_logp = F.log_softmax(student_logits / temperature, dim=-1)
+        return (teacher_logp.exp() * (teacher_logp - student_logp)).sum(dim=-1).mean() * (
+            temperature * temperature
+        )
+
+    def _sandwich_hidden_loss(
+        self,
+        teacher: ModelOutput,
+        student: ModelOutput,
+        *,
+        depth: int,
+    ) -> torch.Tensor:
+        if teacher.meta.recurrent_hidden is None or student.meta.recurrent_hidden is None:
+            raise RuntimeError("sandwich hidden loss requires recurrent hidden states")
+        loss = (
+            self._rms_unit(teacher.meta.recurrent_hidden.detach())
+            - self._rms_unit(student.meta.recurrent_hidden)
+        ).square().mean()
+        count = 1
+        if teacher.meta.states is not None and student.meta.states is not None:
+            for step in range(1, depth + 1):
+                if step not in teacher.meta.states or step not in student.meta.states:
+                    continue
+                loss = loss + (
+                    self._rms_unit(teacher.meta.states[step].detach())
+                    - self._rms_unit(student.meta.states[step])
+                ).square().mean()
+                count += 1
+        return loss / float(count)
+
+    def _route_supervision_loss(
+        self,
+        route: RouterOutput,
+        schedule: torch.Tensor,
+        *,
+        fixed_depth: int,
+    ) -> torch.Tensor:
+        if route.recipe_logits_by_pass is None:
+            return route.recipe_logits.new_zeros(())
+        t_max = schedule.shape[1]
+        active = torch.arange(t_max, device=schedule.device) < fixed_depth
+        logits = route.recipe_logits_by_pass[:, :t_max, :][:, active, :]
+        targets = schedule[:, :t_max][:, active]
+        return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
 
     def _enforce_hot_budget(
         self,
@@ -594,6 +819,513 @@ class TrainEngine:
         self.tokens_seen += int(tokens.numel())
         self._maybe_log(metrics)
         return TrainStepResult(loss=loss, model_output=out, metrics=metrics)
+
+    def train_step_recursive_deferred_grouped_exact(
+        self,
+        batch: tuple[torch.Tensor, torch.Tensor],
+    ) -> TrainStepResult:
+        if self.recursive_model is None:
+            raise ValueError("recursive model is not available")
+        self._set_coda_trainable_for_schedule()
+        tokens, targets = self._move_batch(batch)
+        tr = self.config.training
+        current_lr = self._apply_lr_schedule()
+        with WallTimer() as timer:
+            with self._autocast():
+                out = self.recursive_model.forward_deferred_grouped_exact(
+                    tokens,
+                    targets,
+                    return_states=True,
+                    return_loss_per_sample=True,
+                    fixed_recipe=tr.fixed_recipe,
+                    fixed_recipe_schedule=tr.fixed_recipe_schedule,
+                    fixed_depth=tr.fixed_depth,
+                )
+            assert out.loss_per_sample is not None and out.meta.router is not None
+            aux = self._router_aux_losses(
+                out.meta.router.recipe_probs,
+                out.meta.router.expected_depth,
+            )
+            lm_loss = out.loss_per_sample.mean() / self._loss_scale(targets)
+            loss = lm_loss + sum(aux.values())
+            stepped = self._finish_step(loss)
+        if out.meta.recipe_ids is not None:
+            self.recursive_model.recipe_bank.update_usage(out.meta.recipe_ids, beta=tr.coverage_beta)
+        active_touches = out.meta.active_touches.mean() if out.meta.active_touches is not None else 0.0
+        depth = int(tr.fixed_depth or self.recursive_model.config.t_max)
+        metrics = {
+            "mode": "recursive_deferred_grouped_exact",
+            "loss": loss,
+            "lm_loss": lm_loss,
+            "nll_per_token": out.loss_per_sample.mean() / float(targets.shape[1]),
+            "step_time": timer.elapsed,
+            "tokens_per_sec": tokens.numel() / max(timer.elapsed, 1e-9),
+            "peak_vram": maybe_peak_memory(self.device),
+            "stored_params": recursive_param_count(self.config.model),
+            "tokens_seen": self.tokens_seen,
+            "lr": current_lr,
+            "active_touches_per_token": active_touches,
+            "active_touches_per_micro": active_touches / max(float(depth), 1.0),
+            "avg_depth": out.meta.depths.float().mean() if out.meta.depths is not None else 0.0,
+            "fixed_recipe_schedule": tr.fixed_recipe_schedule or [],
+            **self._accum_metrics(tokens, stepped),
+            **self.last_grad_metrics,
+            **{f"aux_{k}": v for k, v in aux.items()},
+        }
+        self.tokens_seen += int(tokens.numel())
+        self._maybe_log(metrics)
+        return TrainStepResult(loss=loss, model_output=out, metrics=metrics)
+
+    def _dense_distill_layer_map(self, depth: int) -> list[int]:
+        tr = self.config.training
+        if tr.dense_hidden_layer_map is not None:
+            layers = [int(layer) for layer in tr.dense_hidden_layer_map]
+            if len(layers) < depth:
+                raise ValueError(
+                    f"dense_hidden_layer_map has {len(layers)} entries but depth={depth}"
+                )
+            layers = layers[:depth]
+        else:
+            dense_layers = self.config.model.n_dense_layers
+            layers = [math.ceil((idx + 1) * dense_layers / depth) for idx in range(depth)]
+        max_layer = self.config.model.n_dense_layers
+        if any(layer < 1 or layer > max_layer for layer in layers):
+            raise ValueError(
+                f"dense hidden layer map entries must be in [1, {max_layer}], got {layers}"
+            )
+        return layers
+
+    def _rms_unit(self, value: torch.Tensor) -> torch.Tensor:
+        value = value.float()
+        return value * torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + 1e-5)
+
+    def _dense_hidden_distill_losses(
+        self,
+        tokens: torch.Tensor,
+        exact: ModelOutput,
+        dense: ModelOutput,
+        *,
+        depth: int,
+    ) -> dict[str, torch.Tensor]:
+        if self.dense_teacher_model is None:
+            raise ValueError("dense teacher model is not available")
+        if exact.meta.states is None or dense.meta.states is None:
+            raise RuntimeError("dense hidden distillation requires returned states")
+        if exact.meta.h0 is None:
+            raise RuntimeError("recursive exact output is missing h0")
+        if exact.meta.logits is None or dense.meta.logits is None:
+            raise RuntimeError("dense hidden distillation requires full logits")
+
+        layer_map = self._dense_distill_layer_map(depth)
+        hidden_loss = exact.meta.h0.new_zeros(())
+        delta_loss = exact.meta.h0.new_zeros(())
+        cosine_sum = exact.meta.h0.new_zeros(())
+        rec_prev = exact.meta.h0
+        dense_prev = self.dense_teacher_model.embed(tokens).detach()
+        for rec_depth, dense_layer in zip(range(1, depth + 1), layer_map, strict=True):
+            if rec_depth not in exact.meta.states:
+                raise RuntimeError(
+                    f"recursive state {rec_depth} is missing; include it in model.depth_choices"
+                )
+            if dense_layer not in dense.meta.states:
+                raise RuntimeError(f"dense teacher state {dense_layer} is missing")
+            rec_state = exact.meta.states[rec_depth]
+            dense_state = dense.meta.states[dense_layer].detach()
+            rec_normed = self._rms_unit(rec_state)
+            dense_normed = self._rms_unit(dense_state)
+            hidden_loss = hidden_loss + (rec_normed - dense_normed).square().mean()
+            cosine_sum = cosine_sum + F.cosine_similarity(
+                rec_normed.flatten(1),
+                dense_normed.flatten(1),
+                dim=-1,
+            ).mean()
+            delta_loss = delta_loss + (rec_state.float() - rec_prev.float() - (dense_state.float() - dense_prev.float())).square().mean()
+            rec_prev = rec_state
+            dense_prev = dense_state
+
+        denom = float(depth)
+        hidden_loss = hidden_loss / denom
+        delta_loss = delta_loss / denom
+        hidden_cosine = cosine_sum / denom
+
+        temperature = self.config.training.dense_distill_temperature
+        dense_logp = F.log_softmax(dense.meta.logits.detach() / temperature, dim=-1)
+        exact_logp = F.log_softmax(exact.meta.logits / temperature, dim=-1)
+        dense_probs = dense_logp.exp()
+        kl = (dense_probs * (dense_logp - exact_logp)).sum(dim=-1).mean() * (
+            temperature * temperature
+        )
+        return {
+            "hidden": hidden_loss,
+            "delta": delta_loss,
+            "kl": kl,
+            "hidden_cosine": hidden_cosine,
+        }
+
+    def train_step_recursive_exact_dense_hidden_distill(
+        self,
+        batch: tuple[torch.Tensor, torch.Tensor],
+    ) -> TrainStepResult:
+        if self.recursive_model is None:
+            raise ValueError("recursive model is not available")
+        if self.dense_teacher_model is None:
+            raise ValueError("dense teacher model is not available")
+        self._set_coda_trainable_for_schedule()
+        tokens, targets = self._move_batch(batch)
+        tr = self.config.training
+        depth = self._route_depth()
+        current_lr = self._apply_lr_schedule()
+        with WallTimer() as timer:
+            with self._autocast(), torch.no_grad():
+                dense = self.dense_teacher_model(
+                    tokens,
+                    targets,
+                    return_loss_per_sample=True,
+                    return_states=True,
+                )
+            with self._autocast():
+                out = self.recursive_model.forward_exact(
+                    tokens,
+                    targets,
+                    return_states=True,
+                    return_loss_per_sample=True,
+                    fixed_recipe=tr.fixed_recipe,
+                    fixed_recipe_schedule=tr.fixed_recipe_schedule,
+                    fixed_depth=tr.fixed_depth,
+                    state_depths=list(range(1, depth + 1)),
+                )
+                assert out.loss_per_sample is not None and dense.loss_per_sample is not None
+                losses = self._dense_hidden_distill_losses(
+                    tokens,
+                    out,
+                    dense,
+                    depth=depth,
+                )
+                lm_loss = out.loss_per_sample.mean() / self._loss_scale(targets)
+                hidden_loss = tr.lambda_dense_hidden * losses["hidden"]
+                delta_loss = tr.lambda_dense_delta * losses["delta"]
+                kl_loss = tr.lambda_dense_kl * losses["kl"]
+                loss = lm_loss + hidden_loss + delta_loss + kl_loss
+            stepped = self._finish_step(loss)
+        if out.meta.recipe_ids is not None:
+            self.recursive_model.recipe_bank.update_usage(
+                out.meta.recipe_ids, beta=tr.coverage_beta
+            )
+        sparse_touches = out.meta.active_touches.mean() if out.meta.active_touches is not None else 0.0
+        global_touches = (
+            3.0 * self.config.model.d_model * self.config.model.global_corrector_rank
+            if self.config.model.use_global_lowrank_corrector
+            else 0.0
+        )
+        metrics = {
+            "mode": "recursive_exact_dense_hidden_distill",
+            "loss": loss,
+            "lm_loss": lm_loss,
+            "dense_hidden_loss": losses["hidden"],
+            "dense_delta_loss": losses["delta"],
+            "dense_kl_loss": losses["kl"],
+            "weighted_dense_hidden_loss": hidden_loss,
+            "weighted_dense_delta_loss": delta_loss,
+            "weighted_dense_kl_loss": kl_loss,
+            "dense_hidden_cosine": losses["hidden_cosine"],
+            "teacher_nll_per_token": dense.loss_per_sample.mean() / float(targets.shape[1]),
+            "nll_per_token": out.loss_per_sample.mean() / float(targets.shape[1]),
+            "step_time": timer.elapsed,
+            "tokens_per_sec": tokens.numel() / max(timer.elapsed, 1e-9),
+            "peak_vram": maybe_peak_memory(self.device),
+            "stored_params": recursive_param_count(self.config.model),
+            "tokens_seen": self.tokens_seen,
+            "lr": current_lr,
+            "active_touches_per_token": sparse_touches,
+            "global_corrector_touches_per_pass": global_touches,
+            "active_touches_with_global_per_token": sparse_touches + global_touches,
+            "avg_depth": out.meta.depths.float().mean() if out.meta.depths is not None else 0.0,
+            "fixed_recipe_schedule": tr.fixed_recipe_schedule or [],
+            "dense_hidden_layer_map": self._dense_distill_layer_map(depth),
+            **self._accum_metrics(tokens, stepped),
+            **self.last_grad_metrics,
+        }
+        self.tokens_seen += int(tokens.numel())
+        self._maybe_log(metrics)
+        return TrainStepResult(loss=loss, model_output=out, metrics=metrics)
+
+    def train_step_recursive_exact_route_em(
+        self,
+        batch: tuple[torch.Tensor, torch.Tensor],
+    ) -> TrainStepResult:
+        if self.recursive_model is None:
+            raise ValueError("recursive model is not available")
+        self._set_coda_trainable_for_schedule()
+        tokens, targets = self._move_batch(batch)
+        tr = self.config.training
+        fixed_depth = self._route_depth()
+        current_lr = self._apply_lr_schedule()
+        with WallTimer() as timer:
+            with self._autocast():
+                h0 = self.recursive_model._prelude(tokens)
+            with torch.no_grad():
+                _, candidates = self._sample_route_candidates(h0, count=tr.route_em_candidates)
+                candidate_scores, candidate_nll = self._score_route_candidates(
+                    h0,
+                    targets,
+                    candidates,
+                    fixed_depth=fixed_depth,
+                )
+                best_idx = candidate_scores.argmin(dim=1)
+                batch_idx = torch.arange(tokens.shape[0], device=tokens.device)
+                best_schedule = candidates[batch_idx, best_idx]
+                best_candidate_nll = candidate_nll[batch_idx, best_idx]
+            with self._autocast():
+                route = self.recursive_model.router(h0.detach(), fixed_depth=fixed_depth)
+                out = self.recursive_model.forward_exact_from_h0(
+                    h0,
+                    targets,
+                    return_states=True,
+                    return_loss_per_sample=True,
+                    fixed_recipe=tr.fixed_recipe,
+                    fixed_depth=fixed_depth,
+                    recipe_schedule=best_schedule,
+                )
+                assert out.loss_per_sample is not None
+                lm_loss = out.loss_per_sample.mean() / self._loss_scale(targets)
+                router_loss = self._route_supervision_loss(
+                    route,
+                    best_schedule,
+                    fixed_depth=fixed_depth,
+                )
+                loss = lm_loss + tr.lambda_router * router_loss
+            stepped = self._finish_step(loss)
+        self.recursive_model.recipe_bank.update_usage(best_schedule, beta=tr.coverage_beta)
+        metrics = {
+            "mode": "recursive_exact_route_em",
+            "loss": loss,
+            "lm_loss": lm_loss,
+            "router_loss": router_loss,
+            "nll_per_token": out.loss_per_sample.mean() / float(targets.shape[1]),
+            "route_oracle_nll_per_token": best_candidate_nll.mean(),
+            "route_candidate_mean_nll": candidate_nll.mean(),
+            "route_candidate_best_idx_mean": best_idx.float().mean(),
+            "route_em_candidates": tr.route_em_candidates,
+            "step_time": timer.elapsed,
+            "tokens_per_sec": tokens.numel() / max(timer.elapsed, 1e-9),
+            "peak_vram": maybe_peak_memory(self.device),
+            "stored_params": recursive_param_count(self.config.model),
+            "tokens_seen": self.tokens_seen,
+            "lr": current_lr,
+            "router_lr": next(
+                (group["lr"] for group in self.optimizer.param_groups if group.get("name") == "router"),
+                current_lr,
+            ),
+            "active_touches_per_token": out.meta.active_touches.mean()
+            if out.meta.active_touches is not None
+            else 0.0,
+            "avg_depth": out.meta.depths.float().mean() if out.meta.depths is not None else 0.0,
+            "unique_recipes_per_batch": best_schedule.unique().numel(),
+            **self._accum_metrics(tokens, stepped),
+            **self.last_grad_metrics,
+        }
+        self.tokens_seen += int(tokens.numel())
+        self._maybe_log(metrics)
+        return TrainStepResult(loss=loss, model_output=out, metrics=metrics)
+
+    def train_step_recursive_exact_factorized_soft(
+        self,
+        batch: tuple[torch.Tensor, torch.Tensor],
+    ) -> TrainStepResult:
+        if self.recursive_model is None:
+            raise ValueError("recursive model is not available")
+        self._set_coda_trainable_for_schedule()
+        tokens, targets = self._move_batch(batch)
+        tr = self.config.training
+        current_lr = self._apply_lr_schedule()
+        with WallTimer() as timer:
+            with self._autocast():
+                out = self.recursive_model.forward_exact_factorized_soft(
+                    tokens,
+                    targets,
+                    return_states=True,
+                    return_loss_per_sample=True,
+                    top_k=tr.factorized_route_top_k,
+                    temperature=tr.factorized_route_temperature,
+                    fixed_depth=tr.fixed_depth,
+                )
+            assert out.loss_per_sample is not None and out.meta.router is not None
+            lm_loss = out.loss_per_sample.mean() / self._loss_scale(targets)
+            loss = lm_loss
+            stepped = self._finish_step(loss)
+        metrics = {
+            "mode": "recursive_exact_factorized_soft",
+            "loss": loss,
+            "lm_loss": lm_loss,
+            "nll_per_token": out.loss_per_sample.mean() / float(targets.shape[1]),
+            "step_time": timer.elapsed,
+            "tokens_per_sec": tokens.numel() / max(timer.elapsed, 1e-9),
+            "peak_vram": maybe_peak_memory(self.device),
+            "stored_params": recursive_param_count(self.config.model),
+            "tokens_seen": self.tokens_seen,
+            "lr": current_lr,
+            "router_lr": next(
+                (group["lr"] for group in self.optimizer.param_groups if group.get("name") == "router"),
+                current_lr,
+            ),
+            "active_touches_per_token": out.meta.active_touches.mean()
+            if out.meta.active_touches is not None
+            else 0.0,
+            "avg_depth": out.meta.depths.float().mean() if out.meta.depths is not None else 0.0,
+            "factorized_route_top_k": tr.factorized_route_top_k,
+            "factorized_route_temperature": tr.factorized_route_temperature,
+            "factor_entropy": out.meta.router.factor_entropy.mean()
+            if out.meta.router.factor_entropy is not None
+            else 0.0,
+            **self._accum_metrics(tokens, stepped),
+            **self.last_grad_metrics,
+        }
+        self.tokens_seen += int(tokens.numel())
+        self._maybe_log(metrics)
+        return TrainStepResult(loss=loss, model_output=out, metrics=metrics)
+
+    def train_step_recursive_sandwich_supernet(
+        self,
+        batch: tuple[torch.Tensor, torch.Tensor],
+    ) -> TrainStepResult:
+        if self.recursive_model is None:
+            raise ValueError("recursive model is not available")
+        self._set_coda_trainable_for_schedule()
+        tokens, targets = self._move_batch(batch)
+        tr = self.config.training
+        depth = self._route_depth()
+        full_schedule = self._full_recipe_schedule()
+        target_schedule = self._target_sparse_schedule()
+        random_schedules = self._sample_sparse_schedule_tensor(
+            tokens.shape[0],
+            count=tr.sandwich_random_paths,
+        )
+        current_lr = self._apply_lr_schedule()
+        state_depths = list(range(1, depth + 1))
+        with WallTimer() as timer:
+            with self._autocast():
+                h0 = self.recursive_model._prelude(tokens)
+                full = self.recursive_model.forward_exact_from_h0(
+                    h0,
+                    targets,
+                    return_states=True,
+                    return_loss_per_sample=True,
+                    fixed_recipe=0,
+                    fixed_recipe_schedule=full_schedule,
+                    fixed_depth=depth,
+                    state_depths=state_depths,
+                )
+                thin = self.recursive_model.forward_exact_from_h0(
+                    h0,
+                    targets,
+                    return_states=True,
+                    return_loss_per_sample=True,
+                    fixed_recipe=target_schedule[0],
+                    fixed_recipe_schedule=target_schedule,
+                    fixed_depth=depth,
+                    state_depths=state_depths,
+                )
+                assert full.loss_per_sample is not None and thin.loss_per_sample is not None
+                full_ce = full.loss_per_sample.mean() / self._loss_scale(targets)
+                thin_ce = thin.loss_per_sample.mean() / self._loss_scale(targets)
+                kd_thin = self._sandwich_kl(full.meta.logits, thin.meta.logits)
+                hidden = self._sandwich_hidden_loss(full, thin, depth=depth)
+                rand_ce = full_ce.new_zeros(())
+                rand_kd = full_ce.new_zeros(())
+                rand_nll = full_ce.new_zeros(())
+                if tr.sandwich_random_paths > 0:
+                    batch_size, rand_count, t_max = random_schedules.shape
+                    flat_h0 = h0.unsqueeze(1).expand(-1, rand_count, -1, -1).reshape(
+                        batch_size * rand_count,
+                        h0.shape[1],
+                        h0.shape[2],
+                    )
+                    flat_targets = targets.unsqueeze(1).expand(-1, rand_count, -1).reshape(
+                        batch_size * rand_count,
+                        targets.shape[1],
+                    )
+                    flat_schedule = random_schedules.reshape(batch_size * rand_count, t_max)
+                    rand = self.recursive_model.forward_exact_from_h0(
+                        flat_h0,
+                        flat_targets,
+                        return_loss_per_sample=True,
+                        recipe_schedule=flat_schedule,
+                        fixed_depth=depth,
+                    )
+                    assert rand.loss_per_sample is not None
+                    expanded_full_logits = full.meta.logits.detach().unsqueeze(1).expand(
+                        -1,
+                        rand_count,
+                        -1,
+                        -1,
+                    ).reshape_as(rand.meta.logits)
+                    rand_ce = (
+                        rand.loss_per_sample.mean()
+                        / self._loss_scale(flat_targets)
+                        * float(rand_count)
+                    )
+                    rand_kd = self._sandwich_kl(expanded_full_logits, rand.meta.logits) * float(
+                        rand_count
+                    )
+                    rand_nll = rand.loss_per_sample.mean() / float(targets.shape[1])
+                loss = (
+                    full_ce
+                    + thin_ce
+                    + tr.lambda_sandwich_rand_ce * rand_ce
+                    + tr.lambda_sandwich_kd * kd_thin
+                    + tr.lambda_sandwich_rand_kd * rand_kd
+                    + tr.lambda_sandwich_hidden * hidden
+                )
+            stepped = self._finish_step(loss)
+        if thin.meta.recipe_ids is not None:
+            self.recursive_model.recipe_bank.update_usage(thin.meta.recipe_ids, beta=tr.coverage_beta)
+        if tr.sandwich_random_paths > 0:
+            self.recursive_model.recipe_bank.update_usage(
+                random_schedules.reshape(-1, random_schedules.shape[-1]),
+                beta=tr.coverage_beta,
+            )
+        full_nll = full.loss_per_sample.mean() / float(targets.shape[1])
+        thin_nll = thin.loss_per_sample.mean() / float(targets.shape[1])
+        metrics = {
+            "mode": "recursive_sandwich_supernet",
+            "loss": loss,
+            "full_ce_loss": full_ce,
+            "thin_ce_loss": thin_ce,
+            "rand_ce_loss": rand_ce,
+            "thin_kd_loss": kd_thin,
+            "rand_kd_loss": rand_kd,
+            "hidden_loss": hidden,
+            "full_nll_per_token": full_nll,
+            "thin_nll_per_token": thin_nll,
+            "rand_nll_per_token": rand_nll,
+            "full_thin_nll_gap": thin_nll - full_nll,
+            "nll_per_token": thin_nll,
+            "step_time": timer.elapsed,
+            "tokens_per_sec": tokens.numel() / max(timer.elapsed, 1e-9),
+            "peak_vram": maybe_peak_memory(self.device),
+            "stored_params": recursive_param_count(self.config.model),
+            "tokens_seen": self.tokens_seen,
+            "lr": current_lr,
+            "full_active_touches_per_token": full.meta.active_touches.mean()
+            if full.meta.active_touches is not None
+            else 0.0,
+            "thin_active_touches_per_token": thin.meta.active_touches.mean()
+            if thin.meta.active_touches is not None
+            else 0.0,
+            "avg_depth": thin.meta.depths.float().mean() if thin.meta.depths is not None else 0.0,
+            "full_recipe_schedule": full_schedule,
+            "thin_recipe_schedule": target_schedule,
+            "sandwich_random_paths": tr.sandwich_random_paths,
+            "unique_random_recipes_per_batch": random_schedules.unique().numel()
+            if random_schedules.numel()
+            else 0.0,
+            "sandwich_temperature": tr.sandwich_temperature,
+            **self._accum_metrics(tokens, stepped),
+            **self.last_grad_metrics,
+        }
+        self.tokens_seen += int(tokens.numel())
+        self._maybe_log(metrics)
+        return TrainStepResult(loss=loss, model_output=thin, metrics=metrics)
 
     def train_step_recursive_macro(self, batch: tuple[torch.Tensor, torch.Tensor]) -> TrainStepResult:
         return self._train_step_recursive_macro_impl(batch, shortlist=False)
@@ -899,6 +1631,16 @@ class TrainEngine:
             return self.train_step_dense(batch)
         if mode == "recursive_exact":
             return self.train_step_recursive_exact(batch)
+        if mode == "recursive_deferred_grouped_exact":
+            return self.train_step_recursive_deferred_grouped_exact(batch)
+        if mode == "recursive_exact_route_em":
+            return self.train_step_recursive_exact_route_em(batch)
+        if mode == "recursive_exact_factorized_soft":
+            return self.train_step_recursive_exact_factorized_soft(batch)
+        if mode == "recursive_exact_dense_hidden_distill":
+            return self.train_step_recursive_exact_dense_hidden_distill(batch)
+        if mode == "recursive_sandwich_supernet":
+            return self.train_step_recursive_sandwich_supernet(batch)
         if mode == "recursive_macro":
             return self.train_step_recursive_macro(batch)
         if mode == "recursive_macro_lm_aligned":

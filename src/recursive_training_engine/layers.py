@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from recursive_training_engine.config import ModelConfig
 from recursive_training_engine.kernels import optimized as K
-from recursive_training_engine.recipes import RecipeBank, RecipeSpec
+from recursive_training_engine.recipes import RecipeBank, RecipeSpec, spec_from_factors
 
 
 class RMSNorm(nn.Module):
@@ -75,6 +75,170 @@ class DenseSwiGLU(nn.Module):
         return self.wd(up * F.silu(gate))
 
 
+class SVDFactorSparseFFN(nn.Module):
+    """Token-level sparse SwiGLU FFN with SVD factor candidate retrieval.
+
+    This is the executable version of the SVD factor-union oracle: candidate
+    neurons are retrieved from low-rank approximations to W_up/W_gate, then only
+    those candidate rows are evaluated exactly.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        *,
+        rank: int,
+        top_k: int,
+        up_m: int,
+        gate_m: int | None = None,
+        product_m: int = 0,
+        refresh_on_init: bool = True,
+    ):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.d_ff = int(d_ff)
+        self.rank = min(max(1, int(rank)), self.d_model, self.d_ff)
+        self.top_k = min(max(1, int(top_k)), self.d_ff)
+        self.up_m = min(max(0, int(up_m)), self.d_ff)
+        self.gate_m = self.up_m if gate_m is None else min(max(0, int(gate_m)), self.d_ff)
+        self.product_m = min(max(0, int(product_m)), self.d_ff)
+        self.refresh_on_init = bool(refresh_on_init)
+        self.w_up = nn.Parameter(torch.empty(self.d_ff, self.d_model))
+        self.w_gate = nn.Parameter(torch.empty(self.d_ff, self.d_model))
+        self.w_down = nn.Parameter(torch.empty(self.d_ff, self.d_model))
+        self.register_buffer("up_a", torch.empty(self.d_model, self.rank), persistent=False)
+        self.register_buffer("up_b", torch.empty(self.rank, self.d_ff), persistent=False)
+        self.register_buffer("gate_a", torch.empty(self.d_model, self.rank), persistent=False)
+        self.register_buffer("gate_b", torch.empty(self.rank, self.d_ff), persistent=False)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        scale = 1.0 / math.sqrt(self.d_model)
+        nn.init.normal_(self.w_up, std=scale)
+        nn.init.normal_(self.w_gate, std=scale)
+        nn.init.normal_(self.w_down, std=scale)
+        if self.refresh_on_init:
+            self.refresh_svd()
+        else:
+            nn.init.normal_(self.up_a, std=scale)
+            nn.init.normal_(self.up_b, std=scale)
+            nn.init.normal_(self.gate_a, std=scale)
+            nn.init.normal_(self.gate_b, std=scale)
+
+    @classmethod
+    def from_dense(
+        cls,
+        mlp: DenseSwiGLU,
+        *,
+        rank: int,
+        top_k: int,
+        up_m: int,
+        gate_m: int | None = None,
+        product_m: int = 0,
+    ) -> "SVDFactorSparseFFN":
+        module = cls(
+            mlp.wug.in_features,
+            mlp.wd.in_features,
+            rank=rank,
+            top_k=top_k,
+            up_m=up_m,
+            gate_m=gate_m,
+            product_m=product_m,
+        ).to(device=mlp.wug.weight.device, dtype=mlp.wug.weight.dtype)
+        with torch.no_grad():
+            up, gate = mlp.wug.weight.detach().chunk(2, dim=0)
+            module.w_up.copy_(up)
+            module.w_gate.copy_(gate)
+            module.w_down.copy_(mlp.wd.weight.detach().t())
+            module.refresh_svd()
+        return module
+
+    @torch.no_grad()
+    def refresh_svd(self) -> None:
+        for prefix, weight in (("up", self.w_up), ("gate", self.w_gate)):
+            mat = weight.detach().float().t().cpu().contiguous()
+            u, s, vh = torch.linalg.svd(mat, full_matrices=False)
+            rank = self.rank
+            getattr(self, f"{prefix}_a").copy_((u[:, :rank] * s[:rank]).to(weight.device, weight.dtype))
+            getattr(self, f"{prefix}_b").copy_(vh[:rank, :].to(weight.device, weight.dtype))
+
+    def _add_top_candidates(
+        self,
+        candidate_mask: torch.Tensor,
+        scores: torch.Tensor,
+        count: int,
+    ) -> None:
+        if count <= 0:
+            return
+        ids = torch.topk(scores, k=min(count, self.d_ff), dim=-1).indices
+        candidate_mask.scatter_(-1, ids, True)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        return_aux: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
+        original_shape = x.shape[:-1]
+        flat = x.reshape(-1, self.d_model)
+        wd_norm = self.w_down.detach().float().norm(dim=-1).to(flat.device, flat.dtype)
+        q_up = flat @ self.up_a
+        q_gate = flat @ self.gate_a
+        up_hat = q_up @ self.up_b
+        gate_hat = q_gate @ self.gate_b
+        gate_hat_act = F.silu(gate_hat)
+        candidate_mask = torch.zeros(flat.shape[0], self.d_ff, device=flat.device, dtype=torch.bool)
+        self._add_top_candidates(candidate_mask, up_hat.detach().abs() * wd_norm, self.up_m)
+        self._add_top_candidates(candidate_mask, gate_hat_act.detach().abs() * wd_norm, self.gate_m)
+        if self.product_m > 0:
+            self._add_top_candidates(
+                candidate_mask,
+                (up_hat * gate_hat_act).detach().abs() * wd_norm,
+                self.product_m,
+            )
+        # Guard against degenerate duplicate-heavy candidate unions.
+        too_small = candidate_mask.sum(dim=-1) < self.top_k
+        if bool(too_small.any()):
+            fallback_scores = (up_hat * gate_hat_act).detach().abs() * wd_norm
+            fill_ids = torch.topk(fallback_scores[too_small], k=self.top_k, dim=-1).indices
+            candidate_mask[too_small].scatter_(-1, fill_ids, True)
+
+        max_candidates = min(
+            self.d_ff,
+            max(self.top_k, self.up_m + self.gate_m + self.product_m),
+        )
+        candidate_ids = torch.topk(
+            candidate_mask.to(torch.int64),
+            k=max_candidates,
+            dim=-1,
+        ).indices
+        candidate_valid = candidate_mask.gather(dim=-1, index=candidate_ids)
+        up_rows = self.w_up[candidate_ids]
+        gate_rows = self.w_gate[candidate_ids]
+        exact_up = torch.einsum("nd,ncd->nc", flat, up_rows)
+        exact_gate = torch.einsum("nd,ncd->nc", flat, gate_rows)
+        z = exact_up * F.silu(exact_gate)
+        exact_scores = (z.detach().abs() * wd_norm[candidate_ids]).masked_fill(
+            ~candidate_valid,
+            -torch.inf,
+        )
+        selected_local = torch.topk(exact_scores, k=self.top_k, dim=-1).indices
+        selected_ids = candidate_ids.gather(dim=-1, index=selected_local)
+        selected_z = z.gather(dim=-1, index=selected_local)
+        out = (selected_z.unsqueeze(-1) * self.w_down[selected_ids]).sum(dim=1)
+        out = out.view(*original_shape, self.d_model)
+        if not return_aux:
+            return out
+        aux: dict[str, torch.Tensor | float] = {
+            "candidate_ids": candidate_ids,
+            "candidate_valid": candidate_valid,
+            "selected_ids": selected_ids,
+            "avg_candidate_size": float(candidate_mask.sum(dim=-1).float().mean().detach().cpu()),
+        }
+        return out, aux
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -136,8 +300,14 @@ class BankedAttention(nn.Module):
         heads_per_group = self.config.n_heads // self.config.head_groups
         head_dim = d // self.config.n_heads
         active_dim = len(spec.head_groups) * heads_per_group * head_dim
-        cols = self.recipe_cols[spec.recipe_id, :active_dim]
-        qkv_cols = self.recipe_qkv_cols[spec.recipe_id, : 3 * active_dim]
+        if spec.recipe_id >= 0:
+            cols = self.recipe_cols[spec.recipe_id, :active_dim]
+            qkv_cols = self.recipe_qkv_cols[spec.recipe_id, : 3 * active_dim]
+        else:
+            cols = torch.tensor(self._cols_for_groups(spec), dtype=torch.long, device=x.device)
+            qkv_cols = torch.cat(
+                [cols, cols + self.config.d_model, cols + 2 * self.config.d_model]
+            )
         active_heads = active_dim // head_dim
         out = x.new_zeros(b, s, d)
         for bank in spec.attention_banks:
@@ -191,14 +361,42 @@ class BankedSwiGLU(nn.Module):
     def forward(self, x: torch.Tensor, spec: RecipeSpec) -> torch.Tensor:
         slab = self.config.d_ff // self.config.ffn_groups
         active_dim = len(spec.ffn_groups) * slab
-        slabs = self.recipe_slabs[spec.recipe_id, :active_dim]
-        gate_cols = self.recipe_gate_cols[spec.recipe_id, : 2 * active_dim]
+        if spec.recipe_id >= 0:
+            slabs = self.recipe_slabs[spec.recipe_id, :active_dim]
+            gate_cols = self.recipe_gate_cols[spec.recipe_id, : 2 * active_dim]
+        else:
+            slabs = torch.tensor(self._slabs_for_groups(spec), dtype=torch.long, device=x.device)
+            gate_cols = torch.cat([slabs, slabs + self.config.d_ff])
         out = x.new_zeros(*x.shape)
         for bank in spec.ffn_banks:
             fused = x @ self.wug[bank, :, gate_cols]
             up, gate = fused.split(slabs.numel(), dim=-1)
             out = out + (up * F.silu(gate)) @ self.wd[bank, slabs, :]
         return out / max(len(spec.ffn_banks), 1)
+
+
+class GlobalLowRankCorrector(nn.Module):
+    def __init__(self, d_model: int, t_max: int, rank: int):
+        super().__init__()
+        self.norm_h = RMSNorm(d_model)
+        self.norm_h0 = RMSNorm(d_model)
+        self.pass_emb = nn.Embedding(t_max, rank)
+        self.v_h = nn.Linear(d_model, rank, bias=False)
+        self.v_h0 = nn.Linear(d_model, rank, bias=False)
+        self.u = nn.Linear(rank, d_model, bias=False)
+        self.pass_gate = nn.Parameter(torch.ones(t_max, rank))
+        self.pass_scale = nn.Parameter(torch.zeros(t_max))
+
+    def forward(self, h: torch.Tensor, h0: torch.Tensor, pass_idx: int) -> torch.Tensor:
+        pass_idx = int(pass_idx)
+        z = (
+            self.v_h(self.norm_h(h))
+            + self.v_h0(self.norm_h0(h0))
+            + self.pass_emb.weight[pass_idx]
+        )
+        z = F.silu(z) * self.pass_gate[pass_idx]
+        scale = 0.1 * torch.tanh(self.pass_scale[pass_idx]) + 0.1
+        return scale * self.u(z)
 
 
 class BankedRecursiveCore(nn.Module):
@@ -216,6 +414,11 @@ class BankedRecursiveCore(nn.Module):
         self.pass_beta2 = nn.Parameter(torch.zeros(config.t_max, config.d_model))
         self.pass_attn_scale = nn.Parameter(torch.full((config.t_max,), 1.0))
         self.pass_mlp_scale = nn.Parameter(torch.full((config.t_max,), 1.0))
+        self.global_corrector = (
+            GlobalLowRankCorrector(config.d_model, config.t_max, config.global_corrector_rank)
+            if config.use_global_lowrank_corrector
+            else None
+        )
         if config.use_recursive_input_skip:
             self.alpha_inj = nn.Parameter(torch.tensor(0.1))
         else:
@@ -239,7 +442,10 @@ class BankedRecursiveCore(nn.Module):
         n2 = self.norm2(u)
         n2 = n2 * (1.0 + self.pass_gamma2[pass_idx]) + self.pass_beta2[pass_idx]
         mlp_out = self.mlp(n2, spec)
-        return u + self.pass_mlp_scale[pass_idx] * mlp_out
+        sparse_out = u + self.pass_mlp_scale[pass_idx] * mlp_out
+        if self.global_corrector is None:
+            return sparse_out
+        return sparse_out + self.global_corrector(sparse_out, h0, pass_idx)
 
     def forward_step(
         self,
@@ -256,5 +462,86 @@ class BankedRecursiveCore(nn.Module):
             mask = active_mask & (recipe_ids == int(rid))
             spec = self.recipe_bank.get_recipe(int(rid))
             assert isinstance(spec, RecipeSpec)
+            out[mask] = self.step_group(h[mask], h0[mask], spec, pass_idx=pass_idx)
+        return out
+
+    def deferred_grouped_block(
+        self,
+        h: torch.Tensor,
+        h0: torch.Tensor,
+        recipe_schedule: list[int] | tuple[int, ...],
+        active_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        out = h.clone()
+        if active_mask is None:
+            active_mask = torch.ones(h.shape[0], dtype=torch.bool, device=h.device)
+        if not bool(active_mask.any().item()) or len(recipe_schedule) == 0:
+            return out
+        specs = []
+        for recipe_id in recipe_schedule:
+            spec = self.recipe_bank.get_recipe(int(recipe_id))
+            assert isinstance(spec, RecipeSpec)
+            specs.append(spec)
+
+        h_active = h[active_mask]
+        h0_active = h0[active_mask]
+        h_tilde = h_active if self.alpha_inj is None else h_active + self.alpha_inj * h0_active
+
+        n1_base = self.norm1(h_tilde)
+        attn_accum = torch.zeros_like(h_active)
+        for pass_idx, spec in enumerate(specs):
+            idx = min(pass_idx, self.config.t_max - 1)
+            n1 = n1_base * (1.0 + self.pass_gamma1[idx]) + self.pass_beta1[idx]
+            attn_accum = attn_accum + self.pass_attn_scale[idx] * self.attn(n1, spec)
+        u = h_tilde + attn_accum
+
+        n2_base = self.norm2(u)
+        mlp_accum = torch.zeros_like(h_active)
+        for pass_idx, spec in enumerate(specs):
+            idx = min(pass_idx, self.config.t_max - 1)
+            n2 = n2_base * (1.0 + self.pass_gamma2[idx]) + self.pass_beta2[idx]
+            mlp_accum = mlp_accum + self.pass_mlp_scale[idx] * self.mlp(n2, spec)
+        grouped_out = u + mlp_accum
+        if self.global_corrector is not None:
+            grouped_out = grouped_out + self.global_corrector(grouped_out, h0_active, 0)
+        out[active_mask] = grouped_out
+        return out
+
+    def forward_step_factorized(
+        self,
+        h: torch.Tensor,
+        h0: torch.Tensor,
+        attn_banks: torch.Tensor,
+        ffn_banks: torch.Tensor,
+        head_slots: torch.Tensor,
+        ffn_slots: torch.Tensor,
+        active_mask: torch.Tensor | None = None,
+        pass_idx: int = 0,
+    ) -> torch.Tensor:
+        out = h.clone()
+        if active_mask is None:
+            active_mask = torch.ones(h.shape[0], dtype=torch.bool, device=h.device)
+        factors = torch.stack(
+            [
+                attn_banks.to(h.device).long(),
+                ffn_banks.to(h.device).long(),
+                head_slots.to(h.device).long(),
+                ffn_slots.to(h.device).long(),
+            ],
+            dim=-1,
+        )
+        active_factors = factors[active_mask]
+        if active_factors.numel() == 0:
+            return out
+        for attn_bank, ffn_bank, head_slot, ffn_slot in torch.unique(active_factors, dim=0).detach().cpu().tolist():
+            factor = factors.new_tensor([attn_bank, ffn_bank, head_slot, ffn_slot])
+            mask = active_mask & (factors == factor).all(dim=-1)
+            spec = spec_from_factors(
+                self.config,
+                attn_bank=int(attn_bank),
+                ffn_bank=int(ffn_bank),
+                head_slot=int(head_slot),
+                ffn_slot=int(ffn_slot),
+            )
             out[mask] = self.step_group(h[mask], h0[mask], spec, pass_idx=pass_idx)
         return out

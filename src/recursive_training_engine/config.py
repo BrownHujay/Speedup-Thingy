@@ -29,6 +29,8 @@ class ModelConfig:
     tie_embeddings: bool = True
     use_rope: bool = True
     use_recursive_input_skip: bool = True
+    use_global_lowrank_corrector: bool = False
+    global_corrector_rank: int = 16
     fairness_tolerance: float = 0.01
     macro_type: Literal["bounded_residual", "v2_delta_radius"] = "bounded_residual"
     macro_rank: int = 32
@@ -65,6 +67,8 @@ class ModelConfig:
             raise ValueError("depth_choices must be sorted ascending")
         if self.macro_rank < 1:
             raise ValueError("macro_rank must be positive")
+        if self.global_corrector_rank < 1:
+            raise ValueError("global_corrector_rank must be positive")
         if self.macro_hidden_mult < 1:
             raise ValueError("macro_hidden_mult must be positive")
         if self.macro_update_scale_init < 0:
@@ -82,6 +86,11 @@ class TrainingConfig:
     mode: Literal[
         "dense_exact",
         "recursive_exact",
+        "recursive_deferred_grouped_exact",
+        "recursive_exact_route_em",
+        "recursive_exact_factorized_soft",
+        "recursive_exact_dense_hidden_distill",
+        "recursive_sandwich_supernet",
         "recursive_macro",
         "recursive_macro_shortlist",
         "recursive_macro_distill_only",
@@ -138,12 +147,16 @@ class TrainingConfig:
     lambda_depth: float = 1e-4
     lambda_load: float = 1e-2
     lambda_cover: float = 1e-2
+    lambda_router: float = 1.0
     lambda_hid: float = 1e-2
     lambda_cos: float = 1e-2
     lambda_kl: float = 1e-2
     lambda_hidden_mse: float | None = None
     lambda_hidden_cosine: float | None = None
     lambda_logit_kl: float | None = None
+    lambda_dense_hidden: float = 1.0
+    lambda_dense_delta: float = 0.5
+    lambda_dense_kl: float = 0.25
     lambda_norm: float = 0.05
     lambda_delta_dir: float = 2.0
     lambda_delta_rms: float = 2.0
@@ -155,12 +168,25 @@ class TrainingConfig:
     macro_rms_clamp_max: float = 2.0
     lambda_macro_rms_trust: float = 2.0
     distill_temperature: float = 2.0
+    dense_distill_temperature: float = 2.0
+    dense_hidden_layer_map: list[int] | None = None
     lambda_cons: float = 1e-3
     coverage_min: float = 0.01
     coverage_beta: float = 0.98
     fixed_recipe: int | None = None
     fixed_recipe_schedule: list[int] | None = None
     fixed_depth: int | None = None
+    route_em_candidates: int = 4
+    route_em_allow_dense_fallback: bool = False
+    route_em_proposal: Literal["router", "random"] = "router"
+    factorized_route_top_k: int = 4
+    factorized_route_temperature: float = 1.0
+    sandwich_random_paths: int = 2
+    sandwich_temperature: float = 2.0
+    lambda_sandwich_rand_ce: float = 0.5
+    lambda_sandwich_kd: float = 1.0
+    lambda_sandwich_rand_kd: float = 0.5
+    lambda_sandwich_hidden: float = 0.1
     disable_router_aux: bool = False
     debug_force_full_output: bool = False
     coda_warmup_steps: int = 0
@@ -193,6 +219,8 @@ class TrainingConfig:
             raise ValueError("coda_warmup_steps must be non-negative")
         if self.distill_temperature <= 0:
             raise ValueError("distill_temperature must be positive")
+        if self.dense_distill_temperature <= 0:
+            raise ValueError("dense_distill_temperature must be positive")
         if self.lr_final_scale <= 0:
             raise ValueError("lr_final_scale must be positive")
         if self.lr_schedule == "linear_decay_after":
@@ -235,6 +263,29 @@ class TrainingConfig:
             )
         if self.target_speedup_vs_dense is not None and self.target_speedup_vs_dense <= 0:
             raise ValueError("target_speedup_vs_dense must be positive")
+        if self.route_em_candidates < 1:
+            raise ValueError("route_em_candidates must be >= 1")
+        if self.factorized_route_top_k < 1:
+            raise ValueError("factorized_route_top_k must be >= 1")
+        if self.factorized_route_temperature <= 0:
+            raise ValueError("factorized_route_temperature must be positive")
+        if self.sandwich_random_paths < 0:
+            raise ValueError("sandwich_random_paths must be non-negative")
+        if self.sandwich_temperature <= 0:
+            raise ValueError("sandwich_temperature must be positive")
+        if self.lambda_sandwich_rand_ce < 0:
+            raise ValueError("lambda_sandwich_rand_ce must be non-negative")
+        if self.lambda_sandwich_kd < 0:
+            raise ValueError("lambda_sandwich_kd must be non-negative")
+        if self.lambda_sandwich_rand_kd < 0:
+            raise ValueError("lambda_sandwich_rand_kd must be non-negative")
+        if self.lambda_sandwich_hidden < 0:
+            raise ValueError("lambda_sandwich_hidden must be non-negative")
+        if self.dense_hidden_layer_map is not None:
+            if not self.dense_hidden_layer_map:
+                raise ValueError("dense_hidden_layer_map must not be empty when provided")
+            if any(layer < 1 for layer in self.dense_hidden_layer_map):
+                raise ValueError("dense_hidden_layer_map entries must be positive layer indices")
         if (
             self.max_active_param_equiv_per_token is not None
             and self.max_active_param_equiv_per_token <= 0

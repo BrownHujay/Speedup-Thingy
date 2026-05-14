@@ -5,6 +5,7 @@ import dataclasses
 import torch
 
 from recursive_training_engine.config import load_config
+from recursive_training_engine.layers import DenseSwiGLU, SVDFactorSparseFFN
 from recursive_training_engine.models import DenseModel, RecursiveModel
 from recursive_training_engine.output import ShortlistHead
 from recursive_training_engine.training import TrainEngine
@@ -40,6 +41,22 @@ def test_dense_forward_is_deterministic() -> None:
     out_b = model_b(*sample_batch(cfg), return_loss_per_sample=True)
     assert out_a.loss_per_sample is not None and out_b.loss_per_sample is not None
     assert torch.allclose(out_a.loss_per_sample, out_b.loss_per_sample)
+
+
+def test_svd_factor_sparse_ffn_recovers_dense_when_all_neurons_active() -> None:
+    cfg = tiny_config("dense_exact")
+    mlp = DenseSwiGLU(cfg.model)
+    sparse = SVDFactorSparseFFN.from_dense(
+        mlp,
+        rank=min(cfg.model.d_model, cfg.model.d_ff),
+        top_k=cfg.model.d_ff,
+        up_m=cfg.model.d_ff,
+    )
+    x = torch.randn(2, 5, cfg.model.d_model)
+    dense_out = mlp(x)
+    sparse_out, aux = sparse(x, return_aux=True)
+    assert torch.allclose(sparse_out, dense_out, atol=1e-5)
+    assert aux["selected_ids"].shape == (x.shape[0] * x.shape[1], cfg.model.d_ff)
 
 
 def test_recursive_exact_matches_manual_loop_with_fixed_route() -> None:
@@ -91,6 +108,173 @@ def test_recursive_exact_uses_fixed_recipe_schedule_per_pass() -> None:
     )
     assert [pass_idx for pass_idx, _ in seen] == [0, 1, 2, 3]
     assert [int(recipe_ids.unique().item()) for _, recipe_ids in seen] == [1, 2, 3, 1]
+
+
+def test_recursive_exact_accepts_per_sample_recipe_schedule() -> None:
+    cfg = tiny_config("recursive_exact")
+    model = RecursiveModel(cfg.model, cfg.output)
+    tokens, targets = sample_batch(cfg)
+    seen: list[tuple[int, torch.Tensor]] = []
+
+    def record_step(
+        h: torch.Tensor,
+        h0: torch.Tensor,
+        recipe_ids: torch.Tensor,
+        active_mask: torch.Tensor | None = None,
+        pass_idx: int = 0,
+    ) -> torch.Tensor:
+        del h0, active_mask
+        seen.append((pass_idx, recipe_ids.detach().cpu().clone()))
+        return h
+
+    schedule = torch.tensor([[1, 2, 3, 1], [3, 2, 1, 3]])
+    model.core.forward_step = record_step
+    out = model.forward_exact(
+        tokens,
+        targets,
+        fixed_depth=4,
+        recipe_schedule=schedule,
+    )
+    assert [pass_idx for pass_idx, _ in seen] == [0, 1, 2, 3]
+    assert [recipe_ids.tolist() for _, recipe_ids in seen] == [
+        [1, 3],
+        [2, 2],
+        [3, 1],
+        [1, 3],
+    ]
+    assert out.meta.recipe_schedule is not None
+    assert torch.equal(out.meta.recipe_schedule.cpu(), schedule)
+
+
+def test_router_emits_per_pass_recipe_logits() -> None:
+    cfg = tiny_config("recursive_exact")
+    model = RecursiveModel(cfg.model, cfg.output)
+    tokens, _ = sample_batch(cfg)
+    h0 = model._prelude(tokens)
+    route = model.router(h0)
+    assert route.recipe_logits_by_pass is not None
+    assert route.recipe_probs_by_pass is not None
+    assert route.recipe_id_by_pass is not None
+    assert route.recipe_logits_by_pass.shape == (
+        cfg.training.batch_size,
+        cfg.model.t_max,
+        cfg.model.recipe_count,
+    )
+    assert route.recipe_id_by_pass.shape == (cfg.training.batch_size, cfg.model.t_max)
+    assert route.ffn_bank_logits_by_pass is not None
+    assert route.head_slot_logits_by_pass is not None
+    assert route.ffn_slot_logits_by_pass is not None
+    assert route.ffn_bank_logits_by_pass.shape == (
+        cfg.training.batch_size,
+        cfg.model.t_max,
+        cfg.model.ffn_banks,
+    )
+    assert route.head_slot_logits_by_pass.shape[:2] == (
+        cfg.training.batch_size,
+        cfg.model.t_max,
+    )
+    assert route.ffn_slot_logits_by_pass.shape[:2] == (
+        cfg.training.batch_size,
+        cfg.model.t_max,
+    )
+
+
+def test_recursive_factorized_soft_returns_route_metadata() -> None:
+    cfg = tiny_config("recursive_exact_factorized_soft")
+    model = RecursiveModel(cfg.model, cfg.output)
+    out = model.forward_exact_factorized_soft(
+        *sample_batch(cfg),
+        return_loss_per_sample=True,
+        top_k=3,
+        fixed_depth=4,
+    )
+    assert out.loss_per_sample is not None
+    assert out.meta.factor_route_tuples is not None
+    assert out.meta.factor_route_weights is not None
+    assert out.meta.factor_route_tuples.shape[:3] == (
+        cfg.training.batch_size,
+        cfg.model.t_max,
+        3,
+    )
+    assert out.meta.factor_route_weights.shape == (
+        cfg.training.batch_size,
+        cfg.model.t_max,
+        3,
+    )
+    assert torch.allclose(out.meta.factor_route_weights.sum(dim=-1), torch.ones_like(out.meta.factor_route_weights[..., 0]))
+
+
+def test_recursive_dense_hidden_distill_train_step_cpu(tmp_path) -> None:
+    cfg = tiny_config("recursive_exact_dense_hidden_distill")
+    cfg = dataclasses.replace(
+        cfg,
+        model=dataclasses.replace(
+            cfg.model,
+            depth_choices=[1, 2, 3, 4],
+            use_global_lowrank_corrector=True,
+            global_corrector_rank=4,
+        ),
+        training=dataclasses.replace(
+            cfg.training,
+            fixed_recipe=1,
+            fixed_recipe_schedule=[1, 2, 3, 1],
+            fixed_depth=4,
+            disable_router_aux=True,
+            lambda_dense_hidden=0.1,
+            lambda_dense_delta=0.1,
+            lambda_dense_kl=0.1,
+        ),
+    )
+    teacher = DenseModel(dataclasses.replace(cfg.model, topology="dense"))
+    checkpoint = tmp_path / "dense_teacher.pt"
+    torch.save({"model": teacher.state_dict()}, checkpoint)
+    cfg = dataclasses.replace(
+        cfg,
+        training=dataclasses.replace(
+            cfg.training,
+            aligned_lm_teacher_checkpoint=str(checkpoint),
+        ),
+    )
+    engine = TrainEngine(cfg, device=torch.device("cpu"))
+    try:
+        result = engine.train_step(sample_batch(cfg))
+        assert torch.isfinite(result.loss)
+        assert "dense_hidden_loss" in result.metrics
+        assert "grad_norm_global_corrector" in result.metrics
+    finally:
+        engine.close()
+
+
+def test_recursive_sandwich_supernet_train_step_cpu() -> None:
+    cfg = tiny_config("recursive_sandwich_supernet")
+    cfg = dataclasses.replace(
+        cfg,
+        model=dataclasses.replace(cfg.model, depth_choices=[1, 2, 3, 4]),
+        training=dataclasses.replace(
+            cfg.training,
+            fixed_recipe=1,
+            fixed_recipe_schedule=[1, 2, 3, 1],
+            fixed_depth=4,
+            disable_router_aux=True,
+            sandwich_random_paths=1,
+            lambda_sandwich_rand_ce=0.25,
+            lambda_sandwich_kd=0.5,
+            lambda_sandwich_rand_kd=0.25,
+            lambda_sandwich_hidden=0.05,
+        ),
+    )
+    engine = TrainEngine(cfg, device=torch.device("cpu"))
+    try:
+        result = engine.train_step(sample_batch(cfg))
+        assert torch.isfinite(result.loss)
+        assert result.metrics["mode"] == "recursive_sandwich_supernet"
+        assert "full_nll_per_token" in result.metrics
+        assert "thin_nll_per_token" in result.metrics
+        assert "thin_kd_loss" in result.metrics
+        assert result.metrics["full_recipe_schedule"] == [0, 0, 0, 0]
+        assert result.metrics["thin_recipe_schedule"] == [1, 2, 3, 1]
+    finally:
+        engine.close()
 
 
 def test_recursive_exact_subset_can_reuse_cached_prelude() -> None:
@@ -164,7 +348,14 @@ def test_macro_shortlist_does_not_call_full_logits_path() -> None:
 
 
 def test_train_step_all_modes_cpu() -> None:
-    for mode in ["dense_exact", "recursive_exact", "recursive_macro", "recursive_macro_shortlist"]:
+    for mode in [
+        "dense_exact",
+        "recursive_exact",
+        "recursive_exact_factorized_soft",
+        "recursive_sandwich_supernet",
+        "recursive_macro",
+        "recursive_macro_shortlist",
+    ]:
         cfg = tiny_config(mode)
         engine = TrainEngine(cfg, device=torch.device("cpu"))
         try:

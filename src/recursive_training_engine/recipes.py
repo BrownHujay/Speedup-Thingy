@@ -17,6 +17,41 @@ class RecipeSpec:
     dense_fallback: bool = False
 
 
+def factor_slot_counts(config: ModelConfig) -> tuple[int, int]:
+    head_slots = max(1, config.head_groups // config.active_head_groups)
+    ffn_slots = max(1, config.ffn_groups // config.active_ffn_groups)
+    return head_slots, ffn_slots
+
+
+def spec_from_factors(
+    config: ModelConfig,
+    *,
+    attn_bank: int,
+    ffn_bank: int,
+    head_slot: int,
+    ffn_slot: int,
+) -> RecipeSpec:
+    head_slots, ffn_slots = factor_slot_counts(config)
+    if not 0 <= attn_bank < config.attn_banks:
+        raise ValueError(f"attn_bank={attn_bank} is outside [0, {config.attn_banks})")
+    if not 0 <= ffn_bank < config.ffn_banks:
+        raise ValueError(f"ffn_bank={ffn_bank} is outside [0, {config.ffn_banks})")
+    if not 0 <= head_slot < head_slots:
+        raise ValueError(f"head_slot={head_slot} is outside [0, {head_slots})")
+    if not 0 <= ffn_slot < ffn_slots:
+        raise ValueError(f"ffn_slot={ffn_slot} is outside [0, {ffn_slots})")
+    head_start = head_slot * config.active_head_groups
+    ffn_start = ffn_slot * config.active_ffn_groups
+    return RecipeSpec(
+        recipe_id=-1,
+        attention_banks=(attn_bank,),
+        ffn_banks=(ffn_bank,),
+        head_groups=tuple(range(head_start, head_start + config.active_head_groups)),
+        ffn_groups=tuple(range(ffn_start, ffn_start + config.active_ffn_groups)),
+        dense_fallback=False,
+    )
+
+
 class RecipeBank:
     """Static balanced recipe templates plus a dense fallback recipe."""
 
@@ -42,10 +77,14 @@ class RecipeBank:
         sparse_count = cfg.recipe_count - 1
         for idx in range(sparse_count):
             recipe_id = idx + 1
-            attn_bank = idx % cfg.attn_banks
-            ffn_bank = (idx * 3) % cfg.ffn_banks
-            head_start = idx % cfg.head_groups
-            ffn_start = (idx * 5) % cfg.ffn_groups
+            head_slots = max(1, cfg.head_groups // cfg.active_head_groups)
+            ffn_slots = max(1, cfg.ffn_groups // cfg.active_ffn_groups)
+            head_slot = idx % head_slots
+            ffn_slot = idx % ffn_slots
+            attn_bank = (idx // head_slots) % cfg.attn_banks
+            ffn_bank = (idx // ffn_slots) % cfg.ffn_banks
+            head_start = head_slot * cfg.active_head_groups
+            ffn_start = ffn_slot * cfg.active_ffn_groups
             heads = tuple((head_start + j) % cfg.head_groups for j in range(cfg.active_head_groups))
             slabs = tuple((ffn_start + j) % cfg.ffn_groups for j in range(cfg.active_ffn_groups))
             recipes.append(
@@ -60,6 +99,13 @@ class RecipeBank:
             )
         self.recipes = recipes
 
+    def active_touches_for_spec(self, spec: RecipeSpec) -> float:
+        cfg = self.config
+        d = cfg.d_model
+        attn = len(spec.attention_banks) * 4 * d * d * len(spec.head_groups) / cfg.head_groups
+        ffn = len(spec.ffn_banks) * 3 * d * cfg.d_ff * len(spec.ffn_groups) / cfg.ffn_groups
+        return float(attn + ffn)
+
     def get_recipe(self, recipe_id: torch.Tensor | int) -> RecipeSpec | list[RecipeSpec]:
         if isinstance(recipe_id, torch.Tensor):
             if recipe_id.ndim == 0:
@@ -71,7 +117,7 @@ class RecipeBank:
         return self.recipes[0]
 
     def update_usage(self, recipe_ids: torch.Tensor, beta: float = 0.98) -> None:
-        ids = recipe_ids.detach().cpu().long()
+        ids = recipe_ids.detach().cpu().long().flatten()
         counts = torch.bincount(ids, minlength=self.config.recipe_count).float()
         probs = counts / counts.sum().clamp_min(1.0)
         self.usage_ema.mul_(beta).add_(probs, alpha=1.0 - beta)
@@ -89,9 +135,7 @@ class RecipeBank:
         d = cfg.d_model
         touches = []
         for spec in self.recipes:
-            attn = len(spec.attention_banks) * 4 * d * d * len(spec.head_groups) / cfg.head_groups
-            ffn = len(spec.ffn_banks) * 3 * d * cfg.d_ff * len(spec.ffn_groups) / cfg.ffn_groups
-            touches.append(attn + ffn)
+            touches.append(self.active_touches_for_spec(spec))
         return torch.tensor(touches, dtype=torch.float32)
 
     def validate_balance(self) -> dict[str, float]:

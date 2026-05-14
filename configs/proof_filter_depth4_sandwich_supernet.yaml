@@ -1,4 +1,4 @@
-run_name: proof_filter_depth8_exact_teacher
+run_name: proof_filter_depth4_sandwich_supernet
 output_dir: runs
 model:
   topology: recursive
@@ -9,8 +9,8 @@ model:
   n_dense_layers: 11
   n_prelude: 1
   n_coda: 1
-  t_max: 8
-  depth_choices: [1, 2, 4, 8]
+  t_max: 4
+  depth_choices: [1, 2, 4]
   attn_banks: 1
   ffn_banks: 2
   head_groups: 8
@@ -32,7 +32,8 @@ model:
   macro_decomposition: direct
   router_hidden: 64
 training:
-  mode: recursive_exact
+  mode: recursive_sandwich_supernet
+  optimizer: adamw
   lr: 0.001
   lr_base: 0.001
   lr_macro: 0.003
@@ -42,8 +43,10 @@ training:
   weight_decay: 0.1
   batch_size: 128
   seq_len: 64
+  grad_accum_steps: 1
   grad_clip_norm: 1.0
   seed: 1234
+  precision: fp32
   audit_p_min: 0.0
   audit_p_max: 0.0
   audit_alpha: 0.0
@@ -51,14 +54,28 @@ training:
   audit_gamma: 0.0
   audit_mode: metric_only
   audit_gradient_correction: false
+  lambda_norm: 0.05
+  lambda_cons: 0.001
+  distill_temperature: 2.0
   fixed_recipe: 1
-  fixed_recipe_schedule: [1, 3, 5, 7, 9, 11, 13, 15]
-  fixed_depth: 8
+  fixed_recipe_schedule: [1, 3, 5, 7]
+  fixed_depth: 4
+  sandwich_random_paths: 2
+  sandwich_temperature: 2.0
+  lambda_sandwich_rand_ce: 0.5
+  lambda_sandwich_kd: 1.0
+  lambda_sandwich_rand_kd: 0.5
+  lambda_sandwich_hidden: 0.1
   disable_router_aux: true
   debug_force_full_output: true
+  coverage_min: 0.0
   log_every: 10
+  compile_model: false
   fused_optimizer: false
   foreach_optimizer: false
+  allow_tf32: true
+  strict_cuda: false
+  require_triton: false
   require_flash_attention: false
 output:
   mode: full
