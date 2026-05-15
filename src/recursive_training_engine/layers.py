@@ -283,22 +283,25 @@ class SVDFactorSparseFFN(nn.Module):
         flat = x.reshape(-1, self.d_model)
         wd_norm = self.w_down.detach().float().norm(dim=-1).to(flat.device, flat.dtype)
         if self.candidate_mode == "triton":
+            if self.training:
+                raise RuntimeError("SVDFactorSparseFFN Triton mode is inference/eval only; call .eval() first")
             t_start = mark("start")
-            out = triton_svd_sparse_ffn_forward(
-                flat.contiguous(),
-                self.w_up.contiguous(),
-                self.w_gate.contiguous(),
-                self.w_down.contiguous(),
-                self.up_a.contiguous(),
-                self.up_b.contiguous(),
-                self.gate_a.contiguous(),
-                self.gate_b.contiguous(),
-                wd_norm.contiguous(),
-                top_k=self.top_k,
-                up_m=self.up_m,
-                gate_m=self.gate_m,
-                product_m=self.product_m,
-            )
+            with torch.inference_mode():
+                out = triton_svd_sparse_ffn_forward(
+                    flat.detach().contiguous(),
+                    self.w_up.detach().contiguous(),
+                    self.w_gate.detach().contiguous(),
+                    self.w_down.detach().contiguous(),
+                    self.up_a.detach().contiguous(),
+                    self.up_b.detach().contiguous(),
+                    self.gate_a.detach().contiguous(),
+                    self.gate_b.detach().contiguous(),
+                    wd_norm.detach().contiguous(),
+                    top_k=self.top_k,
+                    up_m=self.up_m,
+                    gate_m=self.gate_m,
+                    product_m=self.product_m,
+                )
             mark("triton_sparse_ffn_time", t_start)
             out = out.view(*original_shape, self.d_model)
             if not return_aux:

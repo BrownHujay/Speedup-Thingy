@@ -123,20 +123,25 @@ when `candidate_mode=triton` is requested.
 | `_candidate_activation_select_kernel` | Low-launch candidate kernel that computes exact candidate activations and final top-k selection in one program per token. | Avoids materializing candidate `z` and score tensors before selection. |
 | `_downsum_kernel` | Accumulates `sum_j z_j * W_down[j]` into the FFN residual. | Grid: `[tokens, ceil(d_model / block_d)]`. Parallel over output channels. |
 
-The default Triton forward uses a low-launch path:
+The default Triton forward now uses a GEMM selector path:
 
 ```text
 cuBLAS q_up GEMM
 cuBLAS q_gate GEMM
-_selector_full_kernel
-_candidate_activation_select_kernel
+cuBLAS up_hat = q_up @ B_up
+cuBLAS gate_hat = q_gate @ B_gate
+torch topk candidate ids
+_candidate_activation_kernel
+_candidate_select_kernel
 _downsum_kernel
 ```
 
-That is five GPU launches total, with the two largest regular pieces left as
-vendor GEMMs. The low-rank query projections `q_up = x @ A_up` and
-`q_gate = x @ A_gate` remain regular cuBLAS GEMMs because forcing them into a
-single custom kernel would likely make them slower, not faster.
+The hand-written Triton selector paths remain in the file as experiments, but
+they are not the default. Both the low-launch and tile-parallel Triton selectors
+lost badly on T4 because they evaluate rank-48 dot products with scalar/vector
+Triton loops instead of tensor-core GEMM scheduling. The selector is a low-rank
+matrix multiply problem, so the fast path uses cuBLAS GEMMs and lets Triton do
+only the irregular sparse work that cuBLAS cannot express.
 
 ### CUDA/Triton Kernels To Build Later
 

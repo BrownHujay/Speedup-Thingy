@@ -452,7 +452,8 @@ def triton_svd_sparse_ffn_forward(
     product_m: int = 0,
     block_h: int = 1024,
     block_d: int = 64,
-    low_launch: bool = True,
+    low_launch: bool = False,
+    selector_backend: str = "gemm",
 ) -> torch.Tensor:
     """CUDA/Triton SVD sparse FFN forward.
 
@@ -497,7 +498,22 @@ def triton_svd_sparse_ffn_forward(
     q_gate = x @ gate_a
 
     candidate_ids = torch.empty((n_tokens, candidate_slots), device=x.device, dtype=torch.int32)
-    if low_launch:
+    if selector_backend == "gemm":
+        # The selector projections are intentionally big GEMMs. On NVIDIA this
+        # is faster than hand-written rank loops over H because cuBLAS can use
+        # tensor-core/GEMM scheduling for the [tokens, rank] x [rank, d_ff]
+        # score matrices.
+        up_hat = q_up @ up_b
+        gate_hat = q_gate @ gate_b
+        gate_act = torch.nn.functional.silu(gate_hat)
+        up_ids = torch.topk(up_hat.abs() * wd_norm, k=top_m, dim=-1).indices
+        gate_ids = torch.topk(gate_act.abs() * wd_norm, k=top_m, dim=-1).indices
+        pieces = [up_ids, gate_ids]
+        if views == 3:
+            product_ids = torch.topk((up_hat * gate_act).abs() * wd_norm, k=top_m, dim=-1).indices
+            pieces.append(product_ids)
+        candidate_ids.copy_(torch.cat(pieces, dim=-1).to(torch.int32))
+    elif selector_backend == "triton" and low_launch:
         _selector_full_kernel[(n_tokens,)](
             q_up,
             q_gate,
@@ -513,7 +529,7 @@ def triton_svd_sparse_ffn_forward(
             rank_block,
             num_warps=8,
         )
-    else:
+    elif selector_backend == "triton":
         partial_ids = torch.empty(
             (n_tokens, views, tiles, top_m),
             device=x.device,
@@ -551,6 +567,8 @@ def triton_svd_sparse_ffn_forward(
             merge_block,
             num_warps=8,
         )
+    else:
+        raise ValueError("selector_backend must be 'gemm' or 'triton'")
 
     selected_ids = torch.empty((n_tokens, top_k), device=x.device, dtype=torch.int32)
     selected_z = torch.empty((n_tokens, top_k), device=x.device, dtype=torch.float32)
