@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import torch
 from torch import nn
@@ -8,6 +9,7 @@ import torch.nn.functional as F
 
 from recursive_training_engine.config import ModelConfig
 from recursive_training_engine.kernels import optimized as K
+from recursive_training_engine.kernels.svd_sparse_ffn_triton import triton_svd_sparse_ffn_forward
 from recursive_training_engine.recipes import RecipeBank, RecipeSpec, spec_from_factors
 
 
@@ -93,6 +95,7 @@ class SVDFactorSparseFFN(nn.Module):
         up_m: int,
         gate_m: int | None = None,
         product_m: int = 0,
+        candidate_mode: str = "mask",
         refresh_on_init: bool = True,
     ):
         super().__init__()
@@ -103,6 +106,9 @@ class SVDFactorSparseFFN(nn.Module):
         self.up_m = min(max(0, int(up_m)), self.d_ff)
         self.gate_m = self.up_m if gate_m is None else min(max(0, int(gate_m)), self.d_ff)
         self.product_m = min(max(0, int(product_m)), self.d_ff)
+        if candidate_mode not in {"mask", "slots", "triton"}:
+            raise ValueError("candidate_mode must be 'mask', 'slots', or 'triton'")
+        self.candidate_mode = candidate_mode
         self.refresh_on_init = bool(refresh_on_init)
         self.w_up = nn.Parameter(torch.empty(self.d_ff, self.d_model))
         self.w_gate = nn.Parameter(torch.empty(self.d_ff, self.d_model))
@@ -136,6 +142,7 @@ class SVDFactorSparseFFN(nn.Module):
         up_m: int,
         gate_m: int | None = None,
         product_m: int = 0,
+        candidate_mode: str = "mask",
     ) -> "SVDFactorSparseFFN":
         module = cls(
             mlp.wug.in_features,
@@ -145,6 +152,7 @@ class SVDFactorSparseFFN(nn.Module):
             up_m=up_m,
             gate_m=gate_m,
             product_m=product_m,
+            candidate_mode=candidate_mode,
         ).to(device=mlp.wug.weight.device, dtype=mlp.wug.weight.dtype)
         with torch.no_grad():
             up, gate = mlp.wug.weight.detach().chunk(2, dim=0)
@@ -174,36 +182,41 @@ class SVDFactorSparseFFN(nn.Module):
         ids = torch.topk(scores, k=min(count, self.d_ff), dim=-1).indices
         candidate_mask.scatter_(-1, ids, True)
 
-    def forward(
+    def _top_candidate_ids(self, scores: torch.Tensor, count: int) -> torch.Tensor | None:
+        if count <= 0:
+            return None
+        return torch.topk(scores, k=min(count, self.d_ff), dim=-1).indices
+
+    def _first_occurrence_mask(self, ids: torch.Tensor) -> torch.Tensor:
+        slots = ids.shape[-1]
+        if slots <= 1:
+            return torch.ones_like(ids, dtype=torch.bool)
+        same = ids.unsqueeze(2).eq(ids.unsqueeze(1))
+        earlier = torch.triu(
+            torch.ones(slots, slots, device=ids.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        return ~(same & earlier).any(dim=1)
+
+    def _candidate_ids_from_mask(
         self,
-        x: torch.Tensor,
-        *,
-        return_aux: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
-        original_shape = x.shape[:-1]
-        flat = x.reshape(-1, self.d_model)
-        wd_norm = self.w_down.detach().float().norm(dim=-1).to(flat.device, flat.dtype)
-        q_up = flat @ self.up_a
-        q_gate = flat @ self.gate_a
-        up_hat = q_up @ self.up_b
-        gate_hat = q_gate @ self.gate_b
-        gate_hat_act = F.silu(gate_hat)
-        candidate_mask = torch.zeros(flat.shape[0], self.d_ff, device=flat.device, dtype=torch.bool)
-        self._add_top_candidates(candidate_mask, up_hat.detach().abs() * wd_norm, self.up_m)
-        self._add_top_candidates(candidate_mask, gate_hat_act.detach().abs() * wd_norm, self.gate_m)
-        if self.product_m > 0:
-            self._add_top_candidates(
-                candidate_mask,
-                (up_hat * gate_hat_act).detach().abs() * wd_norm,
-                self.product_m,
-            )
-        # Guard against degenerate duplicate-heavy candidate unions.
+        up_scores: torch.Tensor,
+        gate_scores: torch.Tensor,
+        product_scores: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        candidate_mask = torch.zeros(
+            up_scores.shape[0],
+            self.d_ff,
+            device=up_scores.device,
+            dtype=torch.bool,
+        )
+        self._add_top_candidates(candidate_mask, up_scores, self.up_m)
+        self._add_top_candidates(candidate_mask, gate_scores, self.gate_m)
+        self._add_top_candidates(candidate_mask, product_scores, self.product_m)
         too_small = candidate_mask.sum(dim=-1) < self.top_k
         if bool(too_small.any()):
-            fallback_scores = (up_hat * gate_hat_act).detach().abs() * wd_norm
-            fill_ids = torch.topk(fallback_scores[too_small], k=self.top_k, dim=-1).indices
+            fill_ids = torch.topk(product_scores[too_small], k=self.top_k, dim=-1).indices
             candidate_mask[too_small].scatter_(-1, fill_ids, True)
-
         max_candidates = min(
             self.d_ff,
             max(self.top_k, self.up_m + self.gate_m + self.product_m),
@@ -214,11 +227,118 @@ class SVDFactorSparseFFN(nn.Module):
             dim=-1,
         ).indices
         candidate_valid = candidate_mask.gather(dim=-1, index=candidate_ids)
+        return candidate_ids, candidate_valid, candidate_mask.sum(dim=-1).float()
+
+    def _candidate_ids_from_slots(
+        self,
+        up_scores: torch.Tensor,
+        gate_scores: torch.Tensor,
+        product_scores: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        pieces = [
+            ids
+            for ids in (
+                self._top_candidate_ids(up_scores, self.up_m),
+                self._top_candidate_ids(gate_scores, self.gate_m),
+                self._top_candidate_ids(product_scores, self.product_m),
+            )
+            if ids is not None
+        ]
+        if not pieces:
+            pieces = [torch.topk(product_scores, k=self.top_k, dim=-1).indices]
+        candidate_ids = torch.cat(pieces, dim=-1)
+        candidate_valid = self._first_occurrence_mask(candidate_ids)
+        if bool((candidate_valid.sum(dim=-1) < self.top_k).any()):
+            fallback_ids = torch.topk(product_scores, k=self.top_k, dim=-1).indices
+            candidate_ids = torch.cat([candidate_ids, fallback_ids], dim=-1)
+            candidate_valid = self._first_occurrence_mask(candidate_ids)
+        return candidate_ids, candidate_valid, candidate_valid.sum(dim=-1).float()
+
+    def _sync_for_profile(self, device: torch.device) -> None:
+        if device.type == "mps":
+            torch.mps.synchronize()
+        elif device.type == "cuda":
+            torch.cuda.synchronize()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        return_aux: bool = False,
+        profile: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
+        timings: dict[str, float] = {}
+
+        def mark(name: str, previous: float | None = None) -> float:
+            if not profile:
+                return 0.0
+            self._sync_for_profile(x.device)
+            now = time.perf_counter()
+            if previous is not None:
+                timings[name] = now - previous
+            return now
+
+        t0 = mark("start")
+        original_shape = x.shape[:-1]
+        flat = x.reshape(-1, self.d_model)
+        wd_norm = self.w_down.detach().float().norm(dim=-1).to(flat.device, flat.dtype)
+        if self.candidate_mode == "triton":
+            t_start = mark("start")
+            out = triton_svd_sparse_ffn_forward(
+                flat.contiguous(),
+                self.w_up.contiguous(),
+                self.w_gate.contiguous(),
+                self.w_down.contiguous(),
+                self.up_a.contiguous(),
+                self.up_b.contiguous(),
+                self.gate_a.contiguous(),
+                self.gate_b.contiguous(),
+                wd_norm.contiguous(),
+                top_k=self.top_k,
+                up_m=self.up_m,
+                gate_m=self.gate_m,
+                product_m=self.product_m,
+            )
+            mark("triton_sparse_ffn_time", t_start)
+            out = out.view(*original_shape, self.d_model)
+            if not return_aux:
+                return out
+            aux: dict[str, torch.Tensor | float] = {
+                "avg_candidate_size": float(self.up_m + self.gate_m + self.product_m),
+                "candidate_slots": float(self.up_m + self.gate_m + self.product_m),
+                "candidate_mode": self.candidate_mode,
+            }
+            aux.update(timings)
+            return out, aux
+
+        q_up = flat @ self.up_a
+        q_gate = flat @ self.gate_a
+        up_hat = q_up @ self.up_b
+        gate_hat = q_gate @ self.gate_b
+        gate_hat_act = F.silu(gate_hat)
+        product_scores = (up_hat * gate_hat_act).detach().abs() * wd_norm
+        up_scores = up_hat.detach().abs() * wd_norm
+        gate_scores = gate_hat_act.detach().abs() * wd_norm
+        t1 = mark("selector_score_time", t0)
+        if self.candidate_mode == "mask":
+            candidate_ids, candidate_valid, candidate_sizes = self._candidate_ids_from_mask(
+                up_scores,
+                gate_scores,
+                product_scores,
+            )
+        else:
+            candidate_ids, candidate_valid, candidate_sizes = self._candidate_ids_from_slots(
+                up_scores,
+                gate_scores,
+                product_scores,
+            )
+        t2 = mark("candidate_union_dedup_time", t1)
         up_rows = self.w_up[candidate_ids]
         gate_rows = self.w_gate[candidate_ids]
         exact_up = torch.einsum("nd,ncd->nc", flat, up_rows)
         exact_gate = torch.einsum("nd,ncd->nc", flat, gate_rows)
         z = exact_up * F.silu(exact_gate)
+        t3 = mark("exact_candidate_activation_time", t2)
         exact_scores = (z.detach().abs() * wd_norm[candidate_ids]).masked_fill(
             ~candidate_valid,
             -torch.inf,
@@ -226,7 +346,9 @@ class SVDFactorSparseFFN(nn.Module):
         selected_local = torch.topk(exact_scores, k=self.top_k, dim=-1).indices
         selected_ids = candidate_ids.gather(dim=-1, index=selected_local)
         selected_z = z.gather(dim=-1, index=selected_local)
+        t4 = mark("rerank_topk_time", t3)
         out = (selected_z.unsqueeze(-1) * self.w_down[selected_ids]).sum(dim=1)
+        mark("down_sum_time", t4)
         out = out.view(*original_shape, self.d_model)
         if not return_aux:
             return out
@@ -234,8 +356,11 @@ class SVDFactorSparseFFN(nn.Module):
             "candidate_ids": candidate_ids,
             "candidate_valid": candidate_valid,
             "selected_ids": selected_ids,
-            "avg_candidate_size": float(candidate_mask.sum(dim=-1).float().mean().detach().cpu()),
+            "avg_candidate_size": float(candidate_sizes.mean().detach().cpu()),
+            "candidate_slots": float(candidate_ids.shape[-1]),
+            "candidate_mode": self.candidate_mode,
         }
+        aux.update(timings)
         return out, aux
 
 

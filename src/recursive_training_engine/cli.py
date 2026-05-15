@@ -3892,6 +3892,7 @@ def _build_svd_sparse_ffns(
     gate_m: int,
     product_m: int,
     device: torch.device,
+    candidate_mode: str = "mask",
     svd_factors: list[dict[str, torch.Tensor]] | None = None,
 ) -> list[SVDFactorSparseFFN]:
     modules: list[SVDFactorSparseFFN] = []
@@ -3903,6 +3904,7 @@ def _build_svd_sparse_ffns(
             up_m=up_m,
             gate_m=gate_m,
             product_m=product_m,
+            candidate_mode=candidate_mode,
         ).to(device)
         if svd_factors is not None:
             with torch.no_grad():
@@ -3920,21 +3922,34 @@ def _svd_hot_full_stack_logits(
     dense: DenseModel,
     sparse_ffns: list[SVDFactorSparseFFN],
     tokens: torch.Tensor,
+    *,
+    profile: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     x = dense.embed(tokens)
     candidate_size_sum = 0.0
     selection_count = 0.0
+    timing_sums = {
+        "selector_score_time": 0.0,
+        "candidate_union_dedup_time": 0.0,
+        "exact_candidate_activation_time": 0.0,
+        "rerank_topk_time": 0.0,
+        "down_sum_time": 0.0,
+    }
     for block, sparse_ffn in zip(dense.blocks, sparse_ffns, strict=True):
         u = x + block.attn(block.norm1(x))
-        ffn, layer_aux = sparse_ffn(block.norm2(u), return_aux=True)
+        ffn, layer_aux = sparse_ffn(block.norm2(u), return_aux=True, profile=profile)
         candidate_size_sum += float(layer_aux["avg_candidate_size"]) * u.numel() / u.shape[-1]
         selection_count += float(u.numel() / u.shape[-1])
+        for key in timing_sums:
+            timing_sums[key] += float(layer_aux.get(key, 0.0))
         x = u + ffn
     hidden = dense.final_norm(x)
-    return hidden @ dense.vocab_weight.t(), hidden, {
+    aux = {
         "candidate_size_sum": candidate_size_sum,
         "selection_count": selection_count,
     }
+    aux.update(timing_sums)
+    return hidden @ dense.vocab_weight.t(), hidden, aux
 
 
 def cmd_deferred_neuron_factor_selector_oracle(args: argparse.Namespace) -> None:
@@ -4359,6 +4374,7 @@ def cmd_deferred_neuron_svd_hot_eval(args: argparse.Namespace) -> None:
         gate_m=args.factor_m,
         product_m=args.product_factor_m,
         device=device,
+        candidate_mode=args.candidate_mode,
         svd_factors=svd_factors,
     )
     totals = {
@@ -4375,6 +4391,11 @@ def cmd_deferred_neuron_svd_hot_eval(args: argparse.Namespace) -> None:
         "samples": 0,
         "max_logit_abs_diff": 0.0,
         "max_hidden_abs_diff": 0.0,
+        "selector_score_time": 0.0,
+        "candidate_union_dedup_time": 0.0,
+        "exact_candidate_activation_time": 0.0,
+        "rerank_topk_time": 0.0,
+        "down_sum_time": 0.0,
     }
     batches = streams.eval_batches(config.training)
     for batch_idx in range(eval_batches):
@@ -4400,7 +4421,12 @@ def cmd_deferred_neuron_svd_hot_eval(args: argparse.Namespace) -> None:
             product_m=args.product_factor_m,
             reranker="norm",
         )
-        hot_logits, hot_hidden, hot_aux = _svd_hot_full_stack_logits(dense, sparse_ffns, tokens)
+        hot_logits, hot_hidden, hot_aux = _svd_hot_full_stack_logits(
+            dense,
+            sparse_ffns,
+            tokens,
+            profile=args.profile,
+        )
         token_count = int(targets.numel())
         sample_count = int(targets.shape[0])
         oracle_loss = F.cross_entropy(oracle_logits.flatten(0, -2), target_flat, reduction="sum")
@@ -4432,6 +4458,14 @@ def cmd_deferred_neuron_svd_hot_eval(args: argparse.Namespace) -> None:
         totals["hot_cos"] += float(hot_cos.detach().cpu())
         totals["hot_avg_candidate_size_sum"] += float(hot_aux["candidate_size_sum"])
         totals["hot_selection_count"] += float(hot_aux["selection_count"])
+        for key in (
+            "selector_score_time",
+            "candidate_union_dedup_time",
+            "exact_candidate_activation_time",
+            "rerank_topk_time",
+            "down_sum_time",
+        ):
+            totals[key] += float(hot_aux.get(key, 0.0))
         totals["tokens"] += token_count
         totals["samples"] += sample_count
         totals["max_logit_abs_diff"] = max(
@@ -4458,6 +4492,7 @@ def cmd_deferred_neuron_svd_hot_eval(args: argparse.Namespace) -> None:
         "k": args.k,
         "factor_m": args.factor_m,
         "product_factor_m": args.product_factor_m,
+        "candidate_mode": args.candidate_mode,
         "reranker": "norm",
         "temperature": args.temperature,
         "attention": "dense",
@@ -4483,6 +4518,11 @@ def cmd_deferred_neuron_svd_hot_eval(args: argparse.Namespace) -> None:
                 / max(totals["hot_selection_count"], 1.0),
                 "max_logit_abs_diff_vs_oracle": totals["max_logit_abs_diff"],
                 "max_hidden_abs_diff_vs_oracle": totals["max_hidden_abs_diff"],
+                "selector_score_time": totals["selector_score_time"] / max(eval_batches, 1),
+                "candidate_union_dedup_time": totals["candidate_union_dedup_time"] / max(eval_batches, 1),
+                "exact_candidate_activation_time": totals["exact_candidate_activation_time"] / max(eval_batches, 1),
+                "rerank_topk_time": totals["rerank_topk_time"] / max(eval_batches, 1),
+                "down_sum_time": totals["down_sum_time"] / max(eval_batches, 1),
             },
         ],
     }
@@ -4527,6 +4567,7 @@ def cmd_benchmark_svd_sparse_ffn(args: argparse.Namespace) -> None:
             top_k=k,
             up_m=factor_m,
             product_m=product_m,
+            candidate_mode=args.candidate_mode,
             refresh_on_init=False,
         ).to(device)
         sparse.eval()
@@ -4554,6 +4595,22 @@ def cmd_benchmark_svd_sparse_ffn(args: argparse.Namespace) -> None:
 
         dense_seconds = measure(dense_forward)
         sparse_seconds = measure(sparse_forward)
+        profile_aux: dict[str, Any] = {}
+        if args.profile:
+            _, aux = sparse(x, return_aux=True, profile=True)
+            profile_aux = {
+                key: float(aux.get(key, 0.0))
+                for key in (
+                    "selector_score_time",
+                    "candidate_union_dedup_time",
+                    "exact_candidate_activation_time",
+                    "rerank_topk_time",
+                    "down_sum_time",
+                    "triton_sparse_ffn_time",
+                    "avg_candidate_size",
+                    "candidate_slots",
+                )
+            }
         dense_ops = 3.0 * d_model * d_ff
         sparse_ops = (
             2.0 * d_model * rank
@@ -4569,6 +4626,7 @@ def cmd_benchmark_svd_sparse_ffn(args: argparse.Namespace) -> None:
                 "rank": rank,
                 "factor_m": factor_m,
                 "product_factor_m": product_m,
+                "candidate_mode": args.candidate_mode,
                 "k": k,
                 "dense_ms": dense_seconds * 1000.0,
                 "sparse_ms": sparse_seconds * 1000.0,
@@ -4576,6 +4634,7 @@ def cmd_benchmark_svd_sparse_ffn(args: argparse.Namespace) -> None:
                 "estimated_dense_ops_per_token": dense_ops,
                 "estimated_sparse_ops_per_token": sparse_ops,
                 "estimated_speedup": dense_ops / max(sparse_ops, 1.0),
+                **profile_aux,
             }
         )
         if device.type == "mps":
@@ -4583,6 +4642,39 @@ def cmd_benchmark_svd_sparse_ffn(args: argparse.Namespace) -> None:
     report = {
         "mode": "benchmark_svd_sparse_ffn",
         "device": str(device),
+        "iters": args.iters,
+        "warmup": args.warmup,
+        "rows": rows,
+    }
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+    _print_json(report)
+
+
+def cmd_benchmark_mlx_svd_sparse_ffn(args: argparse.Namespace) -> None:
+    from recursive_training_engine.mlx_svd_ffn import benchmark_mlx_svd_sparse_ffn
+
+    sizes = args.size or [(64, 256, 2048), (512, 2048, 128)]
+    rows = [
+        dataclasses.asdict(row)
+        for row in benchmark_mlx_svd_sparse_ffn(
+            sizes=sizes,
+            rank=args.rank,
+            factor_m=args.factor_m,
+            product_factor_m=args.product_factor_m,
+            k=args.k,
+            iters=args.iters,
+            warmup=args.warmup,
+            seed=args.seed,
+            backend=args.backend,
+        )
+    ]
+    report = {
+        "mode": "benchmark_mlx_svd_sparse_ffn",
+        "backend": "mlx",
+        "kernel_backend": args.backend,
         "iters": args.iters,
         "warmup": args.warmup,
         "rows": rows,
@@ -6683,6 +6775,8 @@ def build_parser() -> argparse.ArgumentParser:
     svd_hot.add_argument("--rank", type=int, default=48)
     svd_hot.add_argument("--factor-m", type=int, default=64)
     svd_hot.add_argument("--product-factor-m", type=int, default=0)
+    svd_hot.add_argument("--candidate-mode", choices=["mask", "slots", "triton"], default="mask")
+    svd_hot.add_argument("--profile", action="store_true")
     svd_hot.add_argument("--temperature", type=float, default=2.0)
     svd_hot.add_argument("--seed", type=int)
     svd_hot.add_argument("--progress", type=int, default=0)
@@ -6700,11 +6794,41 @@ def build_parser() -> argparse.ArgumentParser:
     svd_bench.add_argument("--rank", type=int, default=48)
     svd_bench.add_argument("--factor-m", type=int, default=64)
     svd_bench.add_argument("--product-factor-m", type=int, default=64)
+    svd_bench.add_argument("--candidate-mode", choices=["mask", "slots", "triton"], default="mask")
     svd_bench.add_argument("--k", type=int, default=64)
     svd_bench.add_argument("--iters", type=int, default=5)
     svd_bench.add_argument("--warmup", type=int, default=1)
+    svd_bench.add_argument("--profile", action="store_true")
     svd_bench.add_argument("--output")
     svd_bench.set_defaults(func=cmd_benchmark_svd_sparse_ffn)
+
+    mlx_svd_bench = sub.add_parser("benchmark-mlx-svd-sparse-ffn")
+    mlx_svd_bench.add_argument(
+        "--size",
+        type=_parse_ffn_bench_size,
+        action="append",
+        default=None,
+        help="Benchmark size as d_modelxd_ffxtokens, e.g. 512x2048x128.",
+    )
+    mlx_svd_bench.add_argument("--rank", type=int, default=48)
+    mlx_svd_bench.add_argument("--factor-m", type=int, default=64)
+    mlx_svd_bench.add_argument("--product-factor-m", type=int, default=64)
+    mlx_svd_bench.add_argument("--k", type=int, default=64)
+    mlx_svd_bench.add_argument(
+        "--backend",
+        choices=["graph", "metal", "hybrid", "parallel"],
+        default="graph",
+        help=(
+            "MLX sparse FFN backend. 'graph' uses MLX ops, 'metal' is the serial "
+            "whole-path custom kernel, and 'hybrid'/'parallel' uses MLX selector "
+            "slots plus a parallel Metal candidate/downsum kernel."
+        ),
+    )
+    mlx_svd_bench.add_argument("--iters", type=int, default=5)
+    mlx_svd_bench.add_argument("--warmup", type=int, default=1)
+    mlx_svd_bench.add_argument("--seed", type=int, default=0)
+    mlx_svd_bench.add_argument("--output")
+    mlx_svd_bench.set_defaults(func=cmd_benchmark_mlx_svd_sparse_ffn)
 
     bench = sub.add_parser("benchmark-kernels")
     bench.add_argument("--config", required=True)

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from recursive_training_engine.kernels import optimized, reference
+from recursive_training_engine.layers import SVDFactorSparseFFN
 
 
 def test_rmsnorm_reference_matches_manual() -> None:
@@ -53,3 +54,19 @@ def test_strict_optimized_kernel_does_not_silently_fallback_on_cpu() -> None:
             optimized.k_fused_rmsnorm(torch.randn(2, 3, 4), torch.ones(4))
     finally:
         optimized.set_strict_cuda(False)
+
+
+def test_triton_svd_sparse_ffn_mode_requires_cuda() -> None:
+    if optimized.triton_available():
+        pytest.skip("CUDA Triton is available in this environment")
+    sparse = SVDFactorSparseFFN(
+        8,
+        16,
+        rank=4,
+        top_k=4,
+        up_m=4,
+        product_m=4,
+        candidate_mode="triton",
+    )
+    with pytest.raises(RuntimeError, match="CUDA|Triton"):
+        sparse(torch.randn(2, 8))

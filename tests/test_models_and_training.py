@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 
+import numpy as np
+import pytest
 import torch
 
 from recursive_training_engine.config import load_config
@@ -57,6 +59,60 @@ def test_svd_factor_sparse_ffn_recovers_dense_when_all_neurons_active() -> None:
     sparse_out, aux = sparse(x, return_aux=True)
     assert torch.allclose(sparse_out, dense_out, atol=1e-5)
     assert aux["selected_ids"].shape == (x.shape[0] * x.shape[1], cfg.model.d_ff)
+
+
+def test_mlx_svd_sparse_ffn_compiled_matches_eager_when_available() -> None:
+    mx = pytest.importorskip("mlx.core")
+    from recursive_training_engine.mlx_svd_ffn import (
+        build_metal_candidate_swiglu_downsum,
+        build_metal_fused_svd_sparse_ffn,
+        build_mlx_svd_candidate_slots,
+        build_mlx_svd_sparse_ffn,
+    )
+
+    rng = np.random.default_rng(123)
+    d_model = 16
+    d_ff = 32
+    rank = 8
+    tokens = 4
+    x = mx.array(rng.standard_normal((tokens, d_model)).astype(np.float32))
+    w_up = mx.array(rng.standard_normal((d_ff, d_model)).astype(np.float32))
+    w_gate = mx.array(rng.standard_normal((d_ff, d_model)).astype(np.float32))
+    w_down = mx.array(rng.standard_normal((d_ff, d_model)).astype(np.float32))
+    up_a = mx.array(rng.standard_normal((d_model, rank)).astype(np.float32))
+    up_b = mx.array(rng.standard_normal((rank, d_ff)).astype(np.float32))
+    gate_a = mx.array(rng.standard_normal((d_model, rank)).astype(np.float32))
+    gate_b = mx.array(rng.standard_normal((rank, d_ff)).astype(np.float32))
+    wd_norm = mx.sqrt(mx.sum(w_down * w_down, axis=-1))
+    eager = build_mlx_svd_sparse_ffn(top_k=8, up_m=8, product_m=8, compile_fn=False)
+    compiled = build_mlx_svd_sparse_ffn(top_k=8, up_m=8, product_m=8, compile_fn=True)
+    eager_out = eager(x, w_up, w_gate, w_down, up_a, up_b, gate_a, gate_b, wd_norm)
+    compiled_out = compiled(x, w_up, w_gate, w_down, up_a, up_b, gate_a, gate_b, wd_norm)
+    mx.eval(eager_out, compiled_out)
+    assert np.allclose(np.array(eager_out), np.array(compiled_out), atol=1e-5)
+    metal = build_metal_fused_svd_sparse_ffn(
+        d_model=d_model,
+        d_ff=d_ff,
+        rank=rank,
+        top_k=8,
+        up_m=8,
+        product_m=8,
+    )
+    metal_out = metal(x, w_up, w_gate, w_down, up_a, up_b, gate_a, gate_b, wd_norm)
+    mx.eval(metal_out)
+    assert np.allclose(np.array(eager_out), np.array(metal_out), atol=1e-4)
+
+    candidate_slots = build_mlx_svd_candidate_slots(up_m=8, product_m=8, compile_fn=True)
+    candidate_ids = candidate_slots(x, up_a, up_b, gate_a, gate_b, wd_norm)
+    hybrid = build_metal_candidate_swiglu_downsum(
+        d_model=d_model,
+        candidate_slots=24,
+        top_k=8,
+        threads=64,
+    )
+    hybrid_out = hybrid(x, candidate_ids, w_up, w_gate, w_down, wd_norm)
+    mx.eval(candidate_ids, hybrid_out)
+    assert np.allclose(np.array(eager_out), np.array(hybrid_out), atol=1e-4)
 
 
 def test_recursive_exact_matches_manual_loop_with_fixed_route() -> None:
