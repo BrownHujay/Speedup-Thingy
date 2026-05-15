@@ -92,6 +92,52 @@ uv run --with mlx rte benchmark-mlx-svd-sparse-ffn
 | `mask` | Exact oracle-style dedup path. | Best for equivalence and quality checks. It still creates a full `[tokens, d_ff]` mask and is not the desired hot path. |
 | `slots` | Fixed-slot no-full-mask path. | Uses `topM(up) ∪ topM(gate) ∪ topM(product)` candidate slots and suppresses duplicate slots cheaply. This is closer to the CUDA kernel shape. |
 
+### Cluster-Shared Candidate Pool Oracle
+
+The per-token sparse FFN path is now treated as a correctness/quality oracle,
+not the production kernel shape. On T4 it lost badly because every token gets a
+different sparse row set, which turns the FFN into `topk + gather + tiny
+irregular reductions` while dense FFN remains a few Tensor-Core GEMMs.
+
+The new no-training diagnostic is:
+
+```bash
+uv run rte deferred-neuron-cluster-pool-oracle \
+  --config configs/proof_filter_depth4_dense.yaml \
+  --dense-checkpoint runs/proof_d4_dense/checkpoint.pt \
+  --clusters 8 16 32 64 \
+  --candidate-m 128 192 256 \
+  --ranks 64
+```
+
+Current implementation is a PyTorch oracle in `cli.py`:
+
+```text
+SVD selector features q_up/q_gate
+→ cosine k-means token clusters
+→ aggregate factor scores per cluster
+→ one shared candidate pool per cluster
+→ X_cluster @ W_up[:, pool]
+→ X_cluster @ W_gate[:, pool]
+→ SwiGLU
+→ activation @ W_down[pool, :]
+```
+
+This executes all `M` candidates for a cluster and intentionally skips
+per-token final `k`. That is the point: the hot shape becomes a small set of
+cluster GEMMs instead of token-specific sparse gathers. The oracle reports NLL,
+KL, hidden cosine, cluster imbalance, candidate recall against reference
+top-`k`, and the ideal FFN FLOP ratio `M / d_ff`.
+
+CUDA/Triton kernel target:
+
+| Kernel | Role | Shape |
+| --- | --- | --- |
+| `k_cluster_assign` | Assign tokens to a small number of clusters from SVD selector features. | One block per token or tiled GEMM/argmax over cluster centers. |
+| `k_cluster_score_reduce` | Aggregate up/gate/product scores into one pool score per cluster/neuron. | Reduction over tokens grouped by cluster; can be approximate/top-heavy. |
+| `k_cluster_pool_gemm` | Execute `X_cluster @ W_up_pool`, `X_cluster @ W_gate_pool`, and `Z @ W_down_pool`. | Grouped GEMM over clusters, the GPU-friendly replacement for per-token row gather. |
+| `k_cluster_scatter` | Write clustered FFN outputs back to original token order. | Lightweight permutation/scatter; should be small relative to GEMMs. |
+
 ## CUDA/Triton Kernels
 
 The first CUDA implementation lives in

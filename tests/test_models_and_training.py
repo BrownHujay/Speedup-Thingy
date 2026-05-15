@@ -7,6 +7,10 @@ import pytest
 import torch
 
 from recursive_training_engine.config import load_config
+from recursive_training_engine.cli import (
+    _build_svd_factor_cache,
+    _ffn_neuron_svd_cluster_pool_output,
+)
 from recursive_training_engine.layers import DenseSwiGLU, SVDFactorSparseFFN
 from recursive_training_engine.models import DenseModel, RecursiveModel
 from recursive_training_engine.output import ShortlistHead
@@ -59,6 +63,36 @@ def test_svd_factor_sparse_ffn_recovers_dense_when_all_neurons_active() -> None:
     sparse_out, aux = sparse(x, return_aux=True)
     assert torch.allclose(sparse_out, dense_out, atol=1e-5)
     assert aux["selected_ids"].shape == (x.shape[0] * x.shape[1], cfg.model.d_ff)
+
+
+def test_svd_cluster_pool_recovers_dense_ffn_when_pool_is_full() -> None:
+    cfg = tiny_config("dense_exact")
+    set_seed(123)
+    dense = DenseModel(cfg.model)
+    factors = _build_svd_factor_cache(
+        dense,
+        max_rank=min(cfg.model.d_model, cfg.model.d_ff),
+        device=torch.device("cpu"),
+    )
+    tokens, _ = sample_batch(cfg)
+    x = dense.embed(tokens)
+    block = dense.blocks[0]
+    u = x + block.attn(block.norm1(x))
+    normed = block.norm2(u)
+    clustered, aux = _ffn_neuron_svd_cluster_pool_output(
+        block,
+        normed,
+        factors[0],
+        rank=min(cfg.model.d_model, cfg.model.d_ff),
+        cluster_count=2,
+        candidate_m=cfg.model.d_ff,
+        reference_k=min(4, cfg.model.d_ff),
+        score_mode="sum",
+        aggregation="mean",
+        cluster_iters=2,
+    )
+    assert torch.allclose(clustered, block.mlp(normed), atol=1e-5)
+    assert aux["selection_count"] == tokens.numel()
 
 
 def test_mlx_svd_sparse_ffn_compiled_matches_eager_when_available() -> None:

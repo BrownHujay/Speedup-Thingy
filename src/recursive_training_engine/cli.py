@@ -2730,6 +2730,171 @@ def _build_svd_factor_cache(
     return factors
 
 
+def _cluster_assignments_from_features(
+    features: torch.Tensor,
+    *,
+    cluster_count: int,
+    iters: int,
+) -> torch.Tensor:
+    """Small cosine k-means used only by the cluster-pool oracle."""
+
+    token_count = features.shape[0]
+    cluster_count = min(max(1, int(cluster_count)), max(1, token_count))
+    if cluster_count == 1 or token_count == 1:
+        return torch.zeros(token_count, device=features.device, dtype=torch.long)
+    x = F.normalize(features.float(), dim=-1)
+    init_idx = torch.linspace(
+        0,
+        token_count - 1,
+        steps=cluster_count,
+        device=features.device,
+    ).round().long()
+    centers = x.index_select(0, init_idx).contiguous()
+    assignments = torch.zeros(token_count, device=features.device, dtype=torch.long)
+    for _ in range(max(1, int(iters))):
+        assignments = (x @ centers.t()).argmax(dim=-1)
+        new_centers = torch.zeros_like(centers)
+        counts = torch.bincount(assignments, minlength=cluster_count).to(new_centers.dtype)
+        new_centers.index_add_(0, assignments, x)
+        nonempty = counts > 0
+        new_centers[nonempty] = new_centers[nonempty] / counts[nonempty].unsqueeze(-1).clamp_min(1.0)
+        new_centers[~nonempty] = centers[~nonempty]
+        centers = F.normalize(new_centers, dim=-1)
+    return assignments
+
+
+def _aggregate_cluster_scores(
+    scores: torch.Tensor,
+    assignments: torch.Tensor,
+    *,
+    cluster_count: int,
+    aggregation: str,
+) -> torch.Tensor:
+    cluster_count = max(1, int(cluster_count))
+    if aggregation == "mean":
+        agg = scores.new_zeros(cluster_count, scores.shape[-1])
+        agg.index_add_(0, assignments, scores)
+        counts = torch.bincount(assignments, minlength=cluster_count).to(scores.dtype).clamp_min(1.0)
+        return agg / counts.unsqueeze(-1)
+    if aggregation == "max":
+        rows = []
+        for cluster_idx in range(cluster_count):
+            mask = assignments == cluster_idx
+            if bool(mask.any()):
+                rows.append(scores[mask].amax(dim=0))
+            else:
+                rows.append(scores.new_zeros(scores.shape[-1]))
+        return torch.stack(rows, dim=0)
+    raise ValueError(f"unsupported cluster score aggregation: {aggregation}")
+
+
+@torch.no_grad()
+def _ffn_neuron_svd_cluster_pool_output(
+    block: torch.nn.Module,
+    normed: torch.Tensor,
+    factors: dict[str, torch.Tensor],
+    *,
+    rank: int,
+    cluster_count: int,
+    candidate_m: int,
+    reference_k: int,
+    score_mode: str,
+    aggregation: str,
+    cluster_iters: int,
+    profile: bool = False,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    original_shape = normed.shape[:-1]
+    flat = normed.reshape(-1, normed.shape[-1])
+    hidden = block.mlp.wd.in_features
+    rank = min(max(1, int(rank)), factors["up_a"].shape[1], factors["gate_a"].shape[1])
+    candidate_m = min(max(1, int(candidate_m)), hidden)
+    reference_k = min(max(1, int(reference_k)), hidden)
+    cluster_count = min(max(1, int(cluster_count)), flat.shape[0])
+
+    start = time.perf_counter()
+    q_up = flat @ factors["up_a"][:, :rank]
+    q_gate = flat @ factors["gate_a"][:, :rank]
+    up_hat = q_up @ factors["up_b"][:rank, :]
+    gate_hat = q_gate @ factors["gate_b"][:rank, :]
+    gate_hat_act = F.silu(gate_hat)
+    wd_rows = block.mlp.wd.weight.t().contiguous()
+    wd_norm = block.mlp.wd.weight.detach().norm(dim=0).to(device=flat.device, dtype=flat.dtype)
+    up_scores = up_hat.detach().abs() * wd_norm
+    gate_scores = gate_hat_act.detach().abs() * wd_norm
+    product_scores = (up_hat * gate_hat_act).detach().abs() * wd_norm
+    if score_mode == "sum":
+        pool_scores = up_scores + gate_scores + product_scores
+    elif score_mode == "upgate":
+        pool_scores = up_scores + gate_scores
+    elif score_mode == "product":
+        pool_scores = product_scores
+    else:
+        raise ValueError(f"unsupported cluster pool score mode: {score_mode}")
+
+    features = torch.cat([q_up, q_gate], dim=-1)
+    assignments = _cluster_assignments_from_features(
+        features,
+        cluster_count=cluster_count,
+        iters=cluster_iters,
+    )
+    actual_cluster_count = int(assignments.max().detach().cpu()) + 1 if assignments.numel() else 1
+    cluster_count = max(cluster_count, actual_cluster_count)
+    aggregate_scores = _aggregate_cluster_scores(
+        pool_scores.float(),
+        assignments,
+        cluster_count=cluster_count,
+        aggregation=aggregation,
+    )
+    candidate_ids = torch.topk(
+        aggregate_scores,
+        k=min(candidate_m, aggregate_scores.shape[-1]),
+        dim=-1,
+    ).indices
+
+    out = flat.new_zeros(flat.shape[0], flat.shape[-1])
+    up_weight, gate_weight = block.mlp.wug.weight.detach().chunk(2, dim=0)
+    cluster_sizes = torch.bincount(assignments, minlength=cluster_count)
+    for cluster_idx in range(cluster_count):
+        token_idx = torch.nonzero(assignments == cluster_idx, as_tuple=False).flatten()
+        if token_idx.numel() == 0:
+            continue
+        ids = candidate_ids[cluster_idx]
+        x_cluster = flat.index_select(0, token_idx)
+        up = x_cluster @ up_weight.index_select(0, ids).t().contiguous()
+        gate = x_cluster @ gate_weight.index_select(0, ids).t().contiguous()
+        z = up * F.silu(gate)
+        out.index_copy_(0, token_idx, z @ wd_rows.index_select(0, ids).contiguous())
+
+    up, gate = block.mlp.wug(normed).chunk(2, dim=-1)
+    exact_scores = (up * F.silu(gate)).reshape(flat.shape[0], hidden).detach().abs() * wd_norm
+    true_ids = torch.topk(exact_scores, k=reference_k, dim=-1).indices
+    token_candidates = candidate_ids.index_select(0, assignments)
+    candidate_hits = true_ids.unsqueeze(-1).eq(token_candidates.unsqueeze(1)).any(dim=-1)
+    candidate_recall = candidate_hits.float().sum(dim=-1) / max(reference_k, 1)
+    candidate_scores = torch.gather(exact_scores, dim=-1, index=token_candidates).sum(dim=-1)
+    true_scores = torch.gather(exact_scores, dim=-1, index=true_ids).sum(dim=-1).clamp_min(1e-12)
+    nonempty = cluster_sizes[cluster_sizes > 0].float()
+    elapsed = time.perf_counter() - start
+    return out.view(*original_shape, -1), {
+        "candidate_size_sum": float(candidate_m * flat.shape[0]),
+        "candidate_recall_sum": float(candidate_recall.sum().detach().cpu()),
+        "score_retention_sum": float((candidate_scores / true_scores).sum().detach().cpu()),
+        "selection_count": int(flat.shape[0]),
+        "cluster_count_sum": float(cluster_count),
+        "nonempty_cluster_count_sum": float(nonempty.numel()),
+        "empty_cluster_count_sum": float(cluster_count - nonempty.numel()),
+        "max_cluster_size_sum": float(nonempty.max().detach().cpu()) if nonempty.numel() else 0.0,
+        "min_cluster_size_sum": float(nonempty.min().detach().cpu()) if nonempty.numel() else 0.0,
+        "mean_cluster_size_sum": float(nonempty.mean().detach().cpu()) if nonempty.numel() else 0.0,
+        "cluster_imbalance_sum": float((nonempty.max() / nonempty.mean().clamp_min(1.0)).detach().cpu())
+        if nonempty.numel()
+        else 0.0,
+        "cluster_metric_count": 1.0,
+        "cluster_pool_ffn_flop_ratio_sum": float(candidate_m / hidden),
+        "cluster_pool_exec_seconds": elapsed if profile else 0.0,
+    }
+
+
 @torch.no_grad()
 def _ffn_neuron_svd_factor_union_output(
     block: torch.nn.Module,
@@ -3883,6 +4048,60 @@ def _svd_factor_union_full_stack_logits(
     return hidden @ dense.vocab_weight.t(), hidden, aux
 
 
+@torch.no_grad()
+def _svd_cluster_pool_full_stack_logits(
+    dense: DenseModel,
+    svd_factors: list[dict[str, torch.Tensor]],
+    tokens: torch.Tensor,
+    *,
+    rank: int,
+    cluster_count: int,
+    candidate_m: int,
+    reference_k: int,
+    score_mode: str,
+    aggregation: str,
+    cluster_iters: int,
+    profile: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    x = dense.embed(tokens)
+    aux = {
+        "candidate_size_sum": 0.0,
+        "candidate_recall_sum": 0.0,
+        "score_retention_sum": 0.0,
+        "selection_count": 0.0,
+        "cluster_count_sum": 0.0,
+        "nonempty_cluster_count_sum": 0.0,
+        "empty_cluster_count_sum": 0.0,
+        "max_cluster_size_sum": 0.0,
+        "min_cluster_size_sum": 0.0,
+        "mean_cluster_size_sum": 0.0,
+        "cluster_imbalance_sum": 0.0,
+        "cluster_metric_count": 0.0,
+        "cluster_pool_ffn_flop_ratio_sum": 0.0,
+        "cluster_pool_exec_seconds": 0.0,
+    }
+    for layer_idx, block in enumerate(dense.blocks):
+        u = x + block.attn(block.norm1(x))
+        ffn, layer_aux = _ffn_neuron_svd_cluster_pool_output(
+            block,
+            block.norm2(u),
+            svd_factors[layer_idx],
+            rank=rank,
+            cluster_count=cluster_count,
+            candidate_m=candidate_m,
+            reference_k=reference_k,
+            score_mode=score_mode,
+            aggregation=aggregation,
+            cluster_iters=cluster_iters,
+            profile=profile,
+        )
+        for key in aux:
+            aux[key] += float(layer_aux.get(key, 0.0))
+        x = u + ffn
+    hidden = dense.final_norm(x)
+    return hidden @ dense.vocab_weight.t(), hidden, aux
+
+
 def _build_svd_sparse_ffns(
     dense: DenseModel,
     *,
@@ -4340,6 +4559,228 @@ def cmd_deferred_neuron_svd_factor_union_oracle(args: argparse.Namespace) -> Non
         "rerankers": rerankers,
         "temperature": args.temperature,
         "attention": "dense",
+        "rows": rows,
+    }
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+    _print_json(report)
+
+
+def _init_cluster_pool_bucket(
+    name: str,
+    *,
+    variant_type: str,
+    rank: int | None = None,
+    cluster_count: int | None = None,
+    candidate_m: int | None = None,
+    reference_k: int | None = None,
+    score_mode: str | None = None,
+    aggregation: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "variant": name,
+        "variant_type": variant_type,
+        "rank": rank,
+        "cluster_count": cluster_count,
+        "candidate_m": candidate_m,
+        "reference_k": reference_k,
+        "score_mode": score_mode,
+        "aggregation": aggregation,
+        "tokens": 0,
+        "samples": 0,
+        "loss_sum": 0.0,
+        "kl_sum": 0.0,
+        "final_hidden_cosine_sum": 0.0,
+        "candidate_size_sum": 0.0,
+        "candidate_recall_sum": 0.0,
+        "score_retention_sum": 0.0,
+        "selection_count": 0.0,
+        "cluster_count_sum": 0.0,
+        "nonempty_cluster_count_sum": 0.0,
+        "empty_cluster_count_sum": 0.0,
+        "max_cluster_size_sum": 0.0,
+        "min_cluster_size_sum": 0.0,
+        "mean_cluster_size_sum": 0.0,
+        "cluster_imbalance_sum": 0.0,
+        "cluster_metric_count": 0.0,
+        "cluster_pool_ffn_flop_ratio_sum": 0.0,
+        "cluster_pool_exec_seconds": 0.0,
+    }
+
+
+def _finish_cluster_pool_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
+    tokens = max(int(bucket["tokens"]), 1)
+    samples = max(int(bucket["samples"]), 1)
+    row: dict[str, Any] = {
+        "variant": bucket["variant"],
+        "variant_type": bucket["variant_type"],
+        "nll_per_token": bucket["loss_sum"] / tokens,
+        "kl_to_dense": bucket["kl_sum"] / tokens,
+        "final_hidden_cosine": bucket["final_hidden_cosine_sum"] / samples,
+    }
+    for key in ("rank", "cluster_count", "candidate_m", "reference_k", "score_mode", "aggregation"):
+        if bucket.get(key) is not None:
+            row[key] = bucket[key]
+    selection_count = max(float(bucket.get("selection_count", 0.0)), 1.0)
+    if bucket.get("selection_count", 0.0):
+        row["avg_candidate_size"] = bucket["candidate_size_sum"] / selection_count
+        row["candidate_recall"] = bucket["candidate_recall_sum"] / selection_count
+        row["score_retention_vs_reference_topk"] = bucket["score_retention_sum"] / selection_count
+    metric_count = max(float(bucket.get("cluster_metric_count", 0.0)), 1.0)
+    if bucket.get("cluster_metric_count", 0.0):
+        row["avg_nonempty_clusters"] = bucket["nonempty_cluster_count_sum"] / metric_count
+        row["avg_empty_clusters"] = bucket["empty_cluster_count_sum"] / metric_count
+        row["avg_max_cluster_size"] = bucket["max_cluster_size_sum"] / metric_count
+        row["avg_min_cluster_size"] = bucket["min_cluster_size_sum"] / metric_count
+        row["avg_mean_cluster_size"] = bucket["mean_cluster_size_sum"] / metric_count
+        row["avg_cluster_imbalance"] = bucket["cluster_imbalance_sum"] / metric_count
+        row["estimated_cluster_ffn_flop_ratio"] = bucket["cluster_pool_ffn_flop_ratio_sum"] / metric_count
+    if bucket.get("cluster_pool_exec_seconds", 0.0):
+        row["cluster_pool_exec_seconds"] = bucket["cluster_pool_exec_seconds"]
+        row["cluster_pool_tokens_per_second"] = tokens / bucket["cluster_pool_exec_seconds"]
+    return row
+
+
+def cmd_deferred_neuron_cluster_pool_oracle(args: argparse.Namespace) -> None:
+    config = _model_for_mode(load_config(args.config), "dense_exact")
+    if args.batch_size is not None:
+        config = dataclasses.replace(
+            config,
+            training=dataclasses.replace(config.training, batch_size=args.batch_size),
+        )
+    ranks = [int(rank) for rank in (args.ranks or [64])]
+    cluster_counts = [int(value) for value in (args.clusters or [8, 16, 32, 64])]
+    candidate_ms = [int(value) for value in (args.candidate_m or [128, 192, 256])]
+    score_modes = list(args.score_modes or ["sum"])
+    aggregations = list(args.aggregations or ["mean"])
+    tokens_per_batch = config.training.batch_size * config.training.seq_len
+    eval_batches = args.eval_batches
+    if eval_batches is None:
+        eval_batches = max(1, math.ceil(config.data.eval_tokens / tokens_per_batch))
+    set_seed(args.seed if args.seed is not None else config.training.seed)
+    device = default_device()
+    streams = load_token_streams(config.data, config.training, config.model.vocab_size)
+    dense = _load_dense_model(config, args.dense_checkpoint, device)
+    dense.eval()
+    svd_factors = _build_svd_factor_cache(
+        dense,
+        max_rank=max(ranks),
+        device=device,
+    )
+    buckets: dict[str, dict[str, Any]] = {
+        "dense": _init_cluster_pool_bucket("dense", variant_type="dense")
+    }
+    variants: list[tuple[str, int, int, int, str, str]] = []
+    for rank in ranks:
+        for cluster_count in cluster_counts:
+            for candidate_m in candidate_ms:
+                for score_mode in score_modes:
+                    for aggregation in aggregations:
+                        name = (
+                            f"cluster_svd_rank{rank}_c{cluster_count}_m{candidate_m}_"
+                            f"{score_mode}_{aggregation}"
+                        )
+                        variants.append((name, rank, cluster_count, candidate_m, score_mode, aggregation))
+                        buckets[name] = _init_cluster_pool_bucket(
+                            name,
+                            variant_type="svd_cluster_pool",
+                            rank=rank,
+                            cluster_count=cluster_count,
+                            candidate_m=candidate_m,
+                            reference_k=args.reference_k,
+                            score_mode=score_mode,
+                            aggregation=aggregation,
+                        )
+    batches = streams.eval_batches(config.training)
+    for batch_idx in range(eval_batches):
+        tokens, targets = next(batches)
+        tokens = tokens.to(device)
+        targets = targets.to(device)
+        dense_out = dense(tokens, targets, return_loss_per_sample=True)
+        assert dense_out.logits is not None
+        assert dense_out.loss_per_sample is not None
+        assert dense_out.meta.hidden is not None
+        dense_logits = dense_out.logits
+        dense_hidden = dense_out.meta.hidden
+        dense_logp = F.log_softmax(dense_logits.detach() / args.temperature, dim=-1)
+        target_flat = targets.flatten()
+        token_count = int(targets.numel())
+        sample_count = int(targets.shape[0])
+        dense_bucket = buckets["dense"]
+        dense_bucket["tokens"] += token_count
+        dense_bucket["samples"] += sample_count
+        dense_bucket["loss_sum"] += float(dense_out.loss_per_sample.sum().detach().cpu())
+        dense_bucket["final_hidden_cosine_sum"] += float(sample_count)
+        for name, rank, cluster_count, candidate_m, score_mode, aggregation in variants:
+            logits, hidden, aux = _svd_cluster_pool_full_stack_logits(
+                dense,
+                svd_factors,
+                tokens,
+                rank=rank,
+                cluster_count=cluster_count,
+                candidate_m=candidate_m,
+                reference_k=args.reference_k,
+                score_mode=score_mode,
+                aggregation=aggregation,
+                cluster_iters=args.cluster_iters,
+                profile=args.profile,
+            )
+            bucket = buckets[name]
+            loss = F.cross_entropy(logits.flatten(0, -2), target_flat, reduction="sum")
+            cand_logp = F.log_softmax(logits / args.temperature, dim=-1)
+            kl = (dense_logp.exp() * (dense_logp - cand_logp)).sum(dim=-1).sum() * (
+                args.temperature * args.temperature
+            )
+            final_cos = F.cosine_similarity(
+                hidden.float().flatten(1),
+                dense_hidden.float().flatten(1),
+                dim=-1,
+            ).sum()
+            bucket["tokens"] += token_count
+            bucket["samples"] += sample_count
+            bucket["loss_sum"] += float(loss.detach().cpu())
+            bucket["kl_sum"] += float(kl.detach().cpu())
+            bucket["final_hidden_cosine_sum"] += float(final_cos.detach().cpu())
+            for key in (
+                "candidate_size_sum",
+                "candidate_recall_sum",
+                "score_retention_sum",
+                "selection_count",
+                "cluster_count_sum",
+                "nonempty_cluster_count_sum",
+                "empty_cluster_count_sum",
+                "max_cluster_size_sum",
+                "min_cluster_size_sum",
+                "mean_cluster_size_sum",
+                "cluster_imbalance_sum",
+                "cluster_metric_count",
+                "cluster_pool_ffn_flop_ratio_sum",
+                "cluster_pool_exec_seconds",
+            ):
+                bucket[key] += float(aux.get(key, 0.0))
+        if device.type == "mps":
+            torch.mps.empty_cache()
+        if args.progress and (batch_idx + 1) % args.progress == 0:
+            print(json.dumps({"event": "cluster_pool_eval_batch", "batch": batch_idx + 1}))
+    rows = [_finish_cluster_pool_bucket(bucket) for bucket in buckets.values()]
+    report = {
+        "mode": "deferred_neuron_cluster_pool_oracle",
+        "checkpoint": args.dense_checkpoint,
+        "eval_batches": eval_batches,
+        "eval_tokens": eval_batches * tokens_per_batch,
+        "requested_eval_tokens": config.data.eval_tokens,
+        "ranks": ranks,
+        "clusters": cluster_counts,
+        "candidate_m": candidate_ms,
+        "reference_k": args.reference_k,
+        "score_modes": score_modes,
+        "aggregations": aggregations,
+        "cluster_iters": args.cluster_iters,
+        "temperature": args.temperature,
+        "attention": "dense",
+        "notes": "cluster pool executes all M candidates per cluster; no per-token final top-k",
         "rows": rows,
     }
     if args.output:
@@ -6765,6 +7206,35 @@ def build_parser() -> argparse.ArgumentParser:
     svd_factor.add_argument("--progress", type=int, default=0)
     svd_factor.add_argument("--output")
     svd_factor.set_defaults(func=cmd_deferred_neuron_svd_factor_union_oracle)
+
+    cluster_pool = sub.add_parser("deferred-neuron-cluster-pool-oracle")
+    cluster_pool.add_argument("--config", required=True)
+    cluster_pool.add_argument("--dense-checkpoint", required=True)
+    cluster_pool.add_argument("--eval-batches", type=int)
+    cluster_pool.add_argument("--batch-size", type=int)
+    cluster_pool.add_argument("--ranks", type=int, nargs="+", default=[64])
+    cluster_pool.add_argument("--clusters", type=int, nargs="+", default=[8, 16, 32, 64])
+    cluster_pool.add_argument("--candidate-m", type=int, nargs="+", default=[128, 192, 256])
+    cluster_pool.add_argument("--reference-k", type=int, default=64)
+    cluster_pool.add_argument(
+        "--score-modes",
+        nargs="+",
+        choices=["sum", "upgate", "product"],
+        default=["sum"],
+    )
+    cluster_pool.add_argument(
+        "--aggregations",
+        nargs="+",
+        choices=["mean", "max"],
+        default=["mean"],
+    )
+    cluster_pool.add_argument("--cluster-iters", type=int, default=8)
+    cluster_pool.add_argument("--profile", action="store_true")
+    cluster_pool.add_argument("--temperature", type=float, default=2.0)
+    cluster_pool.add_argument("--seed", type=int)
+    cluster_pool.add_argument("--progress", type=int, default=0)
+    cluster_pool.add_argument("--output")
+    cluster_pool.set_defaults(func=cmd_deferred_neuron_cluster_pool_oracle)
 
     svd_hot = sub.add_parser("deferred-neuron-svd-hot-eval")
     svd_hot.add_argument("--config", required=True)
