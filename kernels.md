@@ -143,6 +143,14 @@ Triton loops instead of tensor-core GEMM scheduling. The selector is a low-rank
 matrix multiply problem, so the fast path uses cuBLAS GEMMs and lets Triton do
 only the irregular sparse work that cuBLAS cannot express.
 
+The exact candidate activation path is also not the default benchmark path
+anymore. Recomputing exact `x·W_up_j` and `x·W_gate_j` for dynamic per-token
+candidate rows is too irregular and lost badly on T4. The fast path uses the
+SVD factor activations from the selector GEMMs as runtime activations
+(`triton_exact_activation=False`) and only applies the sparse down projection
+over selected neurons. Exact candidate activation remains available for
+correctness/reference checks via `triton_exact_activation=True`.
+
 ### CUDA/Triton Kernels To Build Later
 
 These are the next kernels after the initial Triton forward path.

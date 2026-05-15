@@ -96,6 +96,8 @@ class SVDFactorSparseFFN(nn.Module):
         gate_m: int | None = None,
         product_m: int = 0,
         candidate_mode: str = "mask",
+        triton_exact_activation: bool = False,
+        triton_candidate_strategy: str = "product",
         refresh_on_init: bool = True,
     ):
         super().__init__()
@@ -109,6 +111,10 @@ class SVDFactorSparseFFN(nn.Module):
         if candidate_mode not in {"mask", "slots", "triton"}:
             raise ValueError("candidate_mode must be 'mask', 'slots', or 'triton'")
         self.candidate_mode = candidate_mode
+        self.triton_exact_activation = bool(triton_exact_activation)
+        if triton_candidate_strategy not in {"union", "product"}:
+            raise ValueError("triton_candidate_strategy must be 'union' or 'product'")
+        self.triton_candidate_strategy = triton_candidate_strategy
         self.refresh_on_init = bool(refresh_on_init)
         self.w_up = nn.Parameter(torch.empty(self.d_ff, self.d_model))
         self.w_gate = nn.Parameter(torch.empty(self.d_ff, self.d_model))
@@ -143,6 +149,8 @@ class SVDFactorSparseFFN(nn.Module):
         gate_m: int | None = None,
         product_m: int = 0,
         candidate_mode: str = "mask",
+        triton_exact_activation: bool = False,
+        triton_candidate_strategy: str = "product",
     ) -> "SVDFactorSparseFFN":
         module = cls(
             mlp.wug.in_features,
@@ -153,6 +161,8 @@ class SVDFactorSparseFFN(nn.Module):
             gate_m=gate_m,
             product_m=product_m,
             candidate_mode=candidate_mode,
+            triton_exact_activation=triton_exact_activation,
+            triton_candidate_strategy=triton_candidate_strategy,
         ).to(device=mlp.wug.weight.device, dtype=mlp.wug.weight.dtype)
         with torch.no_grad():
             up, gate = mlp.wug.weight.detach().chunk(2, dim=0)
@@ -301,6 +311,8 @@ class SVDFactorSparseFFN(nn.Module):
                     up_m=self.up_m,
                     gate_m=self.gate_m,
                     product_m=self.product_m,
+                    exact_candidate_activation=self.triton_exact_activation,
+                    candidate_strategy=self.triton_candidate_strategy,
                 )
             mark("triton_sparse_ffn_time", t_start)
             out = out.view(*original_shape, self.d_model)
@@ -310,6 +322,8 @@ class SVDFactorSparseFFN(nn.Module):
                 "avg_candidate_size": float(self.up_m + self.gate_m + self.product_m),
                 "candidate_slots": float(self.up_m + self.gate_m + self.product_m),
                 "candidate_mode": self.candidate_mode,
+                "triton_exact_activation": self.triton_exact_activation,
+                "triton_candidate_strategy": self.triton_candidate_strategy,
             }
             aux.update(timings)
             return out, aux

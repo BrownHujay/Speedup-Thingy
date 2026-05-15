@@ -409,6 +409,48 @@ if triton is not None:
             live = live & (offsets_c != best_pos)
 
     @triton.jit
+    def _approx_candidate_select_kernel(
+        candidate_ids,
+        up_hat,
+        gate_hat,
+        wd_norm,
+        selected_ids,
+        selected_z,
+        D_FF: tl.constexpr,
+        CANDIDATES: tl.constexpr,
+        TOP_K: tl.constexpr,
+        CANDIDATE_BLOCK: tl.constexpr,
+    ):
+        token = tl.program_id(0)
+        offsets_c = tl.arange(0, CANDIDATE_BLOCK)
+        valid_c = offsets_c < CANDIDATES
+        ids = tl.load(candidate_ids + token * CANDIDATES + offsets_c, mask=valid_c, other=0)
+
+        duplicate = tl.zeros((CANDIDATE_BLOCK,), tl.int32)
+        for p in range(0, CANDIDATES):
+            prev = tl.load(candidate_ids + token * CANDIDATES + p)
+            duplicate += tl.where((p < offsets_c) & (prev == ids) & valid_c, 1, 0)
+
+        up = tl.load(up_hat + token * D_FF + ids, mask=valid_c, other=0.0).to(tl.float32)
+        gate = tl.load(gate_hat + token * D_FF + ids, mask=valid_c, other=0.0).to(tl.float32)
+        gate_act = gate / (1.0 + tl.exp(-gate))
+        z = up * gate_act
+        norm = tl.load(wd_norm + ids, mask=valid_c, other=0.0).to(tl.float32)
+        scores = tl.where(valid_c & (duplicate == 0), tl.abs(z) * norm, -float("inf"))
+
+        live = valid_c
+        for k in range(0, TOP_K):
+            masked = tl.where(live, scores, -float("inf"))
+            best_score = tl.max(masked, axis=0)
+            winner = masked == best_score
+            best_pos = tl.max(tl.where(winner, offsets_c, 0), axis=0)
+            best_id = tl.load(candidate_ids + token * CANDIDATES + best_pos)
+            best_z = tl.max(tl.where(winner, z, -float("inf")), axis=0)
+            tl.store(selected_ids + token * TOP_K + k, best_id)
+            tl.store(selected_z + token * TOP_K + k, best_z)
+            live = live & (offsets_c != best_pos)
+
+    @triton.jit
     def _downsum_kernel(
         selected_ids,
         selected_z,
@@ -454,6 +496,8 @@ def triton_svd_sparse_ffn_forward(
     block_d: int = 64,
     low_launch: bool = False,
     selector_backend: str = "gemm",
+    exact_candidate_activation: bool = True,
+    candidate_strategy: str = "union",
 ) -> torch.Tensor:
     """CUDA/Triton SVD sparse FFN forward.
 
@@ -470,6 +514,10 @@ def triton_svd_sparse_ffn_forward(
         raise ValueError("Triton SVD sparse FFN currently requires product_m == 0 or product_m == up_m")
     if x.ndim != 2:
         raise ValueError("Triton SVD sparse FFN expects flattened x with shape [tokens, d_model]")
+    if candidate_strategy not in {"union", "product"}:
+        raise ValueError("candidate_strategy must be 'union' or 'product'")
+    if candidate_strategy == "product" and (selector_backend != "gemm" or exact_candidate_activation):
+        raise ValueError("candidate_strategy='product' requires approximate GEMM selector mode")
     tensors = (x, w_up, w_gate, w_down, up_a, up_b, gate_a, gate_b, wd_norm)
     if any(not tensor.is_cuda for tensor in tensors):
         raise RuntimeError("Triton SVD sparse FFN requires all tensors on CUDA")
@@ -498,6 +546,10 @@ def triton_svd_sparse_ffn_forward(
     q_gate = x @ gate_a
 
     candidate_ids = torch.empty((n_tokens, candidate_slots), device=x.device, dtype=torch.int32)
+    selected_ids = None
+    selected_z = None
+    up_hat = None
+    gate_hat = None
     if selector_backend == "gemm":
         # The selector projections are intentionally big GEMMs. On NVIDIA this
         # is faster than hand-written rank loops over H because cuBLAS can use
@@ -506,13 +558,20 @@ def triton_svd_sparse_ffn_forward(
         up_hat = q_up @ up_b
         gate_hat = q_gate @ gate_b
         gate_act = torch.nn.functional.silu(gate_hat)
-        up_ids = torch.topk(up_hat.abs() * wd_norm, k=top_m, dim=-1).indices
-        gate_ids = torch.topk(gate_act.abs() * wd_norm, k=top_m, dim=-1).indices
-        pieces = [up_ids, gate_ids]
-        if views == 3:
-            product_ids = torch.topk((up_hat * gate_act).abs() * wd_norm, k=top_m, dim=-1).indices
-            pieces.append(product_ids)
-        candidate_ids.copy_(torch.cat(pieces, dim=-1).to(torch.int32))
+        if candidate_strategy == "product":
+            z_hat = up_hat * gate_act
+            product_scores = z_hat.abs() * wd_norm
+            selected_ids_long = torch.topk(product_scores, k=top_k, dim=-1).indices
+            selected_ids = selected_ids_long.to(torch.int32)
+            selected_z = torch.gather(z_hat, dim=-1, index=selected_ids_long).float()
+        else:
+            up_ids = torch.topk(up_hat.abs() * wd_norm, k=top_m, dim=-1).indices
+            gate_ids = torch.topk(gate_act.abs() * wd_norm, k=top_m, dim=-1).indices
+            pieces = [up_ids, gate_ids]
+            if views == 3:
+                product_ids = torch.topk((up_hat * gate_act).abs() * wd_norm, k=top_m, dim=-1).indices
+                pieces.append(product_ids)
+            candidate_ids.copy_(torch.cat(pieces, dim=-1).to(torch.int32))
     elif selector_backend == "triton" and low_launch:
         _selector_full_kernel[(n_tokens,)](
             q_up,
@@ -570,9 +629,28 @@ def triton_svd_sparse_ffn_forward(
     else:
         raise ValueError("selector_backend must be 'gemm' or 'triton'")
 
-    selected_ids = torch.empty((n_tokens, top_k), device=x.device, dtype=torch.int32)
-    selected_z = torch.empty((n_tokens, top_k), device=x.device, dtype=torch.float32)
-    if low_launch:
+    if selected_ids is None or selected_z is None:
+        selected_ids = torch.empty((n_tokens, top_k), device=x.device, dtype=torch.int32)
+        selected_z = torch.empty((n_tokens, top_k), device=x.device, dtype=torch.float32)
+
+    if candidate_strategy == "product":
+        pass
+    elif selector_backend == "gemm" and not exact_candidate_activation:
+        assert up_hat is not None and gate_hat is not None
+        _approx_candidate_select_kernel[(n_tokens,)](
+            candidate_ids,
+            up_hat,
+            gate_hat,
+            wd_norm,
+            selected_ids,
+            selected_z,
+            d_ff,
+            candidate_slots,
+            top_k,
+            candidate_block,
+            num_warps=8,
+        )
+    elif low_launch:
         _candidate_activation_select_kernel[(n_tokens,)](
             x,
             candidate_ids,
