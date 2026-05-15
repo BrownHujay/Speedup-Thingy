@@ -4,6 +4,10 @@ import pytest
 import torch
 
 from recursive_training_engine.kernels import optimized, reference
+from recursive_training_engine.kernels.cluster_pool_ffn import (
+    cluster_pool_ffn_forward_from_assignments,
+    prepare_cluster_pool_weights,
+)
 from recursive_training_engine.layers import SVDFactorSparseFFN
 
 
@@ -70,3 +74,31 @@ def test_triton_svd_sparse_ffn_mode_requires_cuda() -> None:
     )
     with pytest.raises(RuntimeError, match="CUDA|Triton"):
         sparse(torch.randn(2, 8))
+
+
+def test_cluster_pool_ffn_recovers_dense_when_pool_is_full_on_cpu() -> None:
+    tokens = 6
+    d_model = 8
+    d_ff = 12
+    x = torch.randn(tokens, d_model)
+    w_up = torch.randn(d_ff, d_model)
+    w_gate = torch.randn(d_ff, d_model)
+    w_down = torch.randn(d_ff, d_model)
+    candidate_ids = torch.arange(d_ff).repeat(2, 1)
+    assignments = torch.tensor([0, 1, 0, 1, 0, 1], dtype=torch.long)
+    wup_pool, wgate_pool, wdown_pool = prepare_cluster_pool_weights(
+        w_up,
+        w_gate,
+        w_down,
+        candidate_ids,
+    )
+    dense = ((x @ w_up.t()) * torch.nn.functional.silu(x @ w_gate.t())) @ w_down
+    clustered = cluster_pool_ffn_forward_from_assignments(
+        x,
+        assignments,
+        wup_pool,
+        wgate_pool,
+        wdown_pool,
+        max_tokens_per_cluster=3,
+    )
+    assert torch.allclose(clustered, dense, atol=1e-5)

@@ -18,6 +18,14 @@ from recursive_training_engine.config import ExperimentConfig, ModelConfig, load
 from recursive_training_engine.ablations import build_ablation_configs
 from recursive_training_engine.data import load_token_streams
 from recursive_training_engine.kernels import optimized, reference
+from recursive_training_engine.kernels.cluster_pool_ffn import (
+    balanced_synthetic_assignments,
+    cluster_pool_ffn_forward_from_assignments,
+    cluster_pool_ffn_forward_static,
+    prepare_cluster_pool_weights,
+    suggested_cluster_capacity,
+    synthetic_cluster_centers,
+)
 from recursive_training_engine.layers import SVDFactorSparseFFN
 from recursive_training_engine.macro import (
     apply_macro_rms_clamp,
@@ -5094,6 +5102,153 @@ def cmd_benchmark_svd_sparse_ffn(args: argparse.Namespace) -> None:
     _print_json(report)
 
 
+@torch.no_grad()
+def cmd_benchmark_cluster_pool_ffn(args: argparse.Namespace) -> None:
+    device = default_device()
+    rows: list[dict[str, Any]] = []
+    sizes = args.size or [(2048, 8192, 4096)]
+    for d_model, d_ff, tokens in sizes:
+        dtype = torch.float16 if device.type == "cuda" else torch.float32
+        scale = 1.0 / math.sqrt(d_model)
+        x = torch.randn(tokens, d_model, device=device, dtype=dtype)
+        w_up = torch.randn(d_ff, d_model, device=device, dtype=dtype) * scale
+        w_gate = torch.randn(d_ff, d_model, device=device, dtype=dtype) * scale
+        w_down = torch.randn(d_ff, d_model, device=device, dtype=dtype) * scale
+        rank = min(args.rank, d_model, d_ff)
+        up_a = torch.randn(d_model, rank, device=device, dtype=dtype) * scale
+        gate_a = torch.randn(d_model, rank, device=device, dtype=dtype) * scale
+
+        def dense_forward() -> torch.Tensor:
+            up = x @ w_up.t()
+            gate = x @ w_gate.t()
+            return (up * F.silu(gate)) @ w_down
+
+        for clusters in args.clusters:
+            clusters = min(int(clusters), tokens)
+            assignments = balanced_synthetic_assignments(tokens, clusters, device)
+            centers = synthetic_cluster_centers(x, up_a, gate_a, assignments, clusters)
+            max_capacity = args.max_tokens_per_cluster or suggested_cluster_capacity(
+                tokens,
+                clusters,
+                args.capacity_factor,
+            )
+            max_capacity = min(max_capacity, tokens)
+            for candidate_m in args.candidate_m:
+                candidate_m = min(int(candidate_m), d_ff)
+                candidate_ids = torch.randint(
+                    0,
+                    d_ff,
+                    (clusters, candidate_m),
+                    device=device,
+                    dtype=torch.long,
+                )
+                wup_pool, wgate_pool, wdown_pool = prepare_cluster_pool_weights(
+                    w_up,
+                    w_gate,
+                    w_down,
+                    candidate_ids,
+                )
+
+                def assignment_forward() -> torch.Tensor:
+                    return cluster_pool_ffn_forward_from_assignments(
+                        x,
+                        assignments,
+                        wup_pool,
+                        wgate_pool,
+                        wdown_pool,
+                        max_tokens_per_cluster=max_capacity,
+                        block_d=args.block_d,
+                    )
+
+                def routed_forward() -> torch.Tensor:
+                    return cluster_pool_ffn_forward_static(
+                        x,
+                        up_a,
+                        gate_a,
+                        centers,
+                        wup_pool,
+                        wgate_pool,
+                        wdown_pool,
+                        max_tokens_per_cluster=max_capacity,
+                        block_d=args.block_d,
+                    )
+
+                for _ in range(args.warmup):
+                    dense_forward()
+                    assignment_forward()
+                    routed_forward()
+                _sync_device(device)
+
+                def measure(fn) -> float:
+                    start = time.perf_counter()
+                    for _ in range(args.iters):
+                        fn()
+                    _sync_device(device)
+                    return (time.perf_counter() - start) / max(args.iters, 1)
+
+                dense_seconds = measure(dense_forward)
+                cluster_seconds = measure(assignment_forward)
+                routed_seconds = measure(routed_forward)
+                _, overflow = cluster_pool_ffn_forward_from_assignments(
+                    x,
+                    assignments,
+                    wup_pool,
+                    wgate_pool,
+                    wdown_pool,
+                    max_tokens_per_cluster=max_capacity,
+                    block_d=args.block_d,
+                    return_overflow=True,
+                )
+                _, routed_overflow = cluster_pool_ffn_forward_static(
+                    x,
+                    up_a,
+                    gate_a,
+                    centers,
+                    wup_pool,
+                    wgate_pool,
+                    wdown_pool,
+                    max_tokens_per_cluster=max_capacity,
+                    block_d=args.block_d,
+                    return_overflow=True,
+                )
+                _sync_device(device)
+                overflow_value = int(overflow.detach().cpu().item())
+                routed_overflow_value = int(routed_overflow.detach().cpu().item())
+                rows.append(
+                    {
+                        "d_model": d_model,
+                        "d_ff": d_ff,
+                        "tokens": tokens,
+                        "clusters": clusters,
+                        "candidate_m": candidate_m,
+                        "rank": rank,
+                        "max_tokens_per_cluster": max_capacity,
+                        "overflow": overflow_value,
+                        "routed_overflow": routed_overflow_value,
+                        "dense_ms": dense_seconds * 1000.0,
+                        "cluster_pool_ms": cluster_seconds * 1000.0,
+                        "cluster_pool_routed_ms": routed_seconds * 1000.0,
+                        "measured_speedup_cluster_pool": dense_seconds
+                        / max(cluster_seconds, 1e-12),
+                        "measured_speedup_routed": dense_seconds / max(routed_seconds, 1e-12),
+                        "ideal_ffn_flop_ratio": candidate_m / d_ff,
+                        "ideal_ffn_math_speedup": d_ff / max(candidate_m, 1),
+                    }
+                )
+    report = {
+        "mode": "benchmark_cluster_pool_ffn",
+        "device": str(device),
+        "iters": args.iters,
+        "warmup": args.warmup,
+        "rows": rows,
+    }
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+    _print_json(report)
+
+
 def cmd_benchmark_mlx_svd_sparse_ffn(args: argparse.Namespace) -> None:
     from recursive_training_engine.mlx_svd_ffn import benchmark_mlx_svd_sparse_ffn
 
@@ -7271,6 +7426,25 @@ def build_parser() -> argparse.ArgumentParser:
     svd_bench.add_argument("--profile", action="store_true")
     svd_bench.add_argument("--output")
     svd_bench.set_defaults(func=cmd_benchmark_svd_sparse_ffn)
+
+    cluster_pool_bench = sub.add_parser("benchmark-cluster-pool-ffn")
+    cluster_pool_bench.add_argument(
+        "--size",
+        type=_parse_ffn_bench_size,
+        action="append",
+        default=None,
+        help="Benchmark size as d_modelxd_ffxtokens, e.g. 2048x8192x4096.",
+    )
+    cluster_pool_bench.add_argument("--rank", type=int, default=64)
+    cluster_pool_bench.add_argument("--clusters", type=int, nargs="+", default=[8, 16, 32])
+    cluster_pool_bench.add_argument("--candidate-m", type=int, nargs="+", default=[96, 128, 192])
+    cluster_pool_bench.add_argument("--capacity-factor", type=float, default=1.25)
+    cluster_pool_bench.add_argument("--max-tokens-per-cluster", type=int)
+    cluster_pool_bench.add_argument("--block-d", type=int, default=64)
+    cluster_pool_bench.add_argument("--iters", type=int, default=10)
+    cluster_pool_bench.add_argument("--warmup", type=int, default=3)
+    cluster_pool_bench.add_argument("--output")
+    cluster_pool_bench.set_defaults(func=cmd_benchmark_cluster_pool_ffn)
 
     mlx_svd_bench = sub.add_parser("benchmark-mlx-svd-sparse-ffn")
     mlx_svd_bench.add_argument(

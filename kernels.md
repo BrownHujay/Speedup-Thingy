@@ -138,6 +138,54 @@ CUDA/Triton kernel target:
 | `k_cluster_pool_gemm` | Execute `X_cluster @ W_up_pool`, `X_cluster @ W_gate_pool`, and `Z @ W_down_pool`. | Grouped GEMM over clusters, the GPU-friendly replacement for per-token row gather. |
 | `k_cluster_scatter` | Write clustered FFN outputs back to original token order. | Lightweight permutation/scatter; should be small relative to GEMMs. |
 
+The production-shaped CUDA prototype now lives in
+`src/recursive_training_engine/kernels/cluster_pool_ffn.py` and can be
+benchmarked with:
+
+```bash
+uv run rte benchmark-cluster-pool-ffn \
+  --size 2048x8192x4096 \
+  --clusters 8 16 32 \
+  --candidate-m 96 128 192 \
+  --rank 64
+```
+
+This path uses static cluster centers/candidate pools and removes the Python
+per-cluster loop:
+
+```text
+cuBLAS q_up/q_gate route features
+→ fixed-center assignment
+→ Triton slot assignment
+→ Triton token pack
+→ cuBLAS batched GEMM for up/gate/down pooled FFN
+→ Triton gather back to token order
+```
+
+Implemented kernels:
+
+| Kernel | Role | Shape |
+| --- | --- | --- |
+| `_assign_slots_kernel` | Uses atomic per-cluster counters to give each token a padded slot. | Grid: `[tokens]`; no Python loop and no `one_hot/cumsum` packing. |
+| `_pack_x_kernel` | Copies token rows into `[clusters, max_tokens_per_cluster, d_model]`. | Grid: `[tokens, ceil(d_model / block_d)]`. |
+| `_gather_y_kernel` | Copies padded cluster outputs back to `[tokens, d_model]`. | Grid: `[tokens, ceil(d_model / block_d)]`. |
+
+The pooled FFN math deliberately uses cuBLAS `torch.bmm` rather than hand-written
+Triton matmul because this is the GEMM-shaped part we want NVIDIA libraries to
+run on Tensor Cores. The missing CUDA follow-up, if this still does not hit the
+target on a real GPU, is a single persistent kernel or CUDA Graph wrapper that
+combines slot assignment, pack, three grouped GEMMs, and gather with less launch
+overhead. The current code is the first non-notebook implementation of the
+right execution shape.
+
+Notebook benchmark variants:
+
+| Variant | Current behavior | What it measures |
+| --- | --- | --- |
+| `cluster_execute_prepacked_bmm` | Uses already packed `[clusters, max_tokens, d]` inputs and pooled weights, then runs three `torch.bmm` calls. | Lower bound for the cluster GEMM body once packing/routing are solved. This hit the desired 20-50x range in the Colab synthetic benchmark. |
+| `cluster_execute_pack_bmm_scatter` | Packs tokens with `one_hot/cumsum/scatter`, runs the same `bmm` body, then gathers outputs back. | Generic PyTorch dynamic packing overhead. This is much better than the Python loop but still far from the lower bound. |
+| `cluster_execute_preindexed_pack_bmm_gather` | Uses precomputed static pack indices and flat gather indices, then runs `index_select + bmm + index_select`. | Best PyTorch-side proxy for a custom pack/gather kernel. It separates the remaining pack/scatter cost from the GEMM body without using a Python loop. |
+
 ## CUDA/Triton Kernels
 
 The first CUDA implementation lives in
