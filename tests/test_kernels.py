@@ -5,8 +5,11 @@ import torch
 
 from recursive_training_engine.kernels import optimized, reference
 from recursive_training_engine.kernels.cluster_pool_ffn import (
+    build_static_pack_gather_indices,
     cluster_pool_ffn_forward_from_assignments,
+    cluster_pool_ffn_forward_preindexed,
     prepare_cluster_pool_weights,
+    scatter_cluster_pool_grads,
 )
 from recursive_training_engine.layers import SVDFactorSparseFFN
 
@@ -102,3 +105,44 @@ def test_cluster_pool_ffn_recovers_dense_when_pool_is_full_on_cpu() -> None:
         max_tokens_per_cluster=3,
     )
     assert torch.allclose(clustered, dense, atol=1e-5)
+
+
+def test_preindexed_cluster_pool_backward_matches_dense_full_pool() -> None:
+    tokens = 5
+    d_model = 4
+    d_ff = 7
+    x_dense = torch.randn(tokens, d_model, requires_grad=True)
+    w_up = torch.randn(d_ff, d_model, requires_grad=True)
+    w_gate = torch.randn(d_ff, d_model, requires_grad=True)
+    w_down = torch.randn(d_ff, d_model, requires_grad=True)
+    x_sparse = x_dense.detach().clone().requires_grad_()
+    candidate_ids = torch.arange(d_ff).view(1, d_ff)
+    assignments = torch.zeros(tokens, dtype=torch.long)
+    pack_index, flat_gather, _, _ = build_static_pack_gather_indices(assignments, cluster_count=1)
+    wup_pool = w_up.detach().t().unsqueeze(0).contiguous().requires_grad_()
+    wgate_pool = w_gate.detach().t().unsqueeze(0).contiguous().requires_grad_()
+    wdown_pool = w_down.detach().unsqueeze(0).contiguous().requires_grad_()
+    dense = ((x_dense @ w_up.t()) * torch.nn.functional.silu(x_dense @ w_gate.t())) @ w_down
+    sparse = cluster_pool_ffn_forward_preindexed(
+        x_sparse,
+        pack_index,
+        flat_gather,
+        wup_pool,
+        wgate_pool,
+        wdown_pool,
+    )
+    assert torch.allclose(sparse, dense, atol=1e-6)
+    dense.square().mean().backward()
+    sparse.square().mean().backward()
+    assert torch.allclose(x_sparse.grad, x_dense.grad, atol=1e-6)
+    assert wup_pool.grad is not None and wgate_pool.grad is not None and wdown_pool.grad is not None
+    grad_up, grad_gate, grad_down = scatter_cluster_pool_grads(
+        candidate_ids,
+        wup_pool.grad,
+        wgate_pool.grad,
+        wdown_pool.grad,
+        d_ff=d_ff,
+    )
+    assert torch.allclose(grad_up, w_up.grad, atol=1e-6)
+    assert torch.allclose(grad_gate, w_gate.grad, atol=1e-6)
+    assert torch.allclose(grad_down, w_down.grad, atol=1e-5)

@@ -20,13 +20,17 @@ from recursive_training_engine.data import load_token_streams
 from recursive_training_engine.kernels import optimized, reference
 from recursive_training_engine.kernels.cluster_pool_ffn import (
     balanced_synthetic_assignments,
+    build_static_pack_gather_indices,
     cluster_pool_ffn_forward_from_assignments,
+    cluster_pool_ffn_forward_preindexed,
     cluster_pool_ffn_forward_static,
     prepare_cluster_pool_weights,
+    route_to_static_centers,
+    scatter_cluster_pool_grads,
     suggested_cluster_capacity,
     synthetic_cluster_centers,
 )
-from recursive_training_engine.layers import SVDFactorSparseFFN
+from recursive_training_engine.layers import SVDFactorSparseFFN, StaticClusterPoolSwiGLU
 from recursive_training_engine.macro import (
     apply_macro_rms_clamp,
     macro_alignment_metrics,
@@ -2771,6 +2775,41 @@ def _cluster_assignments_from_features(
     return assignments
 
 
+def _fit_cluster_centers_from_features(
+    features: torch.Tensor,
+    *,
+    cluster_count: int,
+    iters: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit small cosine k-means centers for static cluster-pool codebooks."""
+
+    token_count = features.shape[0]
+    cluster_count = min(max(1, int(cluster_count)), max(1, token_count))
+    x = F.normalize(features.float(), dim=-1)
+    if cluster_count == 1 or token_count == 1:
+        assignments = torch.zeros(token_count, device=features.device, dtype=torch.long)
+        centers = F.normalize(x.mean(dim=0, keepdim=True), dim=-1)
+        return assignments, centers
+    init_idx = torch.linspace(
+        0,
+        token_count - 1,
+        steps=cluster_count,
+        device=features.device,
+    ).round().long()
+    centers = x.index_select(0, init_idx).contiguous()
+    assignments = torch.zeros(token_count, device=features.device, dtype=torch.long)
+    for _ in range(max(1, int(iters))):
+        assignments = (x @ centers.t()).argmax(dim=-1)
+        new_centers = torch.zeros_like(centers)
+        counts = torch.bincount(assignments, minlength=cluster_count).to(new_centers.dtype)
+        new_centers.index_add_(0, assignments, x)
+        nonempty = counts > 0
+        new_centers[nonempty] = new_centers[nonempty] / counts[nonempty].unsqueeze(-1).clamp_min(1.0)
+        new_centers[~nonempty] = centers[~nonempty]
+        centers = F.normalize(new_centers, dim=-1)
+    return assignments, centers
+
+
 def _aggregate_cluster_scores(
     scores: torch.Tensor,
     assignments: torch.Tensor,
@@ -2797,6 +2836,40 @@ def _aggregate_cluster_scores(
 
 
 @torch.no_grad()
+def _svd_cluster_features_and_scores(
+    block: torch.nn.Module,
+    normed: torch.Tensor,
+    factors: dict[str, torch.Tensor],
+    *,
+    rank: int,
+    score_mode: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    flat = normed.reshape(-1, normed.shape[-1])
+    hidden = block.mlp.wd.in_features
+    rank = min(max(1, int(rank)), factors["up_a"].shape[1], factors["gate_a"].shape[1])
+    q_up = flat @ factors["up_a"][:, :rank]
+    q_gate = flat @ factors["gate_a"][:, :rank]
+    up_hat = q_up @ factors["up_b"][:rank, :]
+    gate_hat = q_gate @ factors["gate_b"][:rank, :]
+    gate_hat_act = F.silu(gate_hat)
+    wd_norm = block.mlp.wd.weight.detach().norm(dim=0).to(device=flat.device, dtype=flat.dtype)
+    up_scores = up_hat.detach().abs() * wd_norm
+    gate_scores = gate_hat_act.detach().abs() * wd_norm
+    product_scores = (up_hat * gate_hat_act).detach().abs() * wd_norm
+    if score_mode == "sum":
+        pool_scores = up_scores + gate_scores + product_scores
+    elif score_mode == "upgate":
+        pool_scores = up_scores + gate_scores
+    elif score_mode == "product":
+        pool_scores = product_scores
+    else:
+        raise ValueError(f"unsupported cluster pool score mode: {score_mode}")
+    if pool_scores.shape[-1] != hidden:
+        raise RuntimeError("cluster score width does not match FFN hidden width")
+    return torch.cat([q_up, q_gate], dim=-1), pool_scores
+
+
+@torch.no_grad()
 def _ffn_neuron_svd_cluster_pool_output(
     block: torch.nn.Module,
     normed: torch.Tensor,
@@ -2820,26 +2893,16 @@ def _ffn_neuron_svd_cluster_pool_output(
     cluster_count = min(max(1, int(cluster_count)), flat.shape[0])
 
     start = time.perf_counter()
-    q_up = flat @ factors["up_a"][:, :rank]
-    q_gate = flat @ factors["gate_a"][:, :rank]
-    up_hat = q_up @ factors["up_b"][:rank, :]
-    gate_hat = q_gate @ factors["gate_b"][:rank, :]
-    gate_hat_act = F.silu(gate_hat)
+    features, pool_scores = _svd_cluster_features_and_scores(
+        block,
+        normed,
+        factors,
+        rank=rank,
+        score_mode=score_mode,
+    )
     wd_rows = block.mlp.wd.weight.t().contiguous()
     wd_norm = block.mlp.wd.weight.detach().norm(dim=0).to(device=flat.device, dtype=flat.dtype)
-    up_scores = up_hat.detach().abs() * wd_norm
-    gate_scores = gate_hat_act.detach().abs() * wd_norm
-    product_scores = (up_hat * gate_hat_act).detach().abs() * wd_norm
-    if score_mode == "sum":
-        pool_scores = up_scores + gate_scores + product_scores
-    elif score_mode == "upgate":
-        pool_scores = up_scores + gate_scores
-    elif score_mode == "product":
-        pool_scores = product_scores
-    else:
-        raise ValueError(f"unsupported cluster pool score mode: {score_mode}")
 
-    features = torch.cat([q_up, q_gate], dim=-1)
     assignments = _cluster_assignments_from_features(
         features,
         cluster_count=cluster_count,
@@ -4110,6 +4173,547 @@ def _svd_cluster_pool_full_stack_logits(
     return hidden @ dense.vocab_weight.t(), hidden, aux
 
 
+@torch.no_grad()
+def _build_static_svd_cluster_pool_codebook(
+    dense: DenseModel,
+    svd_factors: list[dict[str, torch.Tensor]],
+    batches,
+    *,
+    calibration_batches: int,
+    device: torch.device,
+    rank: int,
+    cluster_count: int,
+    candidate_m: int,
+    score_mode: str,
+    aggregation: str,
+    cluster_iters: int,
+) -> tuple[list[dict[str, torch.Tensor]], dict[str, float]]:
+    layer_features: list[list[torch.Tensor]] = [[] for _ in dense.blocks]
+    layer_scores: list[list[torch.Tensor]] = [[] for _ in dense.blocks]
+    tokens_seen = 0
+    for _ in range(calibration_batches):
+        tokens, _ = next(batches)
+        tokens = tokens.to(device)
+        x = dense.embed(tokens)
+        tokens_seen += int(tokens.numel())
+        for layer_idx, block in enumerate(dense.blocks):
+            u = x + block.attn(block.norm1(x))
+            normed = block.norm2(u)
+            features, scores = _svd_cluster_features_and_scores(
+                block,
+                normed,
+                svd_factors[layer_idx],
+                rank=rank,
+                score_mode=score_mode,
+            )
+            # Calibration is an offline/codebook build step. Keep its tensors
+            # on CPU in fp16 so large calibration windows do not sit in GPU/MPS
+            # memory while later layers are collected.
+            layer_features[layer_idx].append(features.detach().to("cpu", dtype=torch.float16))
+            layer_scores[layer_idx].append(scores.detach().to("cpu", dtype=torch.float16))
+            x = u + block.mlp(normed)
+        if device.type == "mps":
+            torch.mps.empty_cache()
+
+    codebook: list[dict[str, torch.Tensor]] = []
+    nonempty_sum = 0.0
+    imbalance_sum = 0.0
+    for layer_idx in range(len(dense.blocks)):
+        features = torch.cat(layer_features[layer_idx], dim=0).float()
+        scores = torch.cat(layer_scores[layer_idx], dim=0).float()
+        assignments, centers = _fit_cluster_centers_from_features(
+            features,
+            cluster_count=cluster_count,
+            iters=cluster_iters,
+        )
+        actual_cluster_count = min(max(1, int(cluster_count)), features.shape[0])
+        aggregate_scores = _aggregate_cluster_scores(
+            scores,
+            assignments,
+            cluster_count=actual_cluster_count,
+            aggregation=aggregation,
+        )
+        candidate_ids = torch.topk(
+            aggregate_scores,
+            k=min(candidate_m, aggregate_scores.shape[-1]),
+            dim=-1,
+        ).indices
+        cluster_sizes = torch.bincount(assignments, minlength=actual_cluster_count).float()
+        nonempty = cluster_sizes[cluster_sizes > 0]
+        nonempty_sum += float(nonempty.numel())
+        imbalance_sum += float((nonempty.max() / nonempty.mean().clamp_min(1.0)).item()) if nonempty.numel() else 0.0
+        codebook.append(
+            {
+                "centers": centers.to(device=device),
+                "candidate_ids": candidate_ids.to(device=device),
+            }
+        )
+    metric_count = max(1, len(dense.blocks))
+    return codebook, {
+        "calibration_tokens_seen": float(tokens_seen),
+        "calibration_avg_nonempty_clusters": nonempty_sum / metric_count,
+        "calibration_avg_cluster_imbalance": imbalance_sum / metric_count,
+    }
+
+
+@torch.no_grad()
+def _ffn_neuron_static_svd_cluster_pool_output(
+    block: torch.nn.Module,
+    normed: torch.Tensor,
+    factors: dict[str, torch.Tensor],
+    codebook: dict[str, torch.Tensor],
+    *,
+    rank: int,
+    reference_k: int,
+    profile: bool = False,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    original_shape = normed.shape[:-1]
+    flat = normed.reshape(-1, normed.shape[-1])
+    hidden = block.mlp.wd.in_features
+    reference_k = min(max(1, int(reference_k)), hidden)
+    centers = codebook["centers"].to(device=flat.device)
+    candidate_ids = codebook["candidate_ids"].to(device=flat.device)
+    cluster_count = candidate_ids.shape[0]
+    candidate_m = candidate_ids.shape[1]
+
+    start = time.perf_counter()
+    features, _ = _svd_cluster_features_and_scores(
+        block,
+        normed,
+        factors,
+        rank=rank,
+        score_mode="sum",
+    )
+    assignments = (F.normalize(features.float(), dim=-1) @ centers.float().t()).argmax(dim=-1)
+
+    out = flat.new_zeros(flat.shape[0], flat.shape[-1])
+    up_weight, gate_weight = block.mlp.wug.weight.detach().chunk(2, dim=0)
+    wd_rows = block.mlp.wd.weight.t().contiguous()
+    cluster_sizes = torch.bincount(assignments, minlength=cluster_count)
+    for cluster_idx in range(cluster_count):
+        token_idx = torch.nonzero(assignments == cluster_idx, as_tuple=False).flatten()
+        if token_idx.numel() == 0:
+            continue
+        ids = candidate_ids[cluster_idx]
+        x_cluster = flat.index_select(0, token_idx)
+        up = x_cluster @ up_weight.index_select(0, ids).t().contiguous()
+        gate = x_cluster @ gate_weight.index_select(0, ids).t().contiguous()
+        z = up * F.silu(gate)
+        out.index_copy_(0, token_idx, z @ wd_rows.index_select(0, ids).contiguous())
+
+    up, gate = block.mlp.wug(normed).chunk(2, dim=-1)
+    wd_norm = block.mlp.wd.weight.detach().norm(dim=0).to(device=flat.device, dtype=flat.dtype)
+    exact_scores = (up * F.silu(gate)).reshape(flat.shape[0], hidden).detach().abs() * wd_norm
+    true_ids = torch.topk(exact_scores, k=reference_k, dim=-1).indices
+    token_candidates = candidate_ids.index_select(0, assignments)
+    candidate_hits = true_ids.unsqueeze(-1).eq(token_candidates.unsqueeze(1)).any(dim=-1)
+    candidate_recall = candidate_hits.float().sum(dim=-1) / max(reference_k, 1)
+    candidate_scores = torch.gather(exact_scores, dim=-1, index=token_candidates).sum(dim=-1)
+    true_scores = torch.gather(exact_scores, dim=-1, index=true_ids).sum(dim=-1).clamp_min(1e-12)
+    nonempty = cluster_sizes[cluster_sizes > 0].float()
+    elapsed = time.perf_counter() - start
+    return out.view(*original_shape, -1), {
+        "candidate_size_sum": float(candidate_m * flat.shape[0]),
+        "candidate_recall_sum": float(candidate_recall.sum().detach().cpu()),
+        "score_retention_sum": float((candidate_scores / true_scores).sum().detach().cpu()),
+        "selection_count": int(flat.shape[0]),
+        "cluster_count_sum": float(cluster_count),
+        "nonempty_cluster_count_sum": float(nonempty.numel()),
+        "empty_cluster_count_sum": float(cluster_count - nonempty.numel()),
+        "max_cluster_size_sum": float(nonempty.max().detach().cpu()) if nonempty.numel() else 0.0,
+        "min_cluster_size_sum": float(nonempty.min().detach().cpu()) if nonempty.numel() else 0.0,
+        "mean_cluster_size_sum": float(nonempty.mean().detach().cpu()) if nonempty.numel() else 0.0,
+        "cluster_imbalance_sum": float((nonempty.max() / nonempty.mean().clamp_min(1.0)).detach().cpu())
+        if nonempty.numel()
+        else 0.0,
+        "cluster_metric_count": 1.0,
+        "cluster_pool_ffn_flop_ratio_sum": float(candidate_m / hidden),
+        "cluster_pool_exec_seconds": elapsed if profile else 0.0,
+    }
+
+
+@torch.no_grad()
+def _svd_static_cluster_pool_full_stack_logits(
+    dense: DenseModel,
+    svd_factors: list[dict[str, torch.Tensor]],
+    codebook: list[dict[str, torch.Tensor]],
+    tokens: torch.Tensor,
+    *,
+    rank: int,
+    reference_k: int,
+    profile: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    x = dense.embed(tokens)
+    aux = {
+        "candidate_size_sum": 0.0,
+        "candidate_recall_sum": 0.0,
+        "score_retention_sum": 0.0,
+        "selection_count": 0.0,
+        "cluster_count_sum": 0.0,
+        "nonempty_cluster_count_sum": 0.0,
+        "empty_cluster_count_sum": 0.0,
+        "max_cluster_size_sum": 0.0,
+        "min_cluster_size_sum": 0.0,
+        "mean_cluster_size_sum": 0.0,
+        "cluster_imbalance_sum": 0.0,
+        "cluster_metric_count": 0.0,
+        "cluster_pool_ffn_flop_ratio_sum": 0.0,
+        "cluster_pool_exec_seconds": 0.0,
+    }
+    for layer_idx, block in enumerate(dense.blocks):
+        u = x + block.attn(block.norm1(x))
+        ffn, layer_aux = _ffn_neuron_static_svd_cluster_pool_output(
+            block,
+            block.norm2(u),
+            svd_factors[layer_idx],
+            codebook[layer_idx],
+            rank=rank,
+            reference_k=reference_k,
+            profile=profile,
+        )
+        for key in aux:
+            aux[key] += float(layer_aux.get(key, 0.0))
+        x = u + ffn
+    hidden = dense.final_norm(x)
+    return hidden @ dense.vocab_weight.t(), hidden, aux
+
+
+def _iter_static_cluster_pool_mlps(model: DenseModel):
+    for block in model.blocks:
+        if isinstance(block.mlp, StaticClusterPoolSwiGLU):
+            yield block.mlp
+
+
+def _set_static_cluster_pool_sparse_enabled(model: DenseModel, enabled: bool) -> None:
+    for mlp in _iter_static_cluster_pool_mlps(model):
+        mlp.sparse_enabled = bool(enabled)
+
+
+def _install_static_cluster_pool_ffns(
+    model: DenseModel,
+    svd_factors: list[dict[str, torch.Tensor]],
+    codebook: list[dict[str, torch.Tensor]],
+    *,
+    rank: int,
+) -> None:
+    for layer_idx, block in enumerate(model.blocks):
+        if isinstance(block.mlp, StaticClusterPoolSwiGLU):
+            block.mlp.update_codebook(svd_factors[layer_idx], codebook[layer_idx], rank=rank)
+            block.mlp.sparse_enabled = True
+            continue
+        device = block.mlp.wug.weight.device
+        dtype = block.mlp.wug.weight.dtype
+        block.mlp = StaticClusterPoolSwiGLU(
+            block.mlp,
+            svd_factors[layer_idx],
+            codebook[layer_idx],
+            rank=rank,
+            sparse_enabled=True,
+        ).to(device=device, dtype=dtype)
+
+
+def _refresh_static_cluster_pool_ffns(
+    model: DenseModel,
+    streams,
+    config: ExperimentConfig,
+    *,
+    calibration_batches: int,
+    device: torch.device,
+    rank: int,
+    cluster_count: int,
+    candidate_m: int,
+    score_mode: str,
+    aggregation: str,
+    cluster_iters: int,
+) -> dict[str, float]:
+    was_training = model.training
+    _set_static_cluster_pool_sparse_enabled(model, False)
+    model.eval()
+    svd_factors = _build_svd_factor_cache(model, max_rank=rank, device=device)
+    codebook, aux = _build_static_svd_cluster_pool_codebook(
+        model,
+        svd_factors,
+        streams.train_batches(config.training),
+        calibration_batches=calibration_batches,
+        device=device,
+        rank=rank,
+        cluster_count=cluster_count,
+        candidate_m=candidate_m,
+        score_mode=score_mode,
+        aggregation=aggregation,
+        cluster_iters=cluster_iters,
+    )
+    _install_static_cluster_pool_ffns(model, svd_factors, codebook, rank=rank)
+    _set_static_cluster_pool_sparse_enabled(model, True)
+    model.train(was_training)
+    return aux
+
+
+@torch.no_grad()
+def _eval_lm_nll(
+    model: DenseModel,
+    streams,
+    config: ExperimentConfig,
+    *,
+    batches: int,
+    device: torch.device,
+) -> float:
+    total_loss = 0.0
+    total_tokens = 0
+    was_training = model.training
+    model.eval()
+    iterator = streams.eval_batches(config.training)
+    for _ in range(batches):
+        tokens, targets = next(iterator)
+        tokens = tokens.to(device)
+        targets = targets.to(device)
+        out = model(tokens, targets, return_loss_per_sample=True)
+        assert out.loss_per_sample is not None
+        total_loss += float(out.loss_per_sample.sum().detach().cpu())
+        total_tokens += int(targets.numel())
+    model.train(was_training)
+    return total_loss / max(total_tokens, 1)
+
+
+def _train_lm_continuation(
+    model: DenseModel,
+    streams,
+    config: ExperimentConfig,
+    *,
+    steps: int,
+    lr: float,
+    weight_decay: float,
+    device: torch.device,
+    refresh_interval: int = 0,
+    refresh_callback=None,
+    grad_clip_norm: float | None = None,
+    optimizer_state: dict[str, Any] | None = None,
+    eval_steps: set[int] | None = None,
+    eval_callback=None,
+    progress: int = 0,
+    label: str = "model",
+) -> dict[str, Any]:
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer_state_loaded = False
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+        optimizer_state_loaded = True
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+            group["weight_decay"] = weight_decay
+            if "base_lr" in group:
+                group["base_lr"] = lr
+    batches = streams.train_batches(config.training)
+    losses: list[float] = []
+    refresh_events: list[dict[str, Any]] = []
+    eval_curve: list[dict[str, float]] = []
+    eval_steps = set(eval_steps or [])
+
+    def maybe_eval(step: int) -> None:
+        if step not in eval_steps or eval_callback is None:
+            return
+        eval_curve.append({"step": float(step), "nll_per_token": float(eval_callback())})
+
+    model.train()
+    start = time.perf_counter()
+    maybe_eval(0)
+    for step in range(steps):
+        tokens, targets = next(batches)
+        tokens = tokens.to(device)
+        targets = targets.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        out = model(tokens, targets, return_loss_per_sample=True)
+        assert out.loss_per_sample is not None
+        loss = out.loss_per_sample.mean() / float(targets.shape[1])
+        loss.backward()
+        if grad_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+        optimizer.step()
+        losses.append(float(loss.detach().cpu()))
+        if refresh_interval > 0 and (step + 1) % refresh_interval == 0:
+            if refresh_callback is not None:
+                aux = refresh_callback()
+                refresh_events.append({"step": step + 1, **aux})
+        maybe_eval(step + 1)
+        if progress and (step + 1) % progress == 0:
+            print(
+                json.dumps(
+                    {
+                        "event": "static_cluster_pool_continuation_step",
+                        "variant": label,
+                        "step": step + 1,
+                        "nll_per_token": losses[-1],
+                    }
+                )
+            )
+    _sync_device(device)
+    elapsed = time.perf_counter() - start
+    return {
+        "steps": steps,
+        "train_seconds": elapsed,
+        "tokens_trained": steps * config.training.batch_size * config.training.seq_len,
+        "tokens_per_second": (steps * config.training.batch_size * config.training.seq_len)
+        / max(elapsed, 1e-9),
+        "first_train_nll": losses[0] if losses else None,
+        "last_train_nll": losses[-1] if losses else None,
+        "mean_train_nll": sum(losses) / max(len(losses), 1),
+        "optimizer_state_loaded": optimizer_state_loaded,
+        "eval_curve": eval_curve,
+        "refresh_events": refresh_events,
+    }
+
+
+def _static_cluster_pool_coverage_metrics(model: DenseModel) -> dict[str, Any]:
+    rows: list[dict[str, float]] = []
+    for layer_idx, mlp in enumerate(_iter_static_cluster_pool_mlps(model)):
+        ids = mlp.candidate_ids.detach().cpu()
+        cluster_count, candidate_m = ids.shape
+        masks = F.one_hot(ids, num_classes=mlp.wd.in_features).sum(dim=1).bool()
+        coverage = masks.any(dim=0)
+        overlaps = []
+        for i in range(cluster_count):
+            for j in range(i + 1, cluster_count):
+                overlaps.append(float((masks[i] & masks[j]).sum().item()))
+        if overlaps:
+            overlap_min = min(overlaps)
+            overlap_mean = sum(overlaps) / len(overlaps)
+            overlap_max = max(overlaps)
+        else:
+            overlap_min = overlap_mean = overlap_max = 0.0
+        rows.append(
+            {
+                "layer": float(layer_idx),
+                "unique_selected_neurons": float(coverage.sum().item()),
+                "coverage_fraction": float(coverage.float().mean().item()),
+                "cluster_overlap_min": overlap_min,
+                "cluster_overlap_mean": overlap_mean,
+                "cluster_overlap_max": overlap_max,
+                "cluster_overlap_mean_fraction": overlap_mean / max(float(candidate_m), 1.0),
+            }
+        )
+    if not rows:
+        return {"rows": [], "mean": {}}
+    mean = {
+        key: sum(row[key] for row in rows) / len(rows)
+        for key in rows[0]
+        if key != "layer"
+    }
+    return {"rows": rows, "mean": mean}
+
+
+def _static_cluster_pool_grad_row_metrics(model: DenseModel) -> dict[str, Any]:
+    rows: list[dict[str, float]] = []
+    for layer_idx, mlp in enumerate(_iter_static_cluster_pool_mlps(model)):
+        ids = mlp.candidate_ids.detach().to(device=mlp.wug.weight.device)
+        selected = ids.reshape(-1).unique()
+        row_mask = torch.zeros(mlp.wd.in_features, device=ids.device, dtype=torch.bool)
+        row_mask[selected] = True
+        if mlp.wug.weight.grad is None or mlp.wd.weight.grad is None:
+            continue
+        up_grad, gate_grad = mlp.wug.weight.grad.detach().chunk(2, dim=0)
+        down_grad = mlp.wd.weight.grad.detach().t().contiguous()
+
+        def row_stats(name: str, grad: torch.Tensor) -> dict[str, float]:
+            row_norm = grad.float().norm(dim=-1)
+            selected_norm = row_norm[row_mask]
+            unselected_norm = row_norm[~row_mask]
+            return {
+                f"{name}_selected_row_grad_mean": float(selected_norm.mean().detach().cpu())
+                if selected_norm.numel()
+                else 0.0,
+                f"{name}_unselected_row_grad_mean": float(unselected_norm.mean().detach().cpu())
+                if unselected_norm.numel()
+                else 0.0,
+                f"{name}_selected_row_grad_max": float(selected_norm.max().detach().cpu())
+                if selected_norm.numel()
+                else 0.0,
+                f"{name}_unselected_row_grad_max": float(unselected_norm.max().detach().cpu())
+                if unselected_norm.numel()
+                else 0.0,
+                f"{name}_dead_row_count": float((row_norm <= 0).sum().detach().cpu()),
+            }
+
+        row = {
+            "layer": float(layer_idx),
+            "selected_rows": float(selected.numel()),
+            "coverage_fraction": float(row_mask.float().mean().detach().cpu()),
+            **row_stats("up", up_grad),
+            **row_stats("gate", gate_grad),
+            **row_stats("down", down_grad),
+        }
+        rows.append(row)
+    if not rows:
+        return {"rows": [], "mean": {}}
+    mean = {
+        key: sum(row[key] for row in rows) / len(rows)
+        for key in rows[0]
+        if key != "layer"
+    }
+    return {"rows": rows, "mean": mean}
+
+
+def _static_cluster_pool_input_grad_alignment(
+    model: DenseModel,
+    streams,
+    config: ExperimentConfig,
+    *,
+    device: torch.device,
+    batches: int,
+    seed: int,
+) -> dict[str, float]:
+    rows: list[dict[str, float]] = []
+    was_training = model.training
+    model.eval()
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    iterator = streams.eval_batches(config.training)
+    for _ in range(batches):
+        tokens, _ = next(iterator)
+        tokens = tokens.to(device)
+        with torch.no_grad():
+            x = model.embed(tokens)
+        for layer_idx, block in enumerate(model.blocks):
+            with torch.no_grad():
+                u = x + block.attn(block.norm1(x))
+                normed = block.norm2(u).detach()
+            if not isinstance(block.mlp, StaticClusterPoolSwiGLU):
+                with torch.no_grad():
+                    x = u + block.mlp(normed)
+                continue
+            x_dense = normed.detach().clone().requires_grad_()
+            x_sparse = normed.detach().clone().requires_grad_()
+            sparse_enabled = block.mlp.sparse_enabled
+            block.mlp.sparse_enabled = False
+            dense_out = block.mlp(x_dense)
+            block.mlp.sparse_enabled = True
+            sparse_out = block.mlp(x_sparse)
+            block.mlp.sparse_enabled = sparse_enabled
+            upstream = torch.randn(
+                dense_out.shape,
+                generator=gen,
+                device="cpu",
+                dtype=torch.float32,
+            ).to(device=device, dtype=dense_out.dtype)
+            dense_grad = torch.autograd.grad((dense_out * upstream).sum(), x_dense)[0]
+            sparse_grad = torch.autograd.grad((sparse_out * upstream).sum(), x_sparse)[0]
+            rows.append(
+                {
+                    "layer": float(layer_idx),
+                    "ffn_output_cosine": _cosine_flat(dense_out.detach(), sparse_out.detach()),
+                    "input_grad_cosine": _cosine_flat(dense_grad, sparse_grad),
+                }
+            )
+            with torch.no_grad():
+                x = u + block.mlp(normed)
+    model.train(was_training)
+    if not rows:
+        return {}
+    return {
+        "ffn_output_cosine": sum(row["ffn_output_cosine"] for row in rows) / len(rows),
+        "input_grad_cosine": sum(row["input_grad_cosine"] for row in rows) / len(rows),
+    }
+
+
 def _build_svd_sparse_ffns(
     dense: DenseModel,
     *,
@@ -4586,6 +5190,7 @@ def _init_cluster_pool_bucket(
     reference_k: int | None = None,
     score_mode: str | None = None,
     aggregation: str | None = None,
+    calibration_tokens: int | None = None,
 ) -> dict[str, Any]:
     return {
         "variant": name,
@@ -4596,6 +5201,7 @@ def _init_cluster_pool_bucket(
         "reference_k": reference_k,
         "score_mode": score_mode,
         "aggregation": aggregation,
+        "calibration_tokens": calibration_tokens,
         "tokens": 0,
         "samples": 0,
         "loss_sum": 0.0,
@@ -4628,7 +5234,15 @@ def _finish_cluster_pool_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
         "kl_to_dense": bucket["kl_sum"] / tokens,
         "final_hidden_cosine": bucket["final_hidden_cosine_sum"] / samples,
     }
-    for key in ("rank", "cluster_count", "candidate_m", "reference_k", "score_mode", "aggregation"):
+    for key in (
+        "rank",
+        "cluster_count",
+        "candidate_m",
+        "reference_k",
+        "score_mode",
+        "aggregation",
+        "calibration_tokens",
+    ):
         if bucket.get(key) is not None:
             row[key] = bucket[key]
     selection_count = max(float(bucket.get("selection_count", 0.0)), 1.0)
@@ -4790,6 +5404,826 @@ def cmd_deferred_neuron_cluster_pool_oracle(args: argparse.Namespace) -> None:
         "attention": "dense",
         "notes": "cluster pool executes all M candidates per cluster; no per-token final top-k",
         "rows": rows,
+    }
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+    _print_json(report)
+
+
+def cmd_deferred_neuron_static_cluster_pool_oracle(args: argparse.Namespace) -> None:
+    config = _model_for_mode(load_config(args.config), "dense_exact")
+    if args.batch_size is not None:
+        config = dataclasses.replace(
+            config,
+            training=dataclasses.replace(config.training, batch_size=args.batch_size),
+        )
+    ranks = [int(rank) for rank in (args.ranks or [64])]
+    cluster_counts = [int(value) for value in (args.clusters or [8, 16])]
+    candidate_ms = [int(value) for value in (args.candidate_m or [192])]
+    calibration_tokens_values = [int(value) for value in (args.calibration_tokens or [8192])]
+    score_modes = list(args.score_modes or ["sum"])
+    aggregations = list(args.aggregations or ["mean"])
+    tokens_per_batch = config.training.batch_size * config.training.seq_len
+    eval_batches = args.eval_batches
+    if eval_batches is None:
+        eval_batches = max(1, math.ceil(config.data.eval_tokens / tokens_per_batch))
+    set_seed(args.seed if args.seed is not None else config.training.seed)
+    device = default_device()
+    streams = load_token_streams(config.data, config.training, config.model.vocab_size)
+    dense = _load_dense_model(config, args.dense_checkpoint, device)
+    dense.eval()
+    svd_factors = _build_svd_factor_cache(
+        dense,
+        max_rank=max(ranks),
+        device=device,
+    )
+    buckets: dict[str, dict[str, Any]] = {
+        "dense": _init_cluster_pool_bucket("dense", variant_type="dense")
+    }
+    variants: list[tuple[str, int, int, int, int, str, str]] = []
+    codebooks: dict[str, tuple[list[dict[str, torch.Tensor]], dict[str, float]]] = {}
+    for calibration_tokens in calibration_tokens_values:
+        calibration_batches = max(1, math.ceil(calibration_tokens / tokens_per_batch))
+        actual_calibration_tokens = calibration_batches * tokens_per_batch
+        for rank in ranks:
+            for cluster_count in cluster_counts:
+                for candidate_m in candidate_ms:
+                    for score_mode in score_modes:
+                        for aggregation in aggregations:
+                            name = (
+                                f"static_cluster_svd_calib{actual_calibration_tokens}_rank{rank}_"
+                                f"c{cluster_count}_m{candidate_m}_{score_mode}_{aggregation}"
+                            )
+                            train_batches = streams.train_batches(config.training)
+                            codebook, codebook_aux = _build_static_svd_cluster_pool_codebook(
+                                dense,
+                                svd_factors,
+                                train_batches,
+                                calibration_batches=calibration_batches,
+                                device=device,
+                                rank=rank,
+                                cluster_count=cluster_count,
+                                candidate_m=candidate_m,
+                                score_mode=score_mode,
+                                aggregation=aggregation,
+                                cluster_iters=args.cluster_iters,
+                            )
+                            codebooks[name] = (codebook, codebook_aux)
+                            variants.append(
+                                (
+                                    name,
+                                    rank,
+                                    cluster_count,
+                                    candidate_m,
+                                    actual_calibration_tokens,
+                                    score_mode,
+                                    aggregation,
+                                )
+                            )
+                            bucket = _init_cluster_pool_bucket(
+                                name,
+                                variant_type="static_svd_cluster_pool",
+                                rank=rank,
+                                cluster_count=cluster_count,
+                                candidate_m=candidate_m,
+                                reference_k=args.reference_k,
+                                score_mode=score_mode,
+                                aggregation=aggregation,
+                                calibration_tokens=actual_calibration_tokens,
+                            )
+                            bucket["calibration_avg_nonempty_clusters"] = codebook_aux[
+                                "calibration_avg_nonempty_clusters"
+                            ]
+                            bucket["calibration_avg_cluster_imbalance"] = codebook_aux[
+                                "calibration_avg_cluster_imbalance"
+                            ]
+                            buckets[name] = bucket
+                            if args.progress:
+                                print(
+                                    json.dumps(
+                                        {
+                                            "event": "static_cluster_pool_codebook_built",
+                                            "variant": name,
+                                            "calibration_tokens": actual_calibration_tokens,
+                                        }
+                                    )
+                                )
+                            if device.type == "mps":
+                                torch.mps.empty_cache()
+
+    batches = streams.eval_batches(config.training)
+    for batch_idx in range(eval_batches):
+        tokens, targets = next(batches)
+        tokens = tokens.to(device)
+        targets = targets.to(device)
+        dense_out = dense(tokens, targets, return_loss_per_sample=True)
+        assert dense_out.logits is not None
+        assert dense_out.loss_per_sample is not None
+        assert dense_out.meta.hidden is not None
+        dense_logits = dense_out.logits
+        dense_hidden = dense_out.meta.hidden
+        dense_logp = F.log_softmax(dense_logits.detach() / args.temperature, dim=-1)
+        target_flat = targets.flatten()
+        token_count = int(targets.numel())
+        sample_count = int(targets.shape[0])
+        dense_bucket = buckets["dense"]
+        dense_bucket["tokens"] += token_count
+        dense_bucket["samples"] += sample_count
+        dense_bucket["loss_sum"] += float(dense_out.loss_per_sample.sum().detach().cpu())
+        dense_bucket["final_hidden_cosine_sum"] += float(sample_count)
+        for name, rank, _cluster_count, _candidate_m, _calibration_tokens, _score_mode, _aggregation in variants:
+            codebook, _codebook_aux = codebooks[name]
+            logits, hidden, aux = _svd_static_cluster_pool_full_stack_logits(
+                dense,
+                svd_factors,
+                codebook,
+                tokens,
+                rank=rank,
+                reference_k=args.reference_k,
+                profile=args.profile,
+            )
+            bucket = buckets[name]
+            loss = F.cross_entropy(logits.flatten(0, -2), target_flat, reduction="sum")
+            cand_logp = F.log_softmax(logits / args.temperature, dim=-1)
+            kl = (dense_logp.exp() * (dense_logp - cand_logp)).sum(dim=-1).sum() * (
+                args.temperature * args.temperature
+            )
+            final_cos = F.cosine_similarity(
+                hidden.float().flatten(1),
+                dense_hidden.float().flatten(1),
+                dim=-1,
+            ).sum()
+            bucket["tokens"] += token_count
+            bucket["samples"] += sample_count
+            bucket["loss_sum"] += float(loss.detach().cpu())
+            bucket["kl_sum"] += float(kl.detach().cpu())
+            bucket["final_hidden_cosine_sum"] += float(final_cos.detach().cpu())
+            for key in (
+                "candidate_size_sum",
+                "candidate_recall_sum",
+                "score_retention_sum",
+                "selection_count",
+                "cluster_count_sum",
+                "nonempty_cluster_count_sum",
+                "empty_cluster_count_sum",
+                "max_cluster_size_sum",
+                "min_cluster_size_sum",
+                "mean_cluster_size_sum",
+                "cluster_imbalance_sum",
+                "cluster_metric_count",
+                "cluster_pool_ffn_flop_ratio_sum",
+                "cluster_pool_exec_seconds",
+            ):
+                bucket[key] += float(aux.get(key, 0.0))
+        if device.type == "mps":
+            torch.mps.empty_cache()
+        if args.progress and (batch_idx + 1) % args.progress == 0:
+            print(json.dumps({"event": "static_cluster_pool_eval_batch", "batch": batch_idx + 1}))
+    rows = [_finish_cluster_pool_bucket(bucket) for bucket in buckets.values()]
+    for row in rows:
+        bucket = buckets[row["variant"]]
+        if "calibration_avg_nonempty_clusters" in bucket:
+            row["calibration_avg_nonempty_clusters"] = bucket["calibration_avg_nonempty_clusters"]
+            row["calibration_avg_cluster_imbalance"] = bucket["calibration_avg_cluster_imbalance"]
+    report = {
+        "mode": "deferred_neuron_static_cluster_pool_oracle",
+        "checkpoint": args.dense_checkpoint,
+        "eval_batches": eval_batches,
+        "eval_tokens": eval_batches * tokens_per_batch,
+        "requested_eval_tokens": config.data.eval_tokens,
+        "calibration_tokens": calibration_tokens_values,
+        "ranks": ranks,
+        "clusters": cluster_counts,
+        "candidate_m": candidate_ms,
+        "reference_k": args.reference_k,
+        "score_modes": score_modes,
+        "aggregations": aggregations,
+        "cluster_iters": args.cluster_iters,
+        "temperature": args.temperature,
+        "attention": "dense",
+        "notes": "candidate pools and cluster centers are calibrated once from train stream, then held fixed on eval",
+        "rows": rows,
+    }
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+    _print_json(report)
+
+
+@torch.no_grad()
+def _perturb_dense_ffn_weights(dense: DenseModel, *, relative_rms: float, seed: int) -> None:
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    for block in dense.blocks:
+        for param in (block.mlp.wug.weight, block.mlp.wd.weight):
+            rms = param.detach().float().square().mean().sqrt().cpu()
+            noise = torch.randn(param.shape, generator=gen, dtype=torch.float32) * (float(relative_rms) * rms)
+            param.add_(noise.to(device=param.device, dtype=param.dtype))
+
+
+def cmd_static_cluster_pool_staleness(args: argparse.Namespace) -> None:
+    config = _model_for_mode(load_config(args.config), "dense_exact")
+    if args.batch_size is not None:
+        config = dataclasses.replace(
+            config,
+            training=dataclasses.replace(config.training, batch_size=args.batch_size),
+        )
+    tokens_per_batch = config.training.batch_size * config.training.seq_len
+    calibration_batches = max(1, math.ceil(args.calibration_tokens / tokens_per_batch))
+    actual_calibration_tokens = calibration_batches * tokens_per_batch
+    eval_batches = args.eval_batches
+    if eval_batches is None:
+        eval_batches = max(1, math.ceil(config.data.eval_tokens / tokens_per_batch))
+    set_seed(args.seed if args.seed is not None else config.training.seed)
+    device = default_device()
+    streams = load_token_streams(config.data, config.training, config.model.vocab_size)
+    dense = _load_dense_model(config, args.dense_checkpoint, device)
+    dense.eval()
+    base_state = copy.deepcopy(dense.state_dict())
+    base_factors = _build_svd_factor_cache(dense, max_rank=args.rank, device=device)
+    base_codebook, base_codebook_aux = _build_static_svd_cluster_pool_codebook(
+        dense,
+        base_factors,
+        streams.train_batches(config.training),
+        calibration_batches=calibration_batches,
+        device=device,
+        rank=args.rank,
+        cluster_count=args.clusters,
+        candidate_m=args.candidate_m,
+        score_mode=args.score_mode,
+        aggregation=args.aggregation,
+        cluster_iters=args.cluster_iters,
+    )
+    rows: list[dict[str, Any]] = []
+    for pct in args.perturb_pct:
+        dense.load_state_dict(base_state)
+        relative = float(pct) / 100.0
+        if relative > 0.0:
+            _perturb_dense_ffn_weights(
+                dense,
+                relative_rms=relative,
+                seed=(args.seed if args.seed is not None else config.training.seed) + int(round(pct * 1000)),
+            )
+        refreshed_factors = _build_svd_factor_cache(dense, max_rank=args.rank, device=device)
+        refreshed_codebook, refreshed_codebook_aux = _build_static_svd_cluster_pool_codebook(
+            dense,
+            refreshed_factors,
+            streams.train_batches(config.training),
+            calibration_batches=calibration_batches,
+            device=device,
+            rank=args.rank,
+            cluster_count=args.clusters,
+            candidate_m=args.candidate_m,
+            score_mode=args.score_mode,
+            aggregation=args.aggregation,
+            cluster_iters=args.cluster_iters,
+        )
+        totals = {
+            "tokens": 0,
+            "samples": 0,
+            "dense_loss": 0.0,
+            "stale_loss": 0.0,
+            "refresh_loss": 0.0,
+            "stale_kl": 0.0,
+            "refresh_kl": 0.0,
+            "stale_cos": 0.0,
+            "refresh_cos": 0.0,
+            "stale_recall": 0.0,
+            "refresh_recall": 0.0,
+            "selection_count": 0.0,
+        }
+        batches = streams.eval_batches(config.training)
+        for batch_idx in range(eval_batches):
+            tokens, targets = next(batches)
+            tokens = tokens.to(device)
+            targets = targets.to(device)
+            dense_out = dense(tokens, targets, return_loss_per_sample=True)
+            assert dense_out.logits is not None
+            assert dense_out.loss_per_sample is not None
+            assert dense_out.meta.hidden is not None
+            dense_logp = F.log_softmax(dense_out.logits.detach() / args.temperature, dim=-1)
+            target_flat = targets.flatten()
+            stale_logits, stale_hidden, stale_aux = _svd_static_cluster_pool_full_stack_logits(
+                dense,
+                base_factors,
+                base_codebook,
+                tokens,
+                rank=args.rank,
+                reference_k=args.reference_k,
+            )
+            refresh_logits, refresh_hidden, refresh_aux = _svd_static_cluster_pool_full_stack_logits(
+                dense,
+                refreshed_factors,
+                refreshed_codebook,
+                tokens,
+                rank=args.rank,
+                reference_k=args.reference_k,
+            )
+            stale_logp = F.log_softmax(stale_logits / args.temperature, dim=-1)
+            refresh_logp = F.log_softmax(refresh_logits / args.temperature, dim=-1)
+            stale_loss = F.cross_entropy(stale_logits.flatten(0, -2), target_flat, reduction="sum")
+            refresh_loss = F.cross_entropy(refresh_logits.flatten(0, -2), target_flat, reduction="sum")
+            stale_kl = (dense_logp.exp() * (dense_logp - stale_logp)).sum(dim=-1).sum() * (
+                args.temperature * args.temperature
+            )
+            refresh_kl = (dense_logp.exp() * (dense_logp - refresh_logp)).sum(dim=-1).sum() * (
+                args.temperature * args.temperature
+            )
+            stale_cos = F.cosine_similarity(
+                stale_hidden.float().flatten(1),
+                dense_out.meta.hidden.float().flatten(1),
+                dim=-1,
+            ).sum()
+            refresh_cos = F.cosine_similarity(
+                refresh_hidden.float().flatten(1),
+                dense_out.meta.hidden.float().flatten(1),
+                dim=-1,
+            ).sum()
+            token_count = int(targets.numel())
+            sample_count = int(targets.shape[0])
+            totals["tokens"] += token_count
+            totals["samples"] += sample_count
+            totals["dense_loss"] += float(dense_out.loss_per_sample.sum().detach().cpu())
+            totals["stale_loss"] += float(stale_loss.detach().cpu())
+            totals["refresh_loss"] += float(refresh_loss.detach().cpu())
+            totals["stale_kl"] += float(stale_kl.detach().cpu())
+            totals["refresh_kl"] += float(refresh_kl.detach().cpu())
+            totals["stale_cos"] += float(stale_cos.detach().cpu())
+            totals["refresh_cos"] += float(refresh_cos.detach().cpu())
+            totals["stale_recall"] += float(stale_aux.get("candidate_recall_sum", 0.0))
+            totals["refresh_recall"] += float(refresh_aux.get("candidate_recall_sum", 0.0))
+            totals["selection_count"] += float(stale_aux.get("selection_count", 0.0))
+            if device.type == "mps":
+                torch.mps.empty_cache()
+            if args.progress and (batch_idx + 1) % args.progress == 0:
+                print(json.dumps({"event": "staleness_eval_batch", "perturb_pct": pct, "batch": batch_idx + 1}))
+        tokens_seen = max(int(totals["tokens"]), 1)
+        samples_seen = max(int(totals["samples"]), 1)
+        selection_count = max(float(totals["selection_count"]), 1.0)
+        rows.append(
+            {
+                "perturb_pct": pct,
+                "dense_nll_per_token": totals["dense_loss"] / tokens_seen,
+                "stale_nll_per_token": totals["stale_loss"] / tokens_seen,
+                "refreshed_nll_per_token": totals["refresh_loss"] / tokens_seen,
+                "stale_kl_to_dense": totals["stale_kl"] / tokens_seen,
+                "refreshed_kl_to_dense": totals["refresh_kl"] / tokens_seen,
+                "stale_final_hidden_cosine": totals["stale_cos"] / samples_seen,
+                "refreshed_final_hidden_cosine": totals["refresh_cos"] / samples_seen,
+                "stale_candidate_recall": totals["stale_recall"] / selection_count,
+                "refreshed_candidate_recall": totals["refresh_recall"] / selection_count,
+                "base_calibration_avg_cluster_imbalance": base_codebook_aux[
+                    "calibration_avg_cluster_imbalance"
+                ],
+                "refreshed_calibration_avg_cluster_imbalance": refreshed_codebook_aux[
+                    "calibration_avg_cluster_imbalance"
+                ],
+            }
+        )
+    report = {
+        "mode": "static_cluster_pool_staleness",
+        "checkpoint": args.dense_checkpoint,
+        "eval_batches": eval_batches,
+        "eval_tokens": eval_batches * tokens_per_batch,
+        "requested_eval_tokens": config.data.eval_tokens,
+        "calibration_tokens": actual_calibration_tokens,
+        "rank": args.rank,
+        "clusters": args.clusters,
+        "candidate_m": args.candidate_m,
+        "reference_k": args.reference_k,
+        "score_mode": args.score_mode,
+        "aggregation": args.aggregation,
+        "cluster_iters": args.cluster_iters,
+        "temperature": args.temperature,
+        "rows": rows,
+    }
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+    _print_json(report)
+
+
+def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
+    config = _model_for_mode(load_config(args.config), "dense_exact")
+    training = config.training
+    if args.batch_size is not None:
+        training = dataclasses.replace(training, batch_size=args.batch_size)
+    if args.seq_len is not None:
+        training = dataclasses.replace(training, seq_len=args.seq_len)
+    if args.lr is not None:
+        training = dataclasses.replace(training, lr=args.lr)
+    config = dataclasses.replace(config, training=training)
+    tokens_per_batch = config.training.batch_size * config.training.seq_len
+    calibration_batches = max(1, math.ceil(args.calibration_tokens / tokens_per_batch))
+    actual_calibration_tokens = calibration_batches * tokens_per_batch
+    eval_batches = args.eval_batches
+    if eval_batches is None:
+        eval_batches = max(1, math.ceil(config.data.eval_tokens / tokens_per_batch))
+    set_seed(args.seed if args.seed is not None else config.training.seed)
+    device = default_device()
+    streams = load_token_streams(config.data, config.training, config.model.vocab_size)
+    lr = args.lr if args.lr is not None else config.training.lr
+    weight_decay = args.weight_decay if args.weight_decay is not None else config.training.weight_decay
+    grad_clip_norm = args.grad_clip_norm if args.grad_clip_norm is not None else config.training.grad_clip_norm
+    checkpoint_payload = None
+    optimizer_state = None
+    if args.resume_optimizer_state:
+        checkpoint_payload = torch.load(args.dense_checkpoint, map_location=device, weights_only=False)
+        optimizer_state = checkpoint_payload.get("optimizer")
+        if optimizer_state is None:
+            raise SystemExit(f"checkpoint has no optimizer state: {args.dense_checkpoint}")
+    eval_steps = {int(step) for step in (args.eval_steps or [0, args.steps])}
+    eval_steps = {step for step in eval_steps if 0 <= step <= args.steps}
+    eval_steps.add(0)
+    eval_steps.add(args.steps)
+    alignment_config = config
+    if args.alignment_batch_size is not None:
+        alignment_config = dataclasses.replace(
+            config,
+            training=dataclasses.replace(config.training, batch_size=args.alignment_batch_size),
+        )
+    rows: list[dict[str, Any]] = []
+
+    if args.run_dense:
+        dense = _load_dense_model(config, args.dense_checkpoint, device)
+
+        def dense_eval_callback() -> float:
+            return _eval_lm_nll(
+                dense,
+                streams,
+                config,
+                batches=eval_batches,
+                device=device,
+            )
+
+        train_metrics = _train_lm_continuation(
+            dense,
+            streams,
+            config,
+            steps=args.steps,
+            lr=lr,
+            weight_decay=weight_decay,
+            device=device,
+            grad_clip_norm=grad_clip_norm,
+            optimizer_state=copy.deepcopy(optimizer_state) if optimizer_state is not None else None,
+            eval_steps=eval_steps,
+            eval_callback=dense_eval_callback,
+            progress=args.progress,
+            label="dense",
+        )
+        curve = {int(row["step"]): float(row["nll_per_token"]) for row in train_metrics["eval_curve"]}
+        dense_initial_nll = curve.get(0, dense_eval_callback())
+        dense_final_nll = curve.get(args.steps, dense_eval_callback())
+        rows.append(
+            {
+                "variant": "dense_continuation",
+                "initial_nll_per_token": dense_initial_nll,
+                "final_nll_per_token": dense_final_nll,
+                "nll_delta": dense_final_nll - dense_initial_nll,
+                **train_metrics,
+            }
+        )
+        del dense
+        if device.type == "mps":
+            torch.mps.empty_cache()
+
+    refresh_intervals = args.refresh_intervals or [0]
+    if not args.run_sparse:
+        refresh_intervals = []
+    for refresh_interval in refresh_intervals:
+        sparse = _load_dense_model(config, args.dense_checkpoint, device)
+        refresh_aux = _refresh_static_cluster_pool_ffns(
+            sparse,
+            streams,
+            config,
+            calibration_batches=calibration_batches,
+            device=device,
+            rank=args.rank,
+            cluster_count=args.clusters,
+            candidate_m=args.candidate_m,
+            score_mode=args.score_mode,
+            aggregation=args.aggregation,
+            cluster_iters=args.cluster_iters,
+        )
+        sparse_initial_nll = _eval_lm_nll(
+            sparse,
+            streams,
+            config,
+            batches=eval_batches,
+            device=device,
+        )
+        initial_coverage = _static_cluster_pool_coverage_metrics(sparse)
+        initial_alignment = (
+            _static_cluster_pool_input_grad_alignment(
+                sparse,
+                streams,
+                alignment_config,
+                device=device,
+                batches=args.alignment_batches,
+                seed=(args.seed if args.seed is not None else config.training.seed) + int(refresh_interval),
+            )
+            if args.include_gradient_alignment
+            else {}
+        )
+
+        def refresh_callback() -> dict[str, float]:
+            if refresh_interval <= 0:
+                return {}
+            return _refresh_static_cluster_pool_ffns(
+                sparse,
+                streams,
+                config,
+                calibration_batches=calibration_batches,
+                device=device,
+                rank=args.rank,
+                cluster_count=args.clusters,
+                candidate_m=args.candidate_m,
+                score_mode=args.score_mode,
+                aggregation=args.aggregation,
+                cluster_iters=args.cluster_iters,
+            )
+
+        def sparse_eval_callback() -> float:
+            return _eval_lm_nll(
+                sparse,
+                streams,
+                config,
+                batches=eval_batches,
+                device=device,
+            )
+
+        train_metrics = _train_lm_continuation(
+            sparse,
+            streams,
+            config,
+            steps=args.steps,
+            lr=lr,
+            weight_decay=weight_decay,
+            device=device,
+            refresh_interval=max(0, int(refresh_interval)),
+            refresh_callback=refresh_callback,
+            grad_clip_norm=grad_clip_norm,
+            optimizer_state=copy.deepcopy(optimizer_state) if optimizer_state is not None else None,
+            eval_steps=eval_steps,
+            eval_callback=sparse_eval_callback,
+            progress=args.progress,
+            label=f"sparse_refresh_{refresh_interval}",
+        )
+        curve = {int(row["step"]): float(row["nll_per_token"]) for row in train_metrics["eval_curve"]}
+        sparse_final_nll = curve.get(args.steps, sparse_eval_callback())
+        final_coverage = _static_cluster_pool_coverage_metrics(sparse)
+        final_grad_row_metrics = _static_cluster_pool_grad_row_metrics(sparse)
+        final_alignment = (
+            _static_cluster_pool_input_grad_alignment(
+                sparse,
+                streams,
+                alignment_config,
+                device=device,
+                batches=args.alignment_batches,
+                seed=(args.seed if args.seed is not None else config.training.seed)
+                + 10_000
+                + int(refresh_interval),
+            )
+            if args.include_gradient_alignment
+            else {}
+        )
+        rows.append(
+            {
+                "variant": "static_cluster_sparse_ffn",
+                "refresh_interval": int(refresh_interval),
+                "initial_nll_per_token": sparse_initial_nll,
+                "final_nll_per_token": sparse_final_nll,
+                "nll_delta": sparse_final_nll - sparse_initial_nll,
+                "initial_calibration_avg_cluster_imbalance": refresh_aux[
+                    "calibration_avg_cluster_imbalance"
+                ],
+                "initial_calibration_avg_nonempty_clusters": refresh_aux[
+                    "calibration_avg_nonempty_clusters"
+                ],
+                "initial_coverage": initial_coverage,
+                "final_coverage": final_coverage,
+                "final_grad_row_metrics": final_grad_row_metrics,
+                "initial_gradient_alignment": initial_alignment,
+                "final_gradient_alignment": final_alignment,
+                **train_metrics,
+            }
+        )
+        del sparse
+        if device.type == "mps":
+            torch.mps.empty_cache()
+
+    dense_curve_by_step: dict[int, float] = {}
+    for row in rows:
+        if row["variant"] == "dense_continuation":
+            dense_curve_by_step = {
+                int(point["step"]): float(point["nll_per_token"])
+                for point in row.get("eval_curve", [])
+            }
+            break
+    if dense_curve_by_step:
+        for row in rows:
+            if row["variant"] != "static_cluster_sparse_ffn":
+                continue
+            for point in row.get("eval_curve", []):
+                step = int(point["step"])
+                if step in dense_curve_by_step:
+                    point["gap_vs_dense"] = float(point["nll_per_token"]) - dense_curve_by_step[step]
+            row["initial_gap_vs_dense"] = row["initial_nll_per_token"] - dense_curve_by_step.get(
+                0,
+                row["initial_nll_per_token"],
+            )
+            row["final_gap_vs_dense"] = row["final_nll_per_token"] - dense_curve_by_step.get(
+                args.steps,
+                row["final_nll_per_token"],
+            )
+
+    report = {
+        "mode": "static_cluster_pool_continuation",
+        "checkpoint": args.dense_checkpoint,
+        "device": str(device),
+        "steps": args.steps,
+        "batch_size": config.training.batch_size,
+        "seq_len": config.training.seq_len,
+        "tokens_per_batch": tokens_per_batch,
+        "eval_batches": eval_batches,
+        "eval_tokens": eval_batches * tokens_per_batch,
+        "eval_steps": sorted(eval_steps),
+        "calibration_tokens": actual_calibration_tokens,
+        "rank": args.rank,
+        "clusters": args.clusters,
+        "candidate_m": args.candidate_m,
+        "score_mode": args.score_mode,
+        "aggregation": args.aggregation,
+        "cluster_iters": args.cluster_iters,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "rows": rows,
+    }
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+    _print_json(report)
+
+
+def _cosine_flat(a: torch.Tensor, b: torch.Tensor) -> float:
+    return float(F.cosine_similarity(a.float().reshape(1, -1), b.float().reshape(1, -1), dim=-1).item())
+
+
+def _norm_ratio(a: torch.Tensor, b: torch.Tensor) -> float:
+    return float(a.float().norm().item() / max(b.float().norm().item(), 1e-12))
+
+
+def cmd_static_cluster_pool_gradient_alignment(args: argparse.Namespace) -> None:
+    config = _model_for_mode(load_config(args.config), "dense_exact")
+    if args.batch_size is not None:
+        config = dataclasses.replace(
+            config,
+            training=dataclasses.replace(config.training, batch_size=args.batch_size),
+        )
+    tokens_per_batch = config.training.batch_size * config.training.seq_len
+    calibration_batches = max(1, math.ceil(args.calibration_tokens / tokens_per_batch))
+    eval_batches = args.eval_batches
+    if eval_batches is None:
+        eval_batches = 1
+    set_seed(args.seed if args.seed is not None else config.training.seed)
+    device = default_device()
+    streams = load_token_streams(config.data, config.training, config.model.vocab_size)
+    dense = _load_dense_model(config, args.dense_checkpoint, device)
+    dense.eval()
+    factors = _build_svd_factor_cache(dense, max_rank=args.rank, device=device)
+    codebook, codebook_aux = _build_static_svd_cluster_pool_codebook(
+        dense,
+        factors,
+        streams.train_batches(config.training),
+        calibration_batches=calibration_batches,
+        device=device,
+        rank=args.rank,
+        cluster_count=args.clusters,
+        candidate_m=args.candidate_m,
+        score_mode=args.score_mode,
+        aggregation=args.aggregation,
+        cluster_iters=args.cluster_iters,
+    )
+    layer_totals: list[dict[str, float]] = [
+        {
+            "count": 0.0,
+            "ffn_output_cosine": 0.0,
+            "ffn_output_mse": 0.0,
+            "input_grad_cosine": 0.0,
+            "w_up_grad_cosine": 0.0,
+            "w_gate_grad_cosine": 0.0,
+            "w_down_grad_cosine": 0.0,
+            "w_up_grad_norm_ratio": 0.0,
+            "w_gate_grad_norm_ratio": 0.0,
+            "w_down_grad_norm_ratio": 0.0,
+            "selected_rows": 0.0,
+        }
+        for _ in dense.blocks
+    ]
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(args.seed if args.seed is not None else config.training.seed)
+    batches = streams.eval_batches(config.training)
+    for batch_idx in range(eval_batches):
+        tokens, _ = next(batches)
+        tokens = tokens.to(device)
+        with torch.no_grad():
+            x = dense.embed(tokens)
+        for layer_idx, block in enumerate(dense.blocks):
+            with torch.no_grad():
+                u = x + block.attn(block.norm1(x))
+                normed = block.norm2(u).detach()
+            dense_mlp = copy.deepcopy(block.mlp).to(device)
+            sparse_mlp = StaticClusterPoolSwiGLU(
+                block.mlp,
+                factors[layer_idx],
+                codebook[layer_idx],
+                rank=args.rank,
+                sparse_enabled=True,
+            ).to(device)
+            dense_mlp.train()
+            sparse_mlp.train()
+            x_dense = normed.detach().clone().requires_grad_()
+            x_sparse = normed.detach().clone().requires_grad_()
+            dense_out = dense_mlp(x_dense)
+            sparse_out = sparse_mlp(x_sparse)
+            upstream = torch.randn(
+                dense_out.shape,
+                generator=gen,
+                device="cpu",
+                dtype=torch.float32,
+            ).to(device=device, dtype=dense_out.dtype)
+            (dense_out * upstream).sum().backward()
+            (sparse_out * upstream).sum().backward()
+            assignments = route_to_static_centers(
+                normed.reshape(-1, normed.shape[-1]),
+                sparse_mlp.up_a[:, : sparse_mlp.rank],
+                sparse_mlp.gate_a[:, : sparse_mlp.rank],
+                sparse_mlp.centers,
+            )
+            selected_rows = sparse_mlp.candidate_ids.index_select(0, assignments).reshape(-1).unique()
+            dense_up_grad, dense_gate_grad = dense_mlp.wug.weight.grad.chunk(2, dim=0)
+            sparse_up_grad, sparse_gate_grad = sparse_mlp.wug.weight.grad.chunk(2, dim=0)
+            dense_down_grad = dense_mlp.wd.weight.grad.t().contiguous()
+            sparse_down_grad = sparse_mlp.wd.weight.grad.t().contiguous()
+            dense_up_sel = dense_up_grad.index_select(0, selected_rows)
+            sparse_up_sel = sparse_up_grad.index_select(0, selected_rows)
+            dense_gate_sel = dense_gate_grad.index_select(0, selected_rows)
+            sparse_gate_sel = sparse_gate_grad.index_select(0, selected_rows)
+            dense_down_sel = dense_down_grad.index_select(0, selected_rows)
+            sparse_down_sel = sparse_down_grad.index_select(0, selected_rows)
+            totals = layer_totals[layer_idx]
+            totals["count"] += 1.0
+            totals["ffn_output_cosine"] += _cosine_flat(dense_out.detach(), sparse_out.detach())
+            totals["ffn_output_mse"] += float((dense_out.detach().float() - sparse_out.detach().float()).square().mean().item())
+            totals["input_grad_cosine"] += _cosine_flat(x_dense.grad, x_sparse.grad)
+            totals["w_up_grad_cosine"] += _cosine_flat(dense_up_sel, sparse_up_sel)
+            totals["w_gate_grad_cosine"] += _cosine_flat(dense_gate_sel, sparse_gate_sel)
+            totals["w_down_grad_cosine"] += _cosine_flat(dense_down_sel, sparse_down_sel)
+            totals["w_up_grad_norm_ratio"] += _norm_ratio(sparse_up_sel, dense_up_sel)
+            totals["w_gate_grad_norm_ratio"] += _norm_ratio(sparse_gate_sel, dense_gate_sel)
+            totals["w_down_grad_norm_ratio"] += _norm_ratio(sparse_down_sel, dense_down_sel)
+            totals["selected_rows"] += float(selected_rows.numel())
+            with torch.no_grad():
+                x = u + block.mlp(normed)
+            del dense_mlp, sparse_mlp, x_dense, x_sparse, dense_out, sparse_out
+            if device.type == "mps":
+                torch.mps.empty_cache()
+        if args.progress and (batch_idx + 1) % args.progress == 0:
+            print(json.dumps({"event": "gradient_alignment_batch", "batch": batch_idx + 1}))
+    rows: list[dict[str, Any]] = []
+    for layer_idx, totals in enumerate(layer_totals):
+        count = max(totals.pop("count"), 1.0)
+        row = {"layer": layer_idx}
+        row.update({key: value / count for key, value in totals.items()})
+        rows.append(row)
+    mean_row = {
+        "layer": "mean",
+        **{
+            key: sum(float(row[key]) for row in rows) / max(len(rows), 1)
+            for key in rows[0]
+            if key != "layer"
+        },
+    }
+    report = {
+        "mode": "static_cluster_pool_gradient_alignment",
+        "checkpoint": args.dense_checkpoint,
+        "device": str(device),
+        "eval_batches": eval_batches,
+        "eval_tokens": eval_batches * tokens_per_batch,
+        "calibration_tokens": calibration_batches * tokens_per_batch,
+        "rank": args.rank,
+        "clusters": args.clusters,
+        "candidate_m": args.candidate_m,
+        "score_mode": args.score_mode,
+        "aggregation": args.aggregation,
+        "cluster_iters": args.cluster_iters,
+        "codebook_aux": codebook_aux,
+        "rows": [*rows, mean_row],
     }
     if args.output:
         output = Path(args.output)
@@ -5240,6 +6674,206 @@ def cmd_benchmark_cluster_pool_ffn(args: argparse.Namespace) -> None:
         "device": str(device),
         "iters": args.iters,
         "warmup": args.warmup,
+        "rows": rows,
+    }
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+    _print_json(report)
+
+
+def _benchmark_static_cluster_grad_check(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    d_model: int,
+    d_ff: int,
+    tokens: int,
+) -> dict[str, float]:
+    scale = 1.0 / math.sqrt(d_model)
+    x_dense = torch.randn(tokens, d_model, device=device, dtype=dtype, requires_grad=True)
+    w_up = (torch.randn(d_ff, d_model, device=device, dtype=dtype) * scale).requires_grad_()
+    w_gate = (torch.randn(d_ff, d_model, device=device, dtype=dtype) * scale).requires_grad_()
+    w_down = (torch.randn(d_ff, d_model, device=device, dtype=dtype) * scale).requires_grad_()
+    x_sparse = x_dense.detach().clone().requires_grad_()
+    wup_pool = w_up.detach().t().unsqueeze(0).contiguous().requires_grad_()
+    wgate_pool = w_gate.detach().t().unsqueeze(0).contiguous().requires_grad_()
+    wdown_pool = w_down.detach().unsqueeze(0).contiguous().requires_grad_()
+    assignments = torch.zeros(tokens, device=device, dtype=torch.long)
+    pack_index, flat_gather, _, _ = build_static_pack_gather_indices(assignments, cluster_count=1)
+    dense = ((x_dense @ w_up.t()) * F.silu(x_dense @ w_gate.t())) @ w_down
+    sparse = cluster_pool_ffn_forward_preindexed(
+        x_sparse,
+        pack_index,
+        flat_gather,
+        wup_pool,
+        wgate_pool,
+        wdown_pool,
+    )
+    max_output_abs_diff = float((dense.detach() - sparse.detach()).abs().max().cpu())
+    dense.square().mean().backward()
+    sparse.square().mean().backward()
+    assert x_dense.grad is not None and x_sparse.grad is not None
+    assert w_up.grad is not None and w_gate.grad is not None and w_down.grad is not None
+    assert wup_pool.grad is not None and wgate_pool.grad is not None and wdown_pool.grad is not None
+    return {
+        "full_mode_max_output_abs_diff": max_output_abs_diff,
+        "full_mode_max_x_grad_abs_diff": float((x_dense.grad - x_sparse.grad).abs().max().cpu()),
+        "full_mode_max_w_up_grad_abs_diff": float((w_up.grad - wup_pool.grad[0].t()).abs().max().cpu()),
+        "full_mode_max_w_gate_grad_abs_diff": float(
+            (w_gate.grad - wgate_pool.grad[0].t()).abs().max().cpu()
+        ),
+        "full_mode_max_w_down_grad_abs_diff": float((w_down.grad - wdown_pool.grad[0]).abs().max().cpu()),
+    }
+
+
+def cmd_benchmark_static_cluster_pool_ffn_train(args: argparse.Namespace) -> None:
+    device = default_device()
+    rows: list[dict[str, Any]] = []
+    sizes = args.size or [(2048, 8192, 1024)]
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+    grad_check: dict[str, float] = {}
+    if args.grad_check:
+        grad_check = _benchmark_static_cluster_grad_check(
+            device=device,
+            dtype=torch.float32,
+            d_model=min(args.grad_check_d_model, 128),
+            d_ff=min(args.grad_check_d_ff, 256),
+            tokens=min(args.grad_check_tokens, 128),
+        )
+        _sync_device(device)
+    for d_model, d_ff, tokens in sizes:
+        scale = 1.0 / math.sqrt(d_model)
+        x_dense = torch.randn(tokens, d_model, device=device, dtype=dtype, requires_grad=True)
+        x_sparse = x_dense.detach().clone().requires_grad_()
+        w_up = (torch.randn(d_ff, d_model, device=device, dtype=dtype) * scale).requires_grad_()
+        w_gate = (torch.randn(d_ff, d_model, device=device, dtype=dtype) * scale).requires_grad_()
+        w_down = (torch.randn(d_ff, d_model, device=device, dtype=dtype) * scale).requires_grad_()
+        clusters = min(args.clusters, tokens)
+        candidate_m = min(args.candidate_m, d_ff)
+        assignments = balanced_synthetic_assignments(tokens, clusters, device)
+        pack_index, flat_gather, _, max_count = build_static_pack_gather_indices(
+            assignments,
+            cluster_count=clusters,
+        )
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(args.seed)
+        candidate_ids = torch.randint(
+            0,
+            d_ff,
+            (clusters, candidate_m),
+            generator=gen,
+            dtype=torch.long,
+        ).to(device)
+        with torch.no_grad():
+            wup_init, wgate_init, wdown_init = prepare_cluster_pool_weights(
+                w_up.detach(),
+                w_gate.detach(),
+                w_down.detach(),
+                candidate_ids,
+            )
+        wup_pool = wup_init.detach().clone().requires_grad_()
+        wgate_pool = wgate_init.detach().clone().requires_grad_()
+        wdown_pool = wdown_init.detach().clone().requires_grad_()
+
+        def zero_dense() -> None:
+            for tensor in (x_dense, w_up, w_gate, w_down):
+                tensor.grad = None
+
+        def zero_sparse() -> None:
+            for tensor in (x_sparse, wup_pool, wgate_pool, wdown_pool):
+                tensor.grad = None
+
+        def dense_forward() -> torch.Tensor:
+            return ((x_dense @ w_up.t()) * F.silu(x_dense @ w_gate.t())) @ w_down
+
+        def sparse_forward() -> torch.Tensor:
+            return cluster_pool_ffn_forward_preindexed(
+                x_sparse,
+                pack_index,
+                flat_gather,
+                wup_pool,
+                wgate_pool,
+                wdown_pool,
+            )
+
+        def dense_step() -> torch.Tensor:
+            zero_dense()
+            out = dense_forward()
+            loss = out.square().mean()
+            loss.backward()
+            return loss
+
+        def sparse_step() -> torch.Tensor:
+            zero_sparse()
+            out = sparse_forward()
+            loss = out.square().mean()
+            loss.backward()
+            return loss
+
+        def scatter_grads() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            if wup_pool.grad is None or wgate_pool.grad is None or wdown_pool.grad is None:
+                raise RuntimeError("sparse gradients are not populated")
+            return scatter_cluster_pool_grads(
+                candidate_ids,
+                wup_pool.grad,
+                wgate_pool.grad,
+                wdown_pool.grad,
+                d_ff=d_ff,
+            )
+
+        for _ in range(args.warmup):
+            dense_step()
+            sparse_step()
+            scatter_grads()
+        _sync_device(device)
+
+        def measure(fn) -> float:
+            start = time.perf_counter()
+            for _ in range(args.iters):
+                fn()
+            _sync_device(device)
+            return (time.perf_counter() - start) / max(args.iters, 1)
+
+        dense_fwd_seconds = measure(dense_forward)
+        sparse_fwd_seconds = measure(sparse_forward)
+        dense_step_seconds = measure(dense_step)
+        sparse_step_seconds = measure(sparse_step)
+        # Make sure scatter timing measures actual populated grads.
+        sparse_step()
+        grad_scatter_seconds = measure(scatter_grads)
+        rows.append(
+            {
+                "d_model": d_model,
+                "d_ff": d_ff,
+                "tokens": tokens,
+                "clusters": clusters,
+                "candidate_m": candidate_m,
+                "max_tokens_per_cluster": max_count,
+                "dense_forward_ms": dense_fwd_seconds * 1000.0,
+                "sparse_forward_ms": sparse_fwd_seconds * 1000.0,
+                "dense_forward_backward_ms": dense_step_seconds * 1000.0,
+                "sparse_forward_backward_ms": sparse_step_seconds * 1000.0,
+                "grad_scatter_ms": grad_scatter_seconds * 1000.0,
+                "sparse_train_step_with_scatter_ms": (sparse_step_seconds + grad_scatter_seconds) * 1000.0,
+                "forward_speedup": dense_fwd_seconds / max(sparse_fwd_seconds, 1e-12),
+                "forward_backward_speedup": dense_step_seconds / max(sparse_step_seconds, 1e-12),
+                "forward_backward_scatter_speedup": dense_step_seconds
+                / max(sparse_step_seconds + grad_scatter_seconds, 1e-12),
+                "ideal_ffn_flop_ratio": candidate_m / d_ff,
+                "ideal_ffn_math_speedup": d_ff / max(candidate_m, 1),
+            }
+        )
+        if device.type == "mps":
+            torch.mps.empty_cache()
+    report = {
+        "mode": "benchmark_static_cluster_pool_ffn_train",
+        "device": str(device),
+        "dtype": str(dtype),
+        "iters": args.iters,
+        "warmup": args.warmup,
+        "grad_check": grad_check,
         "rows": rows,
     }
     if args.output:
@@ -7391,6 +9025,103 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_pool.add_argument("--output")
     cluster_pool.set_defaults(func=cmd_deferred_neuron_cluster_pool_oracle)
 
+    static_cluster_pool = sub.add_parser("deferred-neuron-static-cluster-pool-oracle")
+    static_cluster_pool.add_argument("--config", required=True)
+    static_cluster_pool.add_argument("--dense-checkpoint", required=True)
+    static_cluster_pool.add_argument("--eval-batches", type=int)
+    static_cluster_pool.add_argument("--batch-size", type=int)
+    static_cluster_pool.add_argument("--calibration-tokens", type=int, nargs="+", default=[8192])
+    static_cluster_pool.add_argument("--ranks", type=int, nargs="+", default=[64])
+    static_cluster_pool.add_argument("--clusters", type=int, nargs="+", default=[8, 16])
+    static_cluster_pool.add_argument("--candidate-m", type=int, nargs="+", default=[192])
+    static_cluster_pool.add_argument("--reference-k", type=int, default=64)
+    static_cluster_pool.add_argument(
+        "--score-modes",
+        nargs="+",
+        choices=["sum", "upgate", "product"],
+        default=["sum"],
+    )
+    static_cluster_pool.add_argument(
+        "--aggregations",
+        nargs="+",
+        choices=["mean", "max"],
+        default=["mean"],
+    )
+    static_cluster_pool.add_argument("--cluster-iters", type=int, default=8)
+    static_cluster_pool.add_argument("--profile", action="store_true")
+    static_cluster_pool.add_argument("--temperature", type=float, default=2.0)
+    static_cluster_pool.add_argument("--seed", type=int)
+    static_cluster_pool.add_argument("--progress", type=int, default=0)
+    static_cluster_pool.add_argument("--output")
+    static_cluster_pool.set_defaults(func=cmd_deferred_neuron_static_cluster_pool_oracle)
+
+    staleness = sub.add_parser("static-cluster-pool-staleness")
+    staleness.add_argument("--config", required=True)
+    staleness.add_argument("--dense-checkpoint", required=True)
+    staleness.add_argument("--eval-batches", type=int)
+    staleness.add_argument("--batch-size", type=int)
+    staleness.add_argument("--calibration-tokens", type=int, default=8192)
+    staleness.add_argument("--rank", type=int, default=64)
+    staleness.add_argument("--clusters", type=int, default=16)
+    staleness.add_argument("--candidate-m", type=int, default=192)
+    staleness.add_argument("--reference-k", type=int, default=64)
+    staleness.add_argument("--perturb-pct", type=float, nargs="+", default=[0.1, 0.5, 1.0, 2.0, 5.0])
+    staleness.add_argument("--score-mode", choices=["sum", "upgate", "product"], default="sum")
+    staleness.add_argument("--aggregation", choices=["mean", "max"], default="mean")
+    staleness.add_argument("--cluster-iters", type=int, default=4)
+    staleness.add_argument("--temperature", type=float, default=2.0)
+    staleness.add_argument("--seed", type=int)
+    staleness.add_argument("--progress", type=int, default=0)
+    staleness.add_argument("--output")
+    staleness.set_defaults(func=cmd_static_cluster_pool_staleness)
+
+    continuation = sub.add_parser("static-cluster-pool-continuation")
+    continuation.add_argument("--config", required=True)
+    continuation.add_argument("--dense-checkpoint", required=True)
+    continuation.add_argument("--steps", type=int, default=100)
+    continuation.add_argument("--eval-batches", type=int)
+    continuation.add_argument("--eval-steps", type=int, nargs="+")
+    continuation.add_argument("--batch-size", type=int)
+    continuation.add_argument("--seq-len", type=int)
+    continuation.add_argument("--calibration-tokens", type=int, default=8192)
+    continuation.add_argument("--rank", type=int, default=64)
+    continuation.add_argument("--clusters", type=int, default=16)
+    continuation.add_argument("--candidate-m", type=int, default=192)
+    continuation.add_argument("--refresh-intervals", type=int, nargs="+", default=[0])
+    continuation.add_argument("--score-mode", choices=["sum", "upgate", "product"], default="sum")
+    continuation.add_argument("--aggregation", choices=["mean", "max"], default="mean")
+    continuation.add_argument("--cluster-iters", type=int, default=4)
+    continuation.add_argument("--lr", type=float)
+    continuation.add_argument("--weight-decay", type=float)
+    continuation.add_argument("--grad-clip-norm", type=float)
+    continuation.add_argument("--run-dense", action=argparse.BooleanOptionalAction, default=True)
+    continuation.add_argument("--run-sparse", action=argparse.BooleanOptionalAction, default=True)
+    continuation.add_argument("--resume-optimizer-state", action="store_true")
+    continuation.add_argument("--include-gradient-alignment", action="store_true")
+    continuation.add_argument("--alignment-batches", type=int, default=1)
+    continuation.add_argument("--alignment-batch-size", type=int)
+    continuation.add_argument("--seed", type=int)
+    continuation.add_argument("--progress", type=int, default=0)
+    continuation.add_argument("--output")
+    continuation.set_defaults(func=cmd_static_cluster_pool_continuation)
+
+    grad_align = sub.add_parser("static-cluster-pool-gradient-alignment")
+    grad_align.add_argument("--config", required=True)
+    grad_align.add_argument("--dense-checkpoint", required=True)
+    grad_align.add_argument("--eval-batches", type=int, default=1)
+    grad_align.add_argument("--batch-size", type=int)
+    grad_align.add_argument("--calibration-tokens", type=int, default=8192)
+    grad_align.add_argument("--rank", type=int, default=64)
+    grad_align.add_argument("--clusters", type=int, default=16)
+    grad_align.add_argument("--candidate-m", type=int, default=192)
+    grad_align.add_argument("--score-mode", choices=["sum", "upgate", "product"], default="sum")
+    grad_align.add_argument("--aggregation", choices=["mean", "max"], default="mean")
+    grad_align.add_argument("--cluster-iters", type=int, default=4)
+    grad_align.add_argument("--seed", type=int)
+    grad_align.add_argument("--progress", type=int, default=0)
+    grad_align.add_argument("--output")
+    grad_align.set_defaults(func=cmd_static_cluster_pool_gradient_alignment)
+
     svd_hot = sub.add_parser("deferred-neuron-svd-hot-eval")
     svd_hot.add_argument("--config", required=True)
     svd_hot.add_argument("--dense-checkpoint", required=True)
@@ -7445,6 +9176,26 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_pool_bench.add_argument("--warmup", type=int, default=3)
     cluster_pool_bench.add_argument("--output")
     cluster_pool_bench.set_defaults(func=cmd_benchmark_cluster_pool_ffn)
+
+    cluster_pool_train_bench = sub.add_parser("benchmark-static-cluster-pool-ffn-train")
+    cluster_pool_train_bench.add_argument(
+        "--size",
+        type=_parse_ffn_bench_size,
+        action="append",
+        default=None,
+        help="Benchmark size as d_modelxd_ffxtokens, e.g. 2048x8192x1024.",
+    )
+    cluster_pool_train_bench.add_argument("--clusters", type=int, default=16)
+    cluster_pool_train_bench.add_argument("--candidate-m", type=int, default=192)
+    cluster_pool_train_bench.add_argument("--iters", type=int, default=5)
+    cluster_pool_train_bench.add_argument("--warmup", type=int, default=1)
+    cluster_pool_train_bench.add_argument("--seed", type=int, default=1234)
+    cluster_pool_train_bench.add_argument("--grad-check", action=argparse.BooleanOptionalAction, default=True)
+    cluster_pool_train_bench.add_argument("--grad-check-d-model", type=int, default=64)
+    cluster_pool_train_bench.add_argument("--grad-check-d-ff", type=int, default=128)
+    cluster_pool_train_bench.add_argument("--grad-check-tokens", type=int, default=32)
+    cluster_pool_train_bench.add_argument("--output")
+    cluster_pool_train_bench.set_defaults(func=cmd_benchmark_static_cluster_pool_ffn_train)
 
     mlx_svd_bench = sub.add_parser("benchmark-mlx-svd-sparse-ffn")
     mlx_svd_bench.add_argument(

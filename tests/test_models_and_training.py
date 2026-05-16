@@ -9,9 +9,11 @@ import torch
 from recursive_training_engine.config import load_config
 from recursive_training_engine.cli import (
     _build_svd_factor_cache,
+    _build_static_svd_cluster_pool_codebook,
     _ffn_neuron_svd_cluster_pool_output,
+    _svd_static_cluster_pool_full_stack_logits,
 )
-from recursive_training_engine.layers import DenseSwiGLU, SVDFactorSparseFFN
+from recursive_training_engine.layers import DenseSwiGLU, SVDFactorSparseFFN, StaticClusterPoolSwiGLU
 from recursive_training_engine.models import DenseModel, RecursiveModel
 from recursive_training_engine.output import ShortlistHead
 from recursive_training_engine.training import TrainEngine
@@ -65,6 +67,29 @@ def test_svd_factor_sparse_ffn_recovers_dense_when_all_neurons_active() -> None:
     assert aux["selected_ids"].shape == (x.shape[0] * x.shape[1], cfg.model.d_ff)
 
 
+def test_static_cluster_pool_swiglu_recovers_dense_when_pool_is_full() -> None:
+    cfg = tiny_config("dense_exact")
+    mlp = DenseSwiGLU(cfg.model)
+    rank = min(cfg.model.d_model, cfg.model.d_ff)
+    factors = {
+        "up_a": torch.zeros(cfg.model.d_model, rank),
+        "gate_a": torch.zeros(cfg.model.d_model, rank),
+    }
+    codebook = {
+        "centers": torch.zeros(1, 2 * rank),
+        "candidate_ids": torch.arange(cfg.model.d_ff).unsqueeze(0),
+    }
+    sparse = StaticClusterPoolSwiGLU(mlp, factors, codebook, rank=rank)
+    x = torch.randn(2, 5, cfg.model.d_model, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_()
+    dense_out = mlp(x_ref)
+    sparse_out = sparse(x)
+    assert torch.allclose(sparse_out, dense_out, atol=1e-5)
+    dense_out.square().mean().backward()
+    sparse_out.square().mean().backward()
+    assert torch.allclose(x.grad, x_ref.grad, atol=1e-5)
+
+
 def test_svd_cluster_pool_recovers_dense_ffn_when_pool_is_full() -> None:
     cfg = tiny_config("dense_exact")
     set_seed(123)
@@ -93,6 +118,43 @@ def test_svd_cluster_pool_recovers_dense_ffn_when_pool_is_full() -> None:
     )
     assert torch.allclose(clustered, block.mlp(normed), atol=1e-5)
     assert aux["selection_count"] == tokens.numel()
+
+
+def test_static_svd_cluster_pool_recovers_dense_when_pool_is_full() -> None:
+    cfg = tiny_config("dense_exact")
+    set_seed(123)
+    dense = DenseModel(cfg.model)
+    factors = _build_svd_factor_cache(
+        dense,
+        max_rank=min(cfg.model.d_model, cfg.model.d_ff),
+        device=torch.device("cpu"),
+    )
+    tokens, targets = sample_batch(cfg)
+    codebook, _ = _build_static_svd_cluster_pool_codebook(
+        dense,
+        factors,
+        iter([(tokens, targets)]),
+        calibration_batches=1,
+        device=torch.device("cpu"),
+        rank=min(cfg.model.d_model, cfg.model.d_ff),
+        cluster_count=2,
+        candidate_m=cfg.model.d_ff,
+        score_mode="sum",
+        aggregation="mean",
+        cluster_iters=2,
+    )
+    dense_out = dense(tokens, targets)
+    logits, hidden, aux = _svd_static_cluster_pool_full_stack_logits(
+        dense,
+        factors,
+        codebook,
+        tokens,
+        rank=min(cfg.model.d_model, cfg.model.d_ff),
+        reference_k=min(4, cfg.model.d_ff),
+    )
+    assert dense_out.logits is not None
+    assert torch.allclose(logits, dense_out.logits, atol=1e-5)
+    assert aux["selection_count"] == tokens.numel() * len(dense.blocks)
 
 
 def test_mlx_svd_sparse_ffn_compiled_matches_eager_when_available() -> None:

@@ -162,6 +162,85 @@ def cluster_pool_ffn_reference(
     return out
 
 
+def build_static_pack_gather_indices(
+    assignments: torch.Tensor,
+    *,
+    cluster_count: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Precompute padded pack/gather indices for a fixed assignment pattern."""
+
+    if assignments.ndim != 1:
+        raise ValueError("assignments must have shape [tokens]")
+    assignments = assignments.to(dtype=torch.long)
+    counts = torch.bincount(assignments, minlength=cluster_count)
+    max_count = int(counts.max().item()) if counts.numel() else 0
+    pack_index = torch.zeros(cluster_count, max_count, device=assignments.device, dtype=torch.long)
+    flat_gather = torch.empty(assignments.shape[0], device=assignments.device, dtype=torch.long)
+    for cluster_idx in range(cluster_count):
+        token_idx = torch.nonzero(assignments == cluster_idx, as_tuple=False).flatten()
+        n = token_idx.numel()
+        if n:
+            pack_index[cluster_idx, :n] = token_idx
+            flat_gather[token_idx] = cluster_idx * max_count + torch.arange(
+                n,
+                device=assignments.device,
+                dtype=torch.long,
+            )
+    return pack_index.contiguous(), flat_gather.contiguous(), counts, max_count
+
+
+def cluster_pool_ffn_forward_preindexed(
+    x: torch.Tensor,
+    pack_index: torch.Tensor,
+    flat_gather: torch.Tensor,
+    wup_pool: torch.Tensor,
+    wgate_pool: torch.Tensor,
+    wdown_pool: torch.Tensor,
+) -> torch.Tensor:
+    """Differentiable packed cluster-pool FFN for training benchmarks.
+
+    This uses only PyTorch tensor ops (`index_select` + `bmm` + `index_select`)
+    and supports autograd. It is the forward/backward benchmark shape for static
+    cluster pools; custom CUDA can later replace the pack/gather pieces.
+    """
+
+    if x.ndim != 2:
+        raise ValueError("x must have shape [tokens, d_model]")
+    cluster_count, max_count = pack_index.shape
+    x_pad = x.index_select(0, pack_index.reshape(-1)).view(cluster_count, max_count, x.shape[-1])
+    up = torch.bmm(x_pad, wup_pool)
+    gate = torch.bmm(x_pad, wgate_pool)
+    z = up * F.silu(gate)
+    y_pad = torch.bmm(z, wdown_pool)
+    return y_pad.reshape(cluster_count * max_count, x.shape[-1]).index_select(0, flat_gather)
+
+
+def scatter_cluster_pool_grads(
+    candidate_ids: torch.Tensor,
+    wup_pool_grad: torch.Tensor,
+    wgate_pool_grad: torch.Tensor,
+    wdown_pool_grad: torch.Tensor,
+    *,
+    d_ff: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Scatter prepacked pool gradients back into dense FFN row gradients."""
+
+    if candidate_ids.ndim != 2:
+        raise ValueError("candidate_ids must have shape [clusters, candidate_m]")
+    ids = candidate_ids.reshape(-1).to(dtype=torch.long, device=wup_pool_grad.device)
+    d_model = wdown_pool_grad.shape[-1]
+    grad_up = wup_pool_grad.transpose(1, 2).reshape(-1, d_model)
+    grad_gate = wgate_pool_grad.transpose(1, 2).reshape(-1, d_model)
+    grad_down = wdown_pool_grad.reshape(-1, d_model)
+    dense_up = torch.zeros(d_ff, d_model, device=wup_pool_grad.device, dtype=wup_pool_grad.dtype)
+    dense_gate = torch.zeros_like(dense_up)
+    dense_down = torch.zeros_like(dense_up)
+    dense_up.index_add_(0, ids, grad_up)
+    dense_gate.index_add_(0, ids, grad_gate)
+    dense_down.index_add_(0, ids, grad_down)
+    return dense_up, dense_gate, dense_down
+
+
 def cluster_pool_ffn_forward_from_assignments(
     x: torch.Tensor,
     assignments: torch.Tensor,

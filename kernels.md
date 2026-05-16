@@ -178,6 +178,234 @@ combines slot assignment, pack, three grouped GEMMs, and gather with less launch
 overhead. The current code is the first non-notebook implementation of the
 right execution shape.
 
+Static/precomputed pool quality is now tested with:
+
+```bash
+uv run rte deferred-neuron-static-cluster-pool-oracle \
+  --config configs/proof_filter_depth4_dense.yaml \
+  --dense-checkpoint runs/proof_d4_dense/checkpoint.pt \
+  --calibration-tokens 8192 32768 65536 \
+  --clusters 8 16 \
+  --candidate-m 192 \
+  --ranks 64
+```
+
+This command moves candidate-pool planning out of the hot path:
+
+```text
+offline/train-stream calibration:
+  dense hidden states per layer
+  → SVD selector features
+  → fixed cluster centroids
+  → fixed candidate pools per layer/cluster
+
+held-out eval/hot shape:
+  token hidden
+  → cheap route to fixed centroid
+  → use precomputed pool
+  → cluster-pool FFN
+```
+
+The first 65,536-token Mac eval showed that global `C=1` pools are not viable,
+but static `C=16, M=192` pools hold quality:
+
+```text
+dense:                         3.087743
+dynamic C16 M192:              3.103140
+static C16 M192, calib 8k:     3.107310
+static C16 M192, calib 32k:    3.107661
+static C16 M192, calib 65k:    3.107783
+```
+
+So the next CUDA target is not dynamic pool planning. It is fixed/slow-refresh
+codebook execution with cheap routing and packed cluster GEMMs.
+
+Training-side diagnostics now exist:
+
+```bash
+uv run rte benchmark-static-cluster-pool-ffn-train \
+  --size 2048x8192x1024 \
+  --clusters 16 \
+  --candidate-m 192
+
+uv run rte static-cluster-pool-staleness \
+  --config configs/proof_filter_depth4_dense.yaml \
+  --dense-checkpoint runs/proof_d4_dense/checkpoint.pt \
+  --calibration-tokens 8192 \
+  --clusters 16 \
+  --candidate-m 192 \
+  --perturb-pct 0 0.1 0.5 1 2 5
+```
+
+`benchmark-static-cluster-pool-ffn-train` uses the differentiable static
+pack/GEMM/gather path:
+
+```text
+precomputed assignments
+→ precomputed pack/gather indices
+→ index_select pack
+→ batched up/gate/down GEMMs
+→ index_select gather
+→ backward
+→ gradient scatter from cluster pools back to dense FFN rows
+```
+
+The full-pool gradient check verifies output and gradients match dense exactly
+when `M = d_ff`. On Mac/MPS smoke sizes, forward/backward is faster than dense,
+but gradient scatter is currently a major tax. The CUDA follow-up is therefore
+not another math change; it is a fused/persistent gradient scatter-add kernel or
+a training parameterization that treats cluster pools as the trainable weights
+and refreshes/merges periodically.
+
+The first staleness smoke on 16k eval tokens showed stale pools barely moved
+under synthetic FFN perturbations up to 5% RMS noise:
+
+```text
+perturb  stale NLL   refreshed NLL   stale recall
+0.0%     2.97147     2.97147         0.96489
+0.5%     2.97127     2.97119         0.96487
+1.0%     2.97158     2.97208         0.96489
+2.0%     2.97153     2.97280         0.96485
+5.0%     2.97204     2.97387         0.96480
+```
+
+This is a short smoke, not the final training answer, but it says the fixed
+codebook is not immediately fragile.
+
+Static-pool continuation diagnostics now exist too:
+
+```bash
+uv run rte static-cluster-pool-continuation \
+  --config configs/proof_filter_depth4_exact_teacher.yaml \
+  --dense-checkpoint runs/proof_d4_dense/checkpoint.pt \
+  --steps 50 \
+  --lr 0.0001 \
+  --weight-decay 0.0 \
+  --resume-optimizer-state \
+  --eval-batches 8 \
+  --calibration-tokens 8192 \
+  --clusters 16 \
+  --candidate-m 192 \
+  --refresh-intervals 0 50
+```
+
+This command starts from the dense checkpoint, replaces only the FFNs with
+`StaticClusterPoolSwiGLU`, keeps dense attention/head intact, and trains the
+sparse FFN path through the original dense FFN row weights. Candidate pools are
+static unless a positive refresh interval is requested. A bounded 20-step Mac
+run on 8,192 eval tokens produced:
+
+```text
+variant                 initial NLL   final NLL   train tokens
+dense continuation       3.00750       3.03713     40,960
+static C16 M192          3.02818       3.04981     40,960
+static C16 M192 refresh  3.02818       3.05132     40,960
+```
+
+The short run did not show refresh helping; that is consistent with the
+staleness smoke. The important CUDA-side training issue remains the same:
+forward/backward through packed cluster GEMMs is fine, but packing/gather and
+duplicate-row gradient handling need fused kernels or a pool-native optimizer.
+
+The dense checkpoint includes AdamW optimizer state, so the cleaner
+continuation setup resumes it and uses a lower LR with no decay. A 50-step
+65,536-token eval run produced:
+
+```text
+variant                 initial NLL   final NLL   gap vs dense
+dense continuation       3.08774       3.00059     -
+static C16 M192          3.10731       3.01401     +0.01342
+static C16 M192 refresh  3.10731       3.01362     +0.01303
+```
+
+The initial sparse gap was `+0.01957`, so the gap shrank during the clean
+continuation run. This does not prove long-run training yet, but it clears the
+first trainability gate.
+
+There is also a local gradient-alignment diagnostic:
+
+```bash
+uv run rte static-cluster-pool-gradient-alignment \
+  --config configs/proof_filter_depth4_exact_teacher.yaml \
+  --dense-checkpoint runs/proof_d4_dense/checkpoint.pt \
+  --batch-size 32 \
+  --eval-batches 1 \
+  --calibration-tokens 8192 \
+  --clusters 16 \
+  --candidate-m 192
+```
+
+For `C16 M192`, the one-batch mean results were:
+
+```text
+FFN output cosine:       0.99712
+FFN input-grad cosine:   0.98696
+W_up row-grad cosine:    0.97558
+W_gate row-grad cosine:  0.97826
+W_down row-grad cosine:  0.99049
+```
+
+So the sparse FFN path is not merely forward-close; it sends fairly aligned
+gradients to the FFN input and selected dense rows.
+
+The 300-step stability run used the same clean setup:
+
+```bash
+uv run rte static-cluster-pool-continuation \
+  --config configs/proof_filter_depth4_exact_teacher.yaml \
+  --dense-checkpoint runs/proof_d4_dense/checkpoint.pt \
+  --steps 300 \
+  --lr 0.0001 \
+  --weight-decay 0.0 \
+  --resume-optimizer-state \
+  --eval-batches 8 \
+  --eval-steps 0 50 100 200 300 \
+  --calibration-tokens 8192 \
+  --clusters 16 \
+  --candidate-m 192 \
+  --refresh-intervals 0 100 50
+```
+
+Result:
+
+```text
+variant         step 0    step 50   step 100  step 200  step 300  final gap
+dense           3.08774   3.00059   3.01334   2.97915   2.95914   -
+static          3.10731   3.01401   3.02470   2.98917   2.96843   +0.00929
+refresh@100     3.10731   3.01401   3.02554   2.99107   2.96947   +0.01033
+refresh@50      3.10731   3.01362   3.02600   2.99001   2.96960   +0.01046
+```
+
+The initial sparse gap was `+0.01957`, so all three sparse variants passed the
+300-step gap gate and no-refresh was slightly best. Coverage stayed nearly
+complete:
+
+```text
+unique selected neurons/layer: ~255.8 / 256
+coverage fraction:             ~0.9993
+dead selected rows/layer:       ~0.18-0.36
+```
+
+Input-gradient alignment remained stable:
+
+```text
+initial input-grad cosine: ~0.9868-0.9870
+final input-grad cosine:   ~0.9855-0.9860
+```
+
+Current MPS forward/backward benchmark:
+
+```text
+shape                 dense fwd+bwd   sparse fwd+bwd   +grad scatter   speedup fwd+bwd   speedup with scatter
+d=512,H=2048,N=1024   8.76 ms         1.95 ms          4.24 ms         4.50x             2.06x
+d=2048,H=8192,N=1024  116.30 ms       7.86 ms          22.64 ms        14.80x            5.14x
+```
+
+The `d=2048,H=8192` row passes the first training-speed gate (`>=5x`) even
+including the current unfused gradient scatter. The strong CUDA target remains
+`>=10x` including gradient handling, which likely needs fused scatter-add or
+pool-native optimizer state.
+
 Notebook benchmark variants:
 
 | Variant | Current behavior | What it measures |

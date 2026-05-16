@@ -9,6 +9,12 @@ import torch.nn.functional as F
 
 from recursive_training_engine.config import ModelConfig
 from recursive_training_engine.kernels import optimized as K
+from recursive_training_engine.kernels.cluster_pool_ffn import (
+    build_static_pack_gather_indices,
+    cluster_pool_ffn_forward_preindexed,
+    prepare_cluster_pool_weights,
+    route_to_static_centers,
+)
 from recursive_training_engine.kernels.svd_sparse_ffn_triton import triton_svd_sparse_ffn_forward
 from recursive_training_engine.recipes import RecipeBank, RecipeSpec, spec_from_factors
 
@@ -75,6 +81,110 @@ class DenseSwiGLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         up, gate = self.wug(x).chunk(2, dim=-1)
         return self.wd(up * F.silu(gate))
+
+
+class StaticClusterPoolSwiGLU(nn.Module):
+    """Static cluster-pool sparse SwiGLU FFN.
+
+    Candidate pools and routing centers are built offline from calibration
+    tokens. The hot forward only routes tokens to fixed centers, packs by
+    cluster, and executes pooled GEMMs. The dense weights remain the trainable
+    source of truth, so candidate pool refreshes can re-index the current FFN.
+    """
+
+    def __init__(
+        self,
+        dense: DenseSwiGLU,
+        factors: dict[str, torch.Tensor],
+        codebook: dict[str, torch.Tensor],
+        *,
+        rank: int,
+        sparse_enabled: bool = True,
+    ):
+        super().__init__()
+        self.wug = nn.Linear(dense.wug.in_features, dense.wug.out_features, bias=False)
+        self.wd = nn.Linear(dense.wd.in_features, dense.wd.out_features, bias=False)
+        self.wug.load_state_dict(dense.wug.state_dict())
+        self.wd.load_state_dict(dense.wd.state_dict())
+        self.rank = int(rank)
+        self.sparse_enabled = bool(sparse_enabled)
+        d_model = dense.wug.in_features
+        self.register_buffer("up_a", torch.empty(d_model, 0), persistent=False)
+        self.register_buffer("gate_a", torch.empty(d_model, 0), persistent=False)
+        self.register_buffer("centers", torch.empty(0, 0), persistent=False)
+        self.register_buffer("candidate_ids", torch.empty(0, 0, dtype=torch.long), persistent=False)
+        self.update_codebook(factors, codebook, rank=rank)
+
+    @torch.no_grad()
+    def update_codebook(
+        self,
+        factors: dict[str, torch.Tensor],
+        codebook: dict[str, torch.Tensor],
+        *,
+        rank: int | None = None,
+    ) -> None:
+        if rank is not None:
+            self.rank = int(rank)
+        rank = min(
+            max(1, self.rank),
+            int(factors["up_a"].shape[1]),
+            int(factors["gate_a"].shape[1]),
+        )
+        self.rank = rank
+        self.up_a = factors["up_a"][:, :rank].detach().to(
+            device=self.wug.weight.device,
+            dtype=self.wug.weight.dtype,
+        )
+        self.gate_a = factors["gate_a"][:, :rank].detach().to(
+            device=self.wug.weight.device,
+            dtype=self.wug.weight.dtype,
+        )
+        self.centers = codebook["centers"].detach().to(
+            device=self.wug.weight.device,
+            dtype=self.wug.weight.dtype,
+        )
+        self.candidate_ids = codebook["candidate_ids"].detach().to(
+            device=self.wug.weight.device,
+            dtype=torch.long,
+        )
+
+    def dense_forward(self, x: torch.Tensor) -> torch.Tensor:
+        up, gate = self.wug(x).chunk(2, dim=-1)
+        return self.wd(up * F.silu(gate))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.sparse_enabled:
+            return self.dense_forward(x)
+        if self.candidate_ids.numel() == 0:
+            raise RuntimeError("StaticClusterPoolSwiGLU has no candidate pool")
+        original_shape = x.shape[:-1]
+        flat = x.reshape(-1, x.shape[-1])
+        assignments = route_to_static_centers(
+            flat,
+            self.up_a[:, : self.rank],
+            self.gate_a[:, : self.rank],
+            self.centers,
+        )
+        pack_index, flat_gather, _, _ = build_static_pack_gather_indices(
+            assignments,
+            cluster_count=int(self.candidate_ids.shape[0]),
+        )
+        up_weight, gate_weight = self.wug.weight.chunk(2, dim=0)
+        wup_pool, wgate_pool, wdown_pool = prepare_cluster_pool_weights(
+            up_weight,
+            gate_weight,
+            self.wd.weight.t().contiguous(),
+            self.candidate_ids,
+        )
+        out = cluster_pool_ffn_forward_preindexed(
+            flat,
+            pack_index,
+            flat_gather,
+            wup_pool,
+            wgate_pool,
+            wdown_pool,
+        )
+        return out.view(*original_shape, -1)
 
 
 class SVDFactorSparseFFN(nn.Module):
