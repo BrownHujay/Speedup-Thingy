@@ -1,7 +1,8 @@
 # Kernel Notes
 
-This file tracks the current fused/kernel-shaped paths in the project and the
-CUDA/Triton kernels that should replace PyTorch fallback prototypes later.
+This file tracks fused/kernel-shaped paths in the project. It records the
+actual runtime shape, measured bottleneck, and the CUDA/Triton substitution for
+places where the local MPS/PyTorch path is only a prototype.
 
 ## Current Runtime Kernel Wrappers
 
@@ -32,8 +33,8 @@ replace the same call sites with Triton/CUDA kernels.
 ## New FFN Prototype: `SVDFactorSparseFFN`
 
 The new hot-path prototype lives in `src/recursive_training_engine/layers.py`.
-It is intentionally still a PyTorch implementation, but its stages correspond
-to kernels we should write once the math is locked.
+It is a PyTorch implementation whose stages map directly onto the CUDA/Triton
+kernel boundaries below.
 
 An optional MLX fused-graph version lives in
 `src/recursive_training_engine/mlx_svd_ffn.py`. It compiles the fixed-slot SVD
@@ -136,7 +137,7 @@ CUDA/Triton kernel target:
 | `k_cluster_assign` | Assign tokens to a small number of clusters from SVD selector features. | One block per token or tiled GEMM/argmax over cluster centers. |
 | `k_cluster_score_reduce` | Aggregate up/gate/product scores into one pool score per cluster/neuron. | Reduction over tokens grouped by cluster; can be approximate/top-heavy. |
 | `k_cluster_pool_gemm` | Execute `X_cluster @ W_up_pool`, `X_cluster @ W_gate_pool`, and `Z @ W_down_pool`. | Grouped GEMM over clusters, the GPU-friendly replacement for per-token row gather. |
-| `k_cluster_scatter` | Write clustered FFN outputs back to original token order. | Lightweight permutation/scatter; should be small relative to GEMMs. |
+| `k_cluster_scatter` | Write clustered FFN outputs back to original token order. | Lightweight permutation/scatter; keep below GEMM time. |
 
 The production-shaped CUDA prototype now lives in
 `src/recursive_training_engine/kernels/cluster_pool_ffn.py` and can be
@@ -217,8 +218,8 @@ static C16 M192, calib 32k:    3.107661
 static C16 M192, calib 65k:    3.107783
 ```
 
-So the next CUDA target is not dynamic pool planning. It is fixed/slow-refresh
-codebook execution with cheap routing and packed cluster GEMMs.
+CUDA target: fixed/slow-refresh codebook execution with cheap routing and
+packed cluster GEMMs. Dynamic pool planning stays out of the hot path.
 
 Training-side diagnostics now exist:
 
@@ -402,9 +403,9 @@ d=2048,H=8192,N=1024  116.30 ms       7.86 ms          22.64 ms        14.80x   
 ```
 
 The `d=2048,H=8192` row passes the first training-speed gate (`>=5x`) even
-including the current unfused gradient scatter. The strong CUDA target remains
-`>=10x` including gradient handling, which likely needs fused scatter-add or
-pool-native optimizer state.
+including the current unfused gradient scatter. The CUDA path for this variant
+is fused scatter-add or pool-native optimizer state; otherwise the GEMM body is
+fast but row updates dominate.
 
 Notebook benchmark variants:
 
@@ -473,53 +474,23 @@ SVD factor activations from the selector GEMMs as runtime activations
 over selected neurons. Exact candidate activation remains available for
 correctness/reference checks via `triton_exact_activation=True`.
 
-### CUDA/Triton Kernels To Build Later
+### Per-Token SVD Sparse FFN Kernel Map
 
-These are the next kernels after the initial Triton forward path.
+This path is retained as a correctness/reference implementation. T4 timing
+showed that per-token dynamic candidate rows are memory/latency bound even when
+individual Triton pieces are fused. The CUDA lesson from this path is: keep
+cuBLAS for low-rank selector GEMMs and avoid per-token unique row sets in the
+training hot path.
 
-1. **Persistent / grouped blockwise SVD selector**
-   - Inputs: token hidden `x`, low-rank factors `A_up/B_up`, `A_gate/B_gate`.
-   - Output: fixed candidate id slots for up, gate, and optional product views.
-   - Initial Triton version exists. Next pass should tune `block_h`, use more
-     persistent tiling, and reduce launch count for the three selector views.
+| Stage | Existing implementation | CUDA mapping |
+| --- | --- | --- |
+| Factor selector | cuBLAS query/score GEMMs plus `torch.topk`. | Keep GEMM-based; do not replace with scalar Triton dot loops. |
+| Candidate activation | Triton candidate kernels or factor-activation shortcut. | Use only for oracle/reference or small candidate diagnostics. |
+| Candidate rerank | Norm/top-k over slots. | Fused with candidate activation when the per-token path is used. |
+| Sparse down projection | Triton `_downsum_kernel`. | Parallel over output channels; still row-gather heavy. |
 
-2. **Fixed-slot candidate union / duplicate handling**
-   - Inputs: top-M id lists from factor views.
-   - Output: candidate slot table plus optional validity mask.
-   - Initial duplicate suppression happens in the candidate activation kernel.
-     Later kernels can suppress earlier if recomputation becomes measurable.
-
-3. **More fused sparse SwiGLU candidate activation**
-   - Inputs: `x`, candidate ids, `W_up`, `W_gate`.
-   - Output: exact candidate activations `z_j = (x·W_up_j) * silu(x·W_gate_j)`.
-   - Initial Triton version exists. Next pass should tune candidate blocking,
-     vector widths, and FP16/BF16 accumulation tradeoffs.
-
-4. **Fused candidate rerank**
-   - Inputs: candidate `z_j`, `||W_down_j||`, optional candidate validity.
-   - Output: selected top-k candidate ids and activations.
-   - Start with contribution-norm rerank. OMP is an oracle/training target, not
-     a first hot-path kernel.
-
-5. **Fused sparse down projection**
-   - Inputs: selected ids, selected activations, `W_down`.
-   - Output: FFN residual.
-   - Accumulate `sum_j z_j * W_down_j` per token directly.
-
-6. **Single fused SVD sparse FFN / fewer launches**
-   - Combines candidate activation, rerank, and down projection. The selector
-     may remain a separate kernel if top-M over `d_ff` is the dominant stage.
-   - Initial Triton forward currently uses several kernels plus cuBLAS query
-     GEMMs. A production path should reduce launch count and keep intermediate
-     ids/scores in compact buffers.
-   - MLX custom Metal serial-token prototype now exists. It proves whole-path
-     custom Metal correctness, but it does not expose enough parallelism to be
-     the final fast kernel.
-
-7. **Sparse FFN backward**
-   - Needed once continuation training uses this path.
-   - Only selected/candidate rows receive gradients on the sparse path; coverage
-     or dense-audit updates may be separate.
+The training path moved away from this shape toward cluster pools and active
+union because those recover large GEMMs.
 
 ## Current Quality/Speed Status
 
@@ -531,16 +502,15 @@ These are the next kernels after the initial Triton forward path.
     speedup ~`0.49x`.
 - MLX graph backend:
   - Added as optional `metal` extra and `benchmark-mlx-svd-sparse-ffn`.
-  - This is the best Mac-side place to test whole-path graph fusion, but it is
-    not a substitute for a hand-written Metal/CUDA kernel if gather/topk remains
-    dominant.
+  - Mac-side whole-path graph fusion still exposes gather/topk as the dominant
+    bottleneck.
   - Switching top-M selection from full sort to `argpartition` improved the
     `2048x8192x16` MLX prototype from ~`0.73x` dense speed to ~`0.84x` dense
     speed, still short of the estimated ~`26.5x` math speedup.
 - MLX custom Metal backend:
   - Added as `benchmark-mlx-svd-sparse-ffn --backend metal`.
-  - Current kernel fuses the whole forward but is serial per token. The next
-    Metal/CUDA step is a parallel threadgroup design that splits candidate
+  - Current kernel fuses the whole forward but is serial per token.
+  - CUDA/Metal mapping: parallel threadgroup design splitting candidate
     activation and down projection across lanes/warps.
 - MLX hybrid parallel backend:
   - Added as `benchmark-mlx-svd-sparse-ffn --backend hybrid` or `--backend parallel`.
@@ -555,13 +525,13 @@ These are the next kernels after the initial Triton forward path.
     max diff vs MLX eager oracle `4.77e-7`.
 - Interpretation:
   - The algorithm is viable.
-  - The current implementation is a correctness prototype.
-  - Real speed needs packed/fused Metal/CUDA/Triton kernels, not more
-    architecture tuning.
+  - The measured bottleneck is implementation shape, not architecture quality.
+  - Packed/fused Metal/CUDA/Triton kernels are the speed path; more architecture
+    tuning is not the answer for this specific slowdown.
 
 ## Static Cluster-Pool Union FFN
 
-The `ActiveUnionSwiGLU` path tests the next simplification after static
+The `ActiveUnionSwiGLU` path tests the simplification after static
 cluster-pool training: build the normal `C16 M192` codebook, then use the
 unique union of all candidate neurons in each layer as one global active FFN.
 
@@ -629,29 +599,122 @@ Interpretation:
 
 - The active-union forward shape is GPU-friendly.
 - Backward through indexed master weights is still update/scatter-bound.
-- Packed active trainable weights are dramatically faster and are the right
-  next systems shape if union quality passes at larger `H`.
+- Packed active trainable weights are dramatically faster than indexed master
+  rows and are the active-union training shape used by
+  `--sparse-ffn-kind active_union_packed`.
 - A tiny all-neuron active-union MPS check matched dense forward/backward to
   numerical tolerance (`~1e-8` forward, `~1e-9` grads).
 
-### CUDA/Triton Kernel Wishlist
+### Fair Benchmark Baseline
 
-If union quality passes on larger-H checkpoints, the production kernels should
-be much simpler than per-token sparse retrieval:
+Dense FFN timing must use the same fused SwiGLU projection shape as the model:
 
-1. **Active-union forward GEMM path**
-   - Input: dense token matrix and per-layer active row ids.
-   - Either gather active rows once per refresh or keep packed active weights.
-   - Runtime uses ordinary large GEMMs, not per-token gather.
+```text
+ug = X @ W_ug.T
+up, gate = split(ug)
+Y = (up * silu(gate)) @ W_down
+```
 
-2. **Packed active-weight backward**
-   - Train `W_up_active`, `W_gate_active`, and `W_down_active` directly.
-   - Avoid per-step scatter into dense master weights.
+The active-union benchmark now reports against this fused dense baseline, not
+against two separate dense `W_up`/`W_gate` launches. Sparse variants report:
 
-3. **Periodic reconcile/sync**
-   - If a dense master must exist, fold packed active weights back only on
-     refresh/audit boundaries, not every optimizer step.
+```text
+indexed fused:      gather active rows from dense W_ug every step
+packed split:       train W_up_active/W_gate_active separately
+packed fused WUG:   train contiguous W_ug_active directly
+```
 
-4. **Optional fused active optimizer**
-   - Pool/union-native AdamW over packed active weights.
-   - This is the likely path to keep the no-scatter speedup during training.
+Use `packed fused WUG` for the active-union training speed path. The indexed
+version is a diagnostic for the scatter/gather tax.
+
+The executable `ActiveUnionSwiGLU` path now also uses one fused active `W_ug`
+projection for up/gate rows instead of two separate active GEMMs. For the
+trainable no-reconcile path, `PackedActiveUnionSwiGLU` stores:
+
+```text
+W_ug_active:   [2M, d]
+W_down_active: [d, M]
+```
+
+This is the FFN-v2 systems shape: no dense-master row gather and no per-step
+reconcile in the hot path. Any reconcile/foldback to dense master weights is a
+separate refresh/audit operation, not part of the default training step.
+
+### Capped Union Quality Gate
+
+`static-cluster-pool-union-eval` can now evaluate capped active unions:
+
+```bash
+rte static-cluster-pool-union-eval ... --union-caps 160 192 256 320
+```
+
+Capping is a quality-changing experiment. It ranks candidate ids only from the
+static cluster codebook frequency/rank, not from eval labels, but it still
+changes which neurons the sparse FFN can use. Keep it behind the notebook flag
+`RUN_UNION_CAP_EVAL` so the uncapped union path remains the clean baseline.
+
+The same command also supports one layer-specific active-size variant:
+
+```bash
+rte static-cluster-pool-union-eval ... --union-layer-caps 192 192 256 256 320 320
+```
+
+This tests the "do not pay max active size in every layer" idea. It is also a
+quality-changing experiment and must remain opt-in.
+
+### Active-Union CUDA Mapping
+
+The active-union path is intentionally GEMM-shaped:
+
+```text
+forward:
+  ug = X @ W_ug_active.T
+  up, gate = split(ug)
+  z = up * silu(gate)
+  y = z @ W_down_active.T
+
+backward:
+  dW_down_active = dY.T @ z
+  dZ = dY @ W_down_active
+  dUp, dGate = swiglu_backward(dZ, up, gate)
+  dW_ug_active = concat(dUp, dGate).T @ X
+  dX = concat(dUp, dGate) @ W_ug_active
+```
+
+`src/recursive_training_engine/kernels/active_swiglu_triton.py` implements the
+packed SwiGLU activation as a custom Triton autograd path. The GEMM pieces stay
+as normal matmuls, while Triton fuses:
+
+```text
+forward:  z = up * silu(gate)
+backward: dUp, dGate = swiglu_backward(dZ, up, gate)
+```
+
+`benchmark-active-union-ffn-train --triton-swiglu-backward` applies that custom
+path to both dense fused `W_ug` and sparse active-union `W_ug_active`, so the
+generic SwiGLU backward optimization is not sparse-only. Whole-model graphing or
+`torch.compile` is a fairness-sensitive runtime setting: apply it to both dense
+and sparse model shells, while packed active rows remain the sparse-specific
+FFN primitive.
+
+### CUDA Graph Benchmark Path
+
+The FFN training benchmarks now have CUDA graph replay enabled by default:
+
+```bash
+rte benchmark-static-cluster-pool-ffn-train ... --cuda-graphs
+rte benchmark-active-union-ffn-train ... --cuda-graphs
+```
+
+Graph capture is applied symmetrically:
+
+```text
+dense fused W_ug forward+backward graph
+sparse static-cluster forward+backward graph
+sparse active-union indexed forward+backward graph
+sparse active-union packed W_ug forward+backward graph
+```
+
+The notebook exposes this as `RUN_CUDA_GRAPHS=True` and reports the dense graph
+time next to the sparse graph time, so graph launch reduction cannot silently
+favor only the sparse path.

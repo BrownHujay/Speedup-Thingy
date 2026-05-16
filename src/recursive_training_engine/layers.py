@@ -238,13 +238,57 @@ class ActiveUnionSwiGLU(nn.Module):
         original_shape = x.shape[:-1]
         flat = x.reshape(-1, x.shape[-1])
         ids = self.active_ids.to(device=flat.device)
-        up_weight, gate_weight = self.wug.weight.chunk(2, dim=0)
-        up = flat @ up_weight.index_select(0, ids).t().contiguous()
-        gate = flat @ gate_weight.index_select(0, ids).t().contiguous()
+        d_ff = self.wd.in_features
+        wug_ids = torch.cat([ids, ids + d_ff], dim=0)
+        ug = flat @ self.wug.weight.index_select(0, wug_ids).t().contiguous()
+        up, gate = ug.chunk(2, dim=-1)
         z = up * F.silu(gate)
         down_rows = self.wd.weight.t().index_select(0, ids).contiguous()
         out = z @ down_rows
         return out.view(*original_shape, -1)
+
+
+class PackedActiveUnionSwiGLU(nn.Module):
+    """Packed trainable active-union SwiGLU FFN.
+
+    This is the systems path for active-union training: selected up/gate rows
+    are stored as one contiguous `W_ug_active` parameter and selected down rows
+    as one contiguous `W_down_active` parameter. There is no dense-master
+    gather or per-step reconcile in the hot path.
+    """
+
+    def __init__(
+        self,
+        dense: DenseSwiGLU,
+        active_ids: torch.Tensor,
+    ):
+        super().__init__()
+        if active_ids.ndim != 1:
+            active_ids = active_ids.reshape(-1)
+        if active_ids.numel() == 0:
+            raise ValueError("packed active union must contain at least one neuron")
+        ids = torch.unique(active_ids.detach().to(device=dense.wug.weight.device, dtype=torch.long), sorted=True)
+        d_model = dense.wug.in_features
+        active_m = int(ids.numel())
+        self.d_ff_total = int(dense.wd.in_features)
+        self.wug_active = nn.Linear(d_model, 2 * active_m, bias=False)
+        self.wd_active = nn.Linear(active_m, d_model, bias=False)
+        self.register_buffer("active_ids", ids, persistent=True)
+        with torch.no_grad():
+            up_weight, gate_weight = dense.wug.weight.detach().chunk(2, dim=0)
+            wug_active = torch.cat(
+                [
+                    up_weight.index_select(0, ids),
+                    gate_weight.index_select(0, ids),
+                ],
+                dim=0,
+            )
+            self.wug_active.weight.copy_(wug_active)
+            self.wd_active.weight.copy_(dense.wd.weight.detach().index_select(1, ids))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        up, gate = self.wug_active(x).chunk(2, dim=-1)
+        return self.wd_active(up * F.silu(gate))
 
 
 class SVDFactorSparseFFN(nn.Module):

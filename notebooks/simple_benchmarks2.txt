@@ -1,0 +1,97 @@
+
+=== final_checkpoint_50_steps.json ===
+dense: 7.734866 -> 7.643829 delta=-0.091037
+static_cluster_sparse_ffn: 7.761720 -> 7.646504 gap 0.026853 -> 0.002675
+  grad cos initial/final: input=0.9115628103415171 / 0.9130745530128479
+  coverage: unique=314.00, fraction=0.1533
+  curve: [(0, 7.76172, 0.026853427290916443), (50, 7.6465, 0.0026746243238449097)]
+static_cluster_sparse_ffn: 7.761720 -> 7.646793 gap 0.026853 -> 0.002964
+  grad cos initial/final: input=0.9130691091219584 / 0.9132778644561768
+  coverage: unique=308.00, fraction=0.1504
+  curve: [(0, 7.76172, 0.026853427290916443), (50, 7.64679, 0.0029640793800354004)]
+
+=== final_checkpoint_300_steps.json ===
+dense: 7.734866 -> 7.635434 delta=-0.099432
+static_cluster_sparse_ffn: 7.761720 -> 7.636778 gap 0.026853 -> 0.001344
+  grad cos initial/final: input=0.9115628103415171 / 0.9166460434595743
+  coverage: unique=314.00, fraction=0.1533
+  curve: [(0, 7.76172, 0.026853427290916443), (50, 7.6465, 0.0026740431785583496), (100, 7.63966, 0.002176940441131592), (200, 7.63738, 0.0018304437398910522), (300, 7.63678, 0.0013443827629089355)]
+static_cluster_sparse_ffn: 7.761720 -> 7.636905 gap 0.026853 -> 0.001471
+  grad cos initial/final: input=0.9123550156752268 / 0.9170957207679749
+  coverage: unique=284.17, fraction=0.1388
+  curve: [(0, 7.76172, 0.026853427290916443), (50, 7.6465, 0.0026753991842269897), (100, 7.63985, 0.002366170287132263), (200, 7.63752, 0.001977384090423584), (300, 7.6369, 0.001470997929573059)]
+static_cluster_sparse_ffn: 7.761720 -> 7.636835 gap 0.026853 -> 0.001401
+  grad cos initial/final: input=0.9130691091219584 / 0.9173830250898997
+  coverage: unique=283.00, fraction=0.1382
+  curve: [(0, 7.76172, 0.026853427290916443), (50, 7.64679, 0.0029600560665130615), (100, 7.63984, 0.002356812357902527), (200, 7.63757, 0.0020188093185424805), (300, 7.63683, 0.0014008283615112305)]
+
+=== early_handoff_step100_300_steps.json ===
+dense: 9.455352 -> 8.219248 delta=-1.236103
+static_cluster_sparse_ffn: 9.618901 -> 8.544064 gap 0.163549 -> 0.324816
+  grad cos initial/final: input=0.9008080710967382 / 0.8938108036915461
+  coverage: unique=314.83, fraction=0.1537
+  curve: [(0, 9.6189, 0.16354906558990479), (50, 9.09682, 0.057715266942977905), (100, 8.87291, 0.06730589270591736), (200, 8.61547, 0.1537667214870453), (300, 8.54406, 0.32481569051742554)]
+
+=== early_handoff_step200_300_steps.json ===
+dense: 7.764108 -> 7.642293 delta=-0.121815
+static_cluster_sparse_ffn: 7.839724 -> 7.644519 gap 0.075616 -> 0.002227
+  grad cos initial/final: input=0.9072555899620056 / 0.9145833055178324
+  coverage: unique=316.33, fraction=0.1545
+  curve: [(0, 7.83972, 0.07561551034450531), (50, 7.66564, 0.007043629884719849), (100, 7.65546, 0.004486247897148132), (200, 7.64914, 0.003060445189476013), (300, 7.64452, 0.0022265613079071045)]
+
+=== static_cluster_pool_fwd_bwd_benchmark.json ===
+{
+  "size": "512x2048x1024",
+  "dense_fwd_bwd_ms": 1.374697000028391,
+  "sparse_fwd_bwd_ms": 1.0110125999744923,
+  "scatter_ms": 0.6235454000034224,
+  "speedup_no_scatter": 1.3597229154840151,
+  "speedup_with_scatter": 0.8410206306824016,
+  "peak_memory": null
+}
+{
+  "size": "2048x8192x1024",
+  "dense_fwd_bwd_ms": 15.879482600030315,
+  "sparse_fwd_bwd_ms": 1.9651988000077836,
+  "scatter_ms": 3.2856559999800083,
+  "speedup_no_scatter": 8.080344136159365,
+  "speedup_with_scatter": 3.0241709597582536,
+  "peak_memory": null
+}
+
+=== static_cluster_union_eval_final.json ===
+{
+  "dense_nll": 7.734866142272949,
+  "static_cluster_nll": 7.761720418930054,
+  "global_union_nll": 7.7505980879068375,
+  "union_minus_cluster": -0.011122331023216248,
+  "union_minus_dense": 0.015731945633888245,
+  "avg_active_neurons": 314.0,
+  "avg_active_fraction": 0.1533203125,
+  "union_recall": 0.926176905632019,
+  "cluster_recall": 0.8639072974522909
+}
+
+=== active_union_fwd_bwd_benchmark.json ===
+{
+  "size": "512x2048x1024",
+  "active_m": 320,
+  "active_fraction": 0.15625,
+  "indexed_fwd_speedup": 2.3316766930531405,
+  "indexed_fwd_bwd_speedup": 1.2176545678974136,
+  "packed_fwd_speedup": 3.7741166122832883,
+  "packed_fwd_bwd_speedup": 1.5718400422158045,
+  "max_indexed_packed_abs_diff": 0.0
+}
+{
+  "size": "2048x8192x1024",
+  "active_m": 320,
+  "active_fraction": 0.0390625,
+  "indexed_fwd_speedup": 10.450582477409093,
+  "indexed_fwd_bwd_speedup": 7.031215706305154,
+  "packed_fwd_speedup": 12.229714756107327,
+  "packed_fwd_bwd_speedup": 11.029637777745764,
+  "max_indexed_packed_abs_diff": 0.0
+}
+
+Run root: /content/Speedup-Thingy/runs/colab_static_cluster_ffn_d256_h2048_20260516_014214
