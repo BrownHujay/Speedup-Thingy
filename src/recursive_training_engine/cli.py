@@ -8029,8 +8029,187 @@ def _time_model_train_step(
     }
 
 
+def _event_profile_model_train_step(
+    model: DenseModel,
+    tokens: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    lr: float,
+    weight_decay: float,
+    device: torch.device,
+    iters: int,
+    warmup: int,
+) -> dict[str, Any]:
+    """CUDA-event component profile for one full model train step.
+
+    Forward ranges are timed directly. Backward ranges are timed with tensor
+    hooks on each segment boundary: the output-gradient hook starts the range,
+    and the input-gradient hook ends it. This gives a much cleaner answer than
+    sync-heavy forward-only component timers.
+    """
+
+    if device.type != "cuda":
+        return {"available": False, "reason": f"CUDA events require cuda, got {device}"}
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    model.train()
+
+    def event_pair() -> tuple[torch.cuda.Event, torch.cuda.Event]:
+        return torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+
+    def run_once(measure: bool) -> tuple[dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]], float]:
+        pairs: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {
+            "embedding_forward": [],
+            "attention_forward": [],
+            "ffn_forward": [],
+            "output_head_forward": [],
+            "attention_backward": [],
+            "ffn_backward": [],
+            "output_head_backward": [],
+            "optimizer": [],
+            "total_step": [],
+        }
+
+        def timed_forward(name: str, fn):
+            if measure:
+                start, end = event_pair()
+                torch.cuda.nvtx.range_push(name)
+                start.record()
+                out = fn()
+                end.record()
+                torch.cuda.nvtx.range_pop()
+                pairs[name].append((start, end))
+                return out
+            return fn()
+
+        def add_backward_segment(name: str, input_tensor: torch.Tensor, output_tensor: torch.Tensor) -> None:
+            if not measure:
+                return
+            start, end = event_pair()
+
+            def start_hook(grad):
+                torch.cuda.nvtx.range_push(name)
+                start.record()
+                return grad
+
+            def end_hook(grad):
+                end.record()
+                torch.cuda.nvtx.range_pop()
+                return grad
+
+            output_tensor.register_hook(start_hook)
+            input_tensor.register_hook(end_hook)
+            pairs[name].append((start, end))
+
+        total_start = total_end = None
+        if measure:
+            total_start, total_end = event_pair()
+            total_start.record()
+        optimizer.zero_grad(set_to_none=True)
+        x = timed_forward("embedding_forward", lambda: model.embed(tokens))
+        for block in model.blocks:
+            x_in = x
+            u = timed_forward("attention_forward", lambda block=block, x_in=x_in: x_in + block.attn(block.norm1(x_in)))
+            add_backward_segment("attention_backward", x_in, u)
+            x_out = timed_forward("ffn_forward", lambda block=block, u=u: u + block.mlp(block.norm2(u)))
+            add_backward_segment("ffn_backward", u, x_out)
+            x = x_out
+        if measure:
+            oh_fwd_start, oh_fwd_end = event_pair()
+            torch.cuda.nvtx.range_push("output_head_forward")
+            oh_fwd_start.record()
+        hidden = model.final_norm(x)
+        logits = hidden @ model.vocab_weight.t()
+        loss_per_sample = lm_loss_per_sample(logits, targets)
+        loss = loss_per_sample.mean() / float(targets.shape[1])
+        if measure:
+            oh_fwd_end.record()
+            torch.cuda.nvtx.range_pop()
+            pairs["output_head_forward"].append((oh_fwd_start, oh_fwd_end))
+        out_start = out_end = None
+        if measure:
+            out_start, out_end = event_pair()
+
+            def output_head_end_hook(grad):
+                assert out_end is not None
+                out_end.record()
+                torch.cuda.nvtx.range_pop()
+                return grad
+
+            hidden.register_hook(output_head_end_hook)
+        if measure:
+            assert out_start is not None and out_end is not None
+            torch.cuda.nvtx.range_push("output_head_backward")
+            out_start.record()
+            pairs["output_head_backward"].append((out_start, out_end))
+        loss.backward()
+        if measure:
+            opt_start, opt_end = event_pair()
+            torch.cuda.nvtx.range_push("optimizer")
+            opt_start.record()
+            optimizer.step()
+            opt_end.record()
+            torch.cuda.nvtx.range_pop()
+            pairs["optimizer"].append((opt_start, opt_end))
+            assert total_start is not None and total_end is not None
+            total_end.record()
+            pairs["total_step"].append((total_start, total_end))
+        else:
+            optimizer.step()
+        return pairs, float(loss.detach().float().cpu())
+
+    for _ in range(max(0, int(warmup))):
+        run_once(False)
+    totals: dict[str, float] = {}
+    losses: list[float] = []
+    for _ in range(max(1, int(iters))):
+        pairs, loss_value = run_once(True)
+        losses.append(loss_value)
+        torch.cuda.synchronize()
+        for key, ranges in pairs.items():
+            totals[key] = totals.get(key, 0.0) + sum(start.elapsed_time(end) for start, end in ranges)
+    denom = float(max(1, int(iters)))
+    avg = {f"{key}_ms": value / denom for key, value in totals.items()}
+    known = (
+        avg.get("embedding_forward_ms", 0.0)
+        + avg.get("attention_forward_ms", 0.0)
+        + avg.get("attention_backward_ms", 0.0)
+        + avg.get("ffn_forward_ms", 0.0)
+        + avg.get("ffn_backward_ms", 0.0)
+        + avg.get("output_head_forward_ms", 0.0)
+        + avg.get("output_head_backward_ms", 0.0)
+        + avg.get("optimizer_ms", 0.0)
+    )
+    total = avg.get("total_step_ms", 0.0)
+    avg["attention_forward_backward_ms"] = avg.get("attention_forward_ms", 0.0) + avg.get(
+        "attention_backward_ms",
+        0.0,
+    )
+    avg["ffn_forward_backward_ms"] = avg.get("ffn_forward_ms", 0.0) + avg.get("ffn_backward_ms", 0.0)
+    avg["output_head_forward_backward_ms"] = avg.get("output_head_forward_ms", 0.0) + avg.get(
+        "output_head_backward_ms",
+        0.0,
+    )
+    avg["misc_overhead_ms"] = total - known
+    avg["loss"] = sum(losses) / max(len(losses), 1)
+    avg["available"] = True
+    return avg
+
+
 def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> None:
     config = _model_for_mode(load_config(args.config), "dense_exact")
+    model = config.model
+    if args.d_model is not None:
+        model = dataclasses.replace(model, d_model=args.d_model)
+    if args.d_ff is not None:
+        model = dataclasses.replace(model, d_ff=args.d_ff)
+    if args.layers is not None:
+        model = dataclasses.replace(model, n_dense_layers=args.layers)
+    if args.heads is not None:
+        model = dataclasses.replace(model, n_heads=args.heads)
+    if args.vocab_size is not None:
+        model = dataclasses.replace(model, vocab_size=args.vocab_size)
+    config = dataclasses.replace(config, model=dataclasses.replace(model, topology="dense"))
     training = config.training
     if args.batch_size is not None:
         training = dataclasses.replace(training, batch_size=args.batch_size)
@@ -8049,7 +8228,24 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
     caps = [int(value) for value in (args.active_union_cap or [0, 320])]
     rows: list[dict[str, Any]] = []
 
-    dense = _load_dense_model(config, args.dense_checkpoint, device)
+    if not args.random_init and not args.dense_checkpoint:
+        raise SystemExit("--dense-checkpoint is required unless --random-init is set")
+    random_state = None
+    if args.random_init:
+        random_state = copy.deepcopy(
+            DenseModel(dataclasses.replace(config.model, topology="dense")).state_dict()
+        )
+
+    def make_dense_model() -> DenseModel:
+        if args.random_init:
+            model = DenseModel(dataclasses.replace(config.model, topology="dense")).to(device)
+            assert random_state is not None
+            model.load_state_dict(random_state, strict=True)
+            return model
+        assert args.dense_checkpoint is not None
+        return _load_dense_model(config, args.dense_checkpoint, device)
+
+    dense = make_dense_model()
     if args.pack_dense_ffn:
         _pack_dense_ffns_for_benchmark(dense)
     dense.to(dtype=dtype)
@@ -8072,13 +8268,23 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
         iters=args.iters,
         warmup=args.warmup,
     )
+    dense_event_profile = _event_profile_model_train_step(
+        dense,
+        tokens,
+        targets,
+        lr=args.lr if args.lr is not None else config.training.lr,
+        weight_decay=args.weight_decay if args.weight_decay is not None else config.training.weight_decay,
+        device=device,
+        iters=args.event_iters,
+        warmup=args.event_warmup,
+    ) if args.event_profile else {}
     dense_param_count_value = sum(param.numel() for param in dense.parameters())
     del dense
     if device.type == "mps":
         torch.mps.empty_cache()
 
     for cap in caps:
-        sparse = _load_dense_model(config, args.dense_checkpoint, device)
+        sparse = make_dense_model()
         refresh_aux = _refresh_active_union_ffns(
             sparse,
             streams,
@@ -8114,6 +8320,16 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
             iters=args.iters,
             warmup=args.warmup,
         )
+        sparse_event_profile = _event_profile_model_train_step(
+            sparse,
+            tokens,
+            targets,
+            lr=args.lr if args.lr is not None else config.training.lr,
+            weight_decay=args.weight_decay if args.weight_decay is not None else config.training.weight_decay,
+            device=device,
+            iters=args.event_iters,
+            warmup=args.event_warmup,
+        ) if args.event_profile else {}
         coverage = _active_union_coverage_metrics(sparse)
         sparse_param_count_value = sum(param.numel() for param in sparse.parameters())
         row = {
@@ -8155,7 +8371,24 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
             "coverage": coverage,
             "calibration_avg_cluster_imbalance": refresh_aux["calibration_avg_cluster_imbalance"],
             "calibration_avg_nonempty_clusters": refresh_aux["calibration_avg_nonempty_clusters"],
+            "dense_event_profile": dense_event_profile,
+            "sparse_event_profile": sparse_event_profile,
         }
+        if dense_event_profile.get("available") and sparse_event_profile.get("available"):
+            row["event_total_step_speedup"] = dense_event_profile["total_step_ms"] / max(
+                sparse_event_profile["total_step_ms"],
+                1e-12,
+            )
+            row["event_attention_fwd_bwd_speedup"] = dense_event_profile[
+                "attention_forward_backward_ms"
+            ] / max(sparse_event_profile["attention_forward_backward_ms"], 1e-12)
+            row["event_ffn_fwd_bwd_speedup"] = dense_event_profile["ffn_forward_backward_ms"] / max(
+                sparse_event_profile["ffn_forward_backward_ms"],
+                1e-12,
+            )
+            row["event_output_head_fwd_bwd_speedup"] = dense_event_profile[
+                "output_head_forward_backward_ms"
+            ] / max(sparse_event_profile["output_head_forward_backward_ms"], 1e-12)
         rows.append(row)
         del sparse
         if device.type == "mps":
@@ -8164,11 +8397,196 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
     report = {
         "mode": "benchmark_active_union_model_train_step",
         "checkpoint": args.dense_checkpoint,
+        "random_init": bool(args.random_init),
         "device": str(device),
         "iters": args.iters,
         "warmup": args.warmup,
         "component_iters": args.component_iters,
         "component_warmup": args.component_warmup,
+        "event_profile": bool(args.event_profile),
+        "event_iters": args.event_iters,
+        "event_warmup": args.event_warmup,
+        "rows": rows,
+    }
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+    _print_json(report)
+
+
+def _time_cuda_or_wall(
+    device: torch.device,
+    fn,
+    *,
+    iters: int,
+    warmup: int,
+) -> float:
+    for _ in range(max(0, int(warmup))):
+        fn()
+    if device.type == "cuda":
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(max(1, int(iters))):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        return (start.elapsed_time(end) / max(1, int(iters)))
+    _sync_device(device)
+    start_time = time.perf_counter()
+    for _ in range(max(1, int(iters))):
+        fn()
+    _sync_device(device)
+    return ((time.perf_counter() - start_time) / max(1, int(iters))) * 1000.0
+
+
+def _zero_module_grads(*modules: torch.nn.Module) -> None:
+    for module in modules:
+        for param in module.parameters():
+            param.grad = None
+
+
+def _benchmark_block_parts(
+    dense_block: torch.nn.Module,
+    sparse_block: torch.nn.Module,
+    x_base: torch.Tensor,
+    *,
+    device: torch.device,
+    iters: int,
+    warmup: int,
+) -> dict[str, float]:
+    with torch.no_grad():
+        u_base = x_base + dense_block.attn(dense_block.norm1(x_base))
+    u_base = u_base.detach()
+
+    def dense_block_step() -> None:
+        _zero_module_grads(dense_block)
+        x = x_base.detach().clone().requires_grad_(True)
+        y = dense_block(x)
+        y.float().square().mean().backward()
+
+    def sparse_block_step() -> None:
+        _zero_module_grads(sparse_block)
+        x = x_base.detach().clone().requires_grad_(True)
+        y = sparse_block(x)
+        y.float().square().mean().backward()
+
+    def dense_attention_step() -> None:
+        _zero_module_grads(dense_block.norm1, dense_block.attn)
+        x = x_base.detach().clone().requires_grad_(True)
+        y = x + dense_block.attn(dense_block.norm1(x))
+        y.float().square().mean().backward()
+
+    def sparse_attention_step() -> None:
+        _zero_module_grads(sparse_block.norm1, sparse_block.attn)
+        x = x_base.detach().clone().requires_grad_(True)
+        y = x + sparse_block.attn(sparse_block.norm1(x))
+        y.float().square().mean().backward()
+
+    def dense_ffn_step() -> None:
+        _zero_module_grads(dense_block.norm2, dense_block.mlp)
+        u = u_base.detach().clone().requires_grad_(True)
+        y = u + dense_block.mlp(dense_block.norm2(u))
+        y.float().square().mean().backward()
+
+    def sparse_ffn_step() -> None:
+        _zero_module_grads(sparse_block.norm2, sparse_block.mlp)
+        u = u_base.detach().clone().requires_grad_(True)
+        y = u + sparse_block.mlp(sparse_block.norm2(u))
+        y.float().square().mean().backward()
+
+    dense_block_ms = _time_cuda_or_wall(device, dense_block_step, iters=iters, warmup=warmup)
+    sparse_block_ms = _time_cuda_or_wall(device, sparse_block_step, iters=iters, warmup=warmup)
+    dense_attn_ms = _time_cuda_or_wall(device, dense_attention_step, iters=iters, warmup=warmup)
+    sparse_attn_ms = _time_cuda_or_wall(device, sparse_attention_step, iters=iters, warmup=warmup)
+    dense_ffn_ms = _time_cuda_or_wall(device, dense_ffn_step, iters=iters, warmup=warmup)
+    sparse_ffn_ms = _time_cuda_or_wall(device, sparse_ffn_step, iters=iters, warmup=warmup)
+    return {
+        "dense_block_forward_backward_ms": dense_block_ms,
+        "sparse_block_forward_backward_ms": sparse_block_ms,
+        "block_forward_backward_speedup": dense_block_ms / max(sparse_block_ms, 1e-12),
+        "dense_attention_forward_backward_ms": dense_attn_ms,
+        "sparse_attention_forward_backward_ms": sparse_attn_ms,
+        "attention_forward_backward_speedup": dense_attn_ms / max(sparse_attn_ms, 1e-12),
+        "dense_ffn_forward_backward_ms": dense_ffn_ms,
+        "sparse_ffn_forward_backward_ms": sparse_ffn_ms,
+        "ffn_forward_backward_speedup": dense_ffn_ms / max(sparse_ffn_ms, 1e-12),
+    }
+
+
+def cmd_benchmark_active_union_block_train_step(args: argparse.Namespace) -> None:
+    config = _model_for_mode(load_config(args.config), "dense_exact")
+    training = config.training
+    if args.batch_size is not None:
+        training = dataclasses.replace(training, batch_size=args.batch_size)
+    if args.seq_len is not None:
+        training = dataclasses.replace(training, seq_len=args.seq_len)
+    config = dataclasses.replace(config, training=training)
+    set_seed(args.seed if args.seed is not None else config.training.seed)
+    device = default_device()
+    dtype = _benchmark_dtype(args.dtype, device)
+    streams = load_token_streams(config.data, config.training, config.model.vocab_size)
+    tokens, _ = next(streams.train_batches(config.training))
+    tokens = tokens.to(device)
+    tokens_per_batch = int(tokens.numel())
+    calibration_batches = max(1, math.ceil(args.calibration_tokens / tokens_per_batch))
+    dense = _load_dense_model(config, args.dense_checkpoint, device)
+    sparse = _load_dense_model(config, args.dense_checkpoint, device)
+    _pack_dense_ffns_for_benchmark(dense)
+    _refresh_active_union_ffns(
+        sparse,
+        streams,
+        config,
+        calibration_batches=calibration_batches,
+        device=device,
+        rank=args.rank,
+        cluster_count=args.clusters,
+        candidate_m=args.candidate_m,
+        score_mode=args.score_mode,
+        aggregation=args.aggregation,
+        cluster_iters=args.cluster_iters,
+        cap=None if args.active_union_cap <= 0 else args.active_union_cap,
+        packed=True,
+    )
+    dense.to(dtype=dtype)
+    sparse.to(dtype=dtype)
+    _set_triton_swiglu_backward(dense, args.triton_swiglu_backward)
+    _set_triton_swiglu_backward(sparse, args.triton_swiglu_backward)
+    layer_indices = args.layers or [0]
+    rows: list[dict[str, Any]] = []
+    for layer_idx in layer_indices:
+        if layer_idx < 0 or layer_idx >= config.model.n_dense_layers:
+            raise SystemExit(f"layer index {layer_idx} out of range for {config.model.n_dense_layers} layers")
+        with torch.no_grad():
+            x = dense.embed(tokens)
+            for idx in range(layer_idx):
+                x = dense.blocks[idx](x)
+            x_base = x.detach()
+        row = _benchmark_block_parts(
+            dense.blocks[layer_idx],
+            sparse.blocks[layer_idx],
+            x_base,
+            device=device,
+            iters=args.iters,
+            warmup=args.warmup,
+        )
+        row.update(
+            {
+                "layer": layer_idx,
+                "active_union_cap": None if args.active_union_cap <= 0 else args.active_union_cap,
+                "dtype": str(dtype),
+                "tokens": tokens_per_batch,
+                "triton_swiglu_backward_used": bool(args.triton_swiglu_backward and triton_swiglu_available()),
+            }
+        )
+        rows.append(row)
+    report = {
+        "mode": "benchmark_active_union_block_train_step",
+        "checkpoint": args.dense_checkpoint,
+        "device": str(device),
+        "iters": args.iters,
+        "warmup": args.warmup,
         "rows": rows,
     }
     if args.output:
@@ -10590,7 +11008,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     active_union_model_bench = sub.add_parser("benchmark-active-union-model-train-step")
     active_union_model_bench.add_argument("--config", required=True)
-    active_union_model_bench.add_argument("--dense-checkpoint", required=True)
+    active_union_model_bench.add_argument("--dense-checkpoint")
+    active_union_model_bench.add_argument("--random-init", action="store_true")
+    active_union_model_bench.add_argument("--d-model", type=int)
+    active_union_model_bench.add_argument("--d-ff", type=int)
+    active_union_model_bench.add_argument("--layers", type=int)
+    active_union_model_bench.add_argument("--heads", type=int)
+    active_union_model_bench.add_argument("--vocab-size", type=int)
     active_union_model_bench.add_argument("--active-union-cap", type=int, nargs="+", default=[0, 320])
     active_union_model_bench.add_argument("--batch-size", type=int)
     active_union_model_bench.add_argument("--seq-len", type=int)
@@ -10608,6 +11032,9 @@ def build_parser() -> argparse.ArgumentParser:
     active_union_model_bench.add_argument("--warmup", type=int, default=1)
     active_union_model_bench.add_argument("--component-iters", type=int, default=3)
     active_union_model_bench.add_argument("--component-warmup", type=int, default=1)
+    active_union_model_bench.add_argument("--event-profile", action=argparse.BooleanOptionalAction, default=True)
+    active_union_model_bench.add_argument("--event-iters", type=int, default=3)
+    active_union_model_bench.add_argument("--event-warmup", type=int, default=1)
     active_union_model_bench.add_argument("--pack-dense-ffn", action=argparse.BooleanOptionalAction, default=True)
     active_union_model_bench.add_argument(
         "--triton-swiglu-backward",
@@ -10618,6 +11045,32 @@ def build_parser() -> argparse.ArgumentParser:
     active_union_model_bench.add_argument("--seed", type=int)
     active_union_model_bench.add_argument("--output")
     active_union_model_bench.set_defaults(func=cmd_benchmark_active_union_model_train_step)
+
+    active_union_block_bench = sub.add_parser("benchmark-active-union-block-train-step")
+    active_union_block_bench.add_argument("--config", required=True)
+    active_union_block_bench.add_argument("--dense-checkpoint", required=True)
+    active_union_block_bench.add_argument("--active-union-cap", type=int, default=192)
+    active_union_block_bench.add_argument("--layers", type=int, nargs="+", default=[0])
+    active_union_block_bench.add_argument("--batch-size", type=int)
+    active_union_block_bench.add_argument("--seq-len", type=int)
+    active_union_block_bench.add_argument("--calibration-tokens", type=int, default=8192)
+    active_union_block_bench.add_argument("--rank", type=int, default=64)
+    active_union_block_bench.add_argument("--clusters", type=int, default=16)
+    active_union_block_bench.add_argument("--candidate-m", type=int, default=192)
+    active_union_block_bench.add_argument("--score-mode", choices=["sum", "upgate", "product"], default="sum")
+    active_union_block_bench.add_argument("--aggregation", choices=["mean", "max"], default="mean")
+    active_union_block_bench.add_argument("--cluster-iters", type=int, default=4)
+    active_union_block_bench.add_argument("--dtype", choices=["fp16", "bf16", "fp32"], default="fp16")
+    active_union_block_bench.add_argument("--iters", type=int, default=10)
+    active_union_block_bench.add_argument("--warmup", type=int, default=3)
+    active_union_block_bench.add_argument(
+        "--triton-swiglu-backward",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    active_union_block_bench.add_argument("--seed", type=int)
+    active_union_block_bench.add_argument("--output")
+    active_union_block_bench.set_defaults(func=cmd_benchmark_active_union_block_train_step)
 
     mlx_svd_bench = sub.add_parser("benchmark-mlx-svd-sparse-ffn")
     mlx_svd_bench.add_argument(
