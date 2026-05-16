@@ -30,7 +30,7 @@ from recursive_training_engine.kernels.cluster_pool_ffn import (
     suggested_cluster_capacity,
     synthetic_cluster_centers,
 )
-from recursive_training_engine.layers import SVDFactorSparseFFN, StaticClusterPoolSwiGLU
+from recursive_training_engine.layers import ActiveUnionSwiGLU, SVDFactorSparseFFN, StaticClusterPoolSwiGLU
 from recursive_training_engine.macro import (
     apply_macro_rms_clamp,
     macro_alignment_metrics,
@@ -2934,7 +2934,14 @@ def _ffn_neuron_svd_cluster_pool_output(
         up = x_cluster @ up_weight.index_select(0, ids).t().contiguous()
         gate = x_cluster @ gate_weight.index_select(0, ids).t().contiguous()
         z = up * F.silu(gate)
-        out.index_copy_(0, token_idx, z @ wd_rows.index_select(0, ids).contiguous())
+        y_cluster = z @ wd_rows.index_select(0, ids).contiguous()
+        if out.device.type == "mps":
+            # MPS does not implement aten::index_copy.out. This path is only
+            # used by local oracle diagnostics; CUDA training kernels use the
+            # packed/preindexed execution path instead.
+            out[token_idx] = y_cluster
+        else:
+            out.index_copy_(0, token_idx, y_cluster)
 
     up, gate = block.mlp.wug(normed).chunk(2, dim=-1)
     exact_scores = (up * F.silu(gate)).reshape(flat.shape[0], hidden).detach().abs() * wd_norm
@@ -4299,7 +4306,14 @@ def _ffn_neuron_static_svd_cluster_pool_output(
         up = x_cluster @ up_weight.index_select(0, ids).t().contiguous()
         gate = x_cluster @ gate_weight.index_select(0, ids).t().contiguous()
         z = up * F.silu(gate)
-        out.index_copy_(0, token_idx, z @ wd_rows.index_select(0, ids).contiguous())
+        y_cluster = z @ wd_rows.index_select(0, ids).contiguous()
+        if out.device.type == "mps":
+            # MPS does not implement aten::index_copy.out. This path is only
+            # used by local oracle diagnostics; CUDA training kernels use the
+            # packed/preindexed execution path instead.
+            out[token_idx] = y_cluster
+        else:
+            out.index_copy_(0, token_idx, y_cluster)
 
     up, gate = block.mlp.wug(normed).chunk(2, dim=-1)
     wd_norm = block.mlp.wd.weight.detach().norm(dim=0).to(device=flat.device, dtype=flat.dtype)
@@ -4378,10 +4392,112 @@ def _svd_static_cluster_pool_full_stack_logits(
     return hidden @ dense.vocab_weight.t(), hidden, aux
 
 
+@torch.no_grad()
+def _ffn_neuron_static_union_output(
+    block: torch.nn.Module,
+    normed: torch.Tensor,
+    codebook: dict[str, torch.Tensor],
+    *,
+    reference_k: int,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Evaluate one FFN using the union of all static cluster candidates."""
+
+    original_shape = normed.shape[:-1]
+    flat = normed.reshape(-1, normed.shape[-1])
+    hidden = block.mlp.wd.in_features
+    reference_k = min(max(1, int(reference_k)), hidden)
+    active_ids = torch.unique(
+        codebook["candidate_ids"].reshape(-1).to(device=flat.device, dtype=torch.long),
+        sorted=True,
+    )
+    up_weight, gate_weight = block.mlp.wug.weight.detach().chunk(2, dim=0)
+    wd_rows = block.mlp.wd.weight.t().contiguous()
+    up = flat @ up_weight.index_select(0, active_ids).t().contiguous()
+    gate = flat @ gate_weight.index_select(0, active_ids).t().contiguous()
+    z = up * F.silu(gate)
+    out = z @ wd_rows.index_select(0, active_ids).contiguous()
+
+    full_up, full_gate = block.mlp.wug(normed).chunk(2, dim=-1)
+    wd_norm = block.mlp.wd.weight.detach().norm(dim=0).to(device=flat.device, dtype=flat.dtype)
+    exact_scores = (full_up * F.silu(full_gate)).reshape(flat.shape[0], hidden).detach().abs() * wd_norm
+    true_ids = torch.topk(exact_scores, k=reference_k, dim=-1).indices
+    union_hits = true_ids.unsqueeze(-1).eq(active_ids.view(1, 1, -1)).any(dim=-1)
+    union_recall = union_hits.float().sum(dim=-1) / max(reference_k, 1)
+    true_score = torch.gather(exact_scores, dim=-1, index=true_ids).sum(dim=-1).clamp_min(1e-12)
+    union_score = exact_scores.index_select(-1, active_ids).sum(dim=-1)
+    return out.view(*original_shape, -1), {
+        "active_size_sum": float(active_ids.numel() * flat.shape[0]),
+        "active_fraction_sum": float(active_ids.numel() / max(hidden, 1)),
+        "union_recall_sum": float(union_recall.sum().detach().cpu()),
+        "union_score_ratio_sum": float((union_score / true_score).sum().detach().cpu()),
+        "selection_count": float(flat.shape[0]),
+        "union_metric_count": 1.0,
+    }
+
+
+@torch.no_grad()
+def _svd_static_union_full_stack_logits(
+    dense: DenseModel,
+    codebook: list[dict[str, torch.Tensor]],
+    tokens: torch.Tensor,
+    *,
+    reference_k: int,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    x = dense.embed(tokens)
+    aux = {
+        "active_size_sum": 0.0,
+        "active_fraction_sum": 0.0,
+        "union_recall_sum": 0.0,
+        "union_score_ratio_sum": 0.0,
+        "selection_count": 0.0,
+        "union_metric_count": 0.0,
+    }
+    for layer_idx, block in enumerate(dense.blocks):
+        u = x + block.attn(block.norm1(x))
+        ffn, layer_aux = _ffn_neuron_static_union_output(
+            block,
+            block.norm2(u),
+            codebook[layer_idx],
+            reference_k=reference_k,
+        )
+        for key in aux:
+            aux[key] += float(layer_aux.get(key, 0.0))
+        x = u + ffn
+    hidden = dense.final_norm(x)
+    return hidden @ dense.vocab_weight.t(), hidden, aux
+
+
 def _iter_static_cluster_pool_mlps(model: DenseModel):
     for block in model.blocks:
         if isinstance(block.mlp, StaticClusterPoolSwiGLU):
             yield block.mlp
+
+
+def _iter_active_union_mlps(model: DenseModel):
+    for block in model.blocks:
+        if isinstance(block.mlp, ActiveUnionSwiGLU):
+            yield block.mlp
+
+
+def _set_active_union_sparse_enabled(model: DenseModel, enabled: bool) -> None:
+    for mlp in _iter_active_union_mlps(model):
+        mlp.sparse_enabled = bool(enabled)
+
+
+def _install_active_union_ffns(model: DenseModel, codebook: list[dict[str, torch.Tensor]]) -> None:
+    for layer_idx, block in enumerate(model.blocks):
+        active_ids = torch.unique(codebook[layer_idx]["candidate_ids"].reshape(-1), sorted=True)
+        if isinstance(block.mlp, ActiveUnionSwiGLU):
+            block.mlp.update_active_ids(active_ids)
+            block.mlp.sparse_enabled = True
+            continue
+        device = block.mlp.wug.weight.device
+        dtype = block.mlp.wug.weight.dtype
+        block.mlp = ActiveUnionSwiGLU(
+            block.mlp,
+            active_ids,
+            sparse_enabled=True,
+        ).to(device=device, dtype=dtype)
 
 
 def _set_static_cluster_pool_sparse_enabled(model: DenseModel, enabled: bool) -> None:
@@ -5604,6 +5720,235 @@ def cmd_deferred_neuron_static_cluster_pool_oracle(args: argparse.Namespace) -> 
         "temperature": args.temperature,
         "attention": "dense",
         "notes": "candidate pools and cluster centers are calibrated once from train stream, then held fixed on eval",
+        "rows": rows,
+    }
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+    _print_json(report)
+
+
+def _finish_union_eval_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
+    tokens = max(int(bucket["tokens"]), 1)
+    samples = max(int(bucket["samples"]), 1)
+    row: dict[str, Any] = {
+        "variant": bucket["variant"],
+        "variant_type": bucket["variant_type"],
+        "nll_per_token": bucket["loss_sum"] / tokens,
+        "kl_to_dense": bucket["kl_sum"] / tokens,
+        "final_hidden_cosine": bucket["final_hidden_cosine_sum"] / samples,
+    }
+    for key in (
+        "calibration_tokens",
+        "rank",
+        "cluster_count",
+        "candidate_m",
+        "reference_k",
+        "score_mode",
+        "aggregation",
+    ):
+        if bucket.get(key) is not None:
+            row[key] = bucket[key]
+    selection_count = max(float(bucket.get("selection_count", 0.0)), 1.0)
+    if bucket.get("selection_count", 0.0):
+        row["avg_active_neurons"] = bucket["active_size_sum"] / selection_count
+        row["union_recall"] = bucket["union_recall_sum"] / selection_count
+        row["union_score_ratio_vs_reference_topk"] = bucket["union_score_ratio_sum"] / selection_count
+    metric_count = max(float(bucket.get("union_metric_count", 0.0)), 1.0)
+    if bucket.get("union_metric_count", 0.0):
+        row["avg_active_fraction"] = bucket["active_fraction_sum"] / metric_count
+    return row
+
+
+def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
+    config = _model_for_mode(load_config(args.config), "dense_exact")
+    if args.batch_size is not None:
+        config = dataclasses.replace(
+            config,
+            training=dataclasses.replace(config.training, batch_size=args.batch_size),
+        )
+    tokens_per_batch = config.training.batch_size * config.training.seq_len
+    calibration_batches = max(1, math.ceil(args.calibration_tokens / tokens_per_batch))
+    actual_calibration_tokens = calibration_batches * tokens_per_batch
+    eval_batches = args.eval_batches
+    if eval_batches is None:
+        eval_batches = max(1, math.ceil(config.data.eval_tokens / tokens_per_batch))
+    set_seed(args.seed if args.seed is not None else config.training.seed)
+    device = default_device()
+    streams = load_token_streams(config.data, config.training, config.model.vocab_size)
+    dense = _load_dense_model(config, args.dense_checkpoint, device)
+    dense.eval()
+    svd_factors = _build_svd_factor_cache(dense, max_rank=args.rank, device=device)
+    codebook, codebook_aux = _build_static_svd_cluster_pool_codebook(
+        dense,
+        svd_factors,
+        streams.train_batches(config.training),
+        calibration_batches=calibration_batches,
+        device=device,
+        rank=args.rank,
+        cluster_count=args.clusters,
+        candidate_m=args.candidate_m,
+        score_mode=args.score_mode,
+        aggregation=args.aggregation,
+        cluster_iters=args.cluster_iters,
+    )
+    buckets: dict[str, dict[str, Any]] = {
+        "dense": {
+            "variant": "dense",
+            "variant_type": "dense",
+            "tokens": 0,
+            "samples": 0,
+            "loss_sum": 0.0,
+            "kl_sum": 0.0,
+            "final_hidden_cosine_sum": 0.0,
+        },
+        "static_cluster": _init_cluster_pool_bucket(
+            "static_cluster",
+            variant_type="static_svd_cluster_pool",
+            rank=args.rank,
+            cluster_count=args.clusters,
+            candidate_m=args.candidate_m,
+            reference_k=args.reference_k,
+            score_mode=args.score_mode,
+            aggregation=args.aggregation,
+            calibration_tokens=actual_calibration_tokens,
+        ),
+        "global_union": {
+            "variant": "global_union",
+            "variant_type": "static_cluster_union",
+            "rank": args.rank,
+            "cluster_count": args.clusters,
+            "candidate_m": args.candidate_m,
+            "reference_k": args.reference_k,
+            "score_mode": args.score_mode,
+            "aggregation": args.aggregation,
+            "calibration_tokens": actual_calibration_tokens,
+            "tokens": 0,
+            "samples": 0,
+            "loss_sum": 0.0,
+            "kl_sum": 0.0,
+            "final_hidden_cosine_sum": 0.0,
+            "active_size_sum": 0.0,
+            "active_fraction_sum": 0.0,
+            "union_recall_sum": 0.0,
+            "union_score_ratio_sum": 0.0,
+            "selection_count": 0.0,
+            "union_metric_count": 0.0,
+        },
+    }
+    batches = streams.eval_batches(config.training)
+    for batch_idx in range(eval_batches):
+        tokens, targets = next(batches)
+        tokens = tokens.to(device)
+        targets = targets.to(device)
+        dense_out = dense(tokens, targets, return_loss_per_sample=True)
+        assert dense_out.logits is not None
+        assert dense_out.loss_per_sample is not None
+        assert dense_out.meta.hidden is not None
+        dense_logits = dense_out.logits
+        dense_hidden = dense_out.meta.hidden
+        dense_logp = F.log_softmax(dense_logits.detach() / args.temperature, dim=-1)
+        target_flat = targets.flatten()
+        token_count = int(targets.numel())
+        sample_count = int(targets.shape[0])
+        dense_bucket = buckets["dense"]
+        dense_bucket["tokens"] += token_count
+        dense_bucket["samples"] += sample_count
+        dense_bucket["loss_sum"] += float(dense_out.loss_per_sample.sum().detach().cpu())
+        dense_bucket["final_hidden_cosine_sum"] += float(sample_count)
+
+        variants = (
+            (
+                "static_cluster",
+                _svd_static_cluster_pool_full_stack_logits(
+                    dense,
+                    svd_factors,
+                    codebook,
+                    tokens,
+                    rank=args.rank,
+                    reference_k=args.reference_k,
+                    profile=False,
+                ),
+            ),
+            (
+                "global_union",
+                _svd_static_union_full_stack_logits(
+                    dense,
+                    codebook,
+                    tokens,
+                    reference_k=args.reference_k,
+                ),
+            ),
+        )
+        for name, (logits, hidden, aux) in variants:
+            bucket = buckets[name]
+            loss = F.cross_entropy(logits.flatten(0, -2), target_flat, reduction="sum")
+            cand_logp = F.log_softmax(logits / args.temperature, dim=-1)
+            kl = (dense_logp.exp() * (dense_logp - cand_logp)).sum(dim=-1).sum() * (
+                args.temperature * args.temperature
+            )
+            final_cos = F.cosine_similarity(
+                hidden.float().flatten(1),
+                dense_hidden.float().flatten(1),
+                dim=-1,
+            ).sum()
+            bucket["tokens"] += token_count
+            bucket["samples"] += sample_count
+            bucket["loss_sum"] += float(loss.detach().cpu())
+            bucket["kl_sum"] += float(kl.detach().cpu())
+            bucket["final_hidden_cosine_sum"] += float(final_cos.detach().cpu())
+            for key in (
+                "candidate_size_sum",
+                "candidate_recall_sum",
+                "score_retention_sum",
+                "selection_count",
+                "cluster_count_sum",
+                "nonempty_cluster_count_sum",
+                "empty_cluster_count_sum",
+                "max_cluster_size_sum",
+                "min_cluster_size_sum",
+                "mean_cluster_size_sum",
+                "cluster_imbalance_sum",
+                "cluster_metric_count",
+                "cluster_pool_ffn_flop_ratio_sum",
+                "active_size_sum",
+                "active_fraction_sum",
+                "union_recall_sum",
+                "union_score_ratio_sum",
+                "union_metric_count",
+            ):
+                if key in bucket:
+                    bucket[key] += float(aux.get(key, 0.0))
+        if device.type == "mps":
+            torch.mps.empty_cache()
+        if args.progress and (batch_idx + 1) % args.progress == 0:
+            print(json.dumps({"event": "static_cluster_pool_union_eval_batch", "batch": batch_idx + 1}))
+    rows = [
+        _finish_cluster_pool_bucket(buckets["dense"]),
+        _finish_cluster_pool_bucket(buckets["static_cluster"]),
+        _finish_union_eval_bucket(buckets["global_union"]),
+    ]
+    for row in rows:
+        row["calibration_avg_nonempty_clusters"] = codebook_aux["calibration_avg_nonempty_clusters"]
+        row["calibration_avg_cluster_imbalance"] = codebook_aux["calibration_avg_cluster_imbalance"]
+    report = {
+        "mode": "static_cluster_pool_union_eval",
+        "checkpoint": args.dense_checkpoint,
+        "eval_batches": eval_batches,
+        "eval_tokens": eval_batches * tokens_per_batch,
+        "requested_eval_tokens": config.data.eval_tokens,
+        "calibration_tokens": actual_calibration_tokens,
+        "rank": args.rank,
+        "clusters": args.clusters,
+        "candidate_m": args.candidate_m,
+        "reference_k": args.reference_k,
+        "score_mode": args.score_mode,
+        "aggregation": args.aggregation,
+        "cluster_iters": args.cluster_iters,
+        "temperature": args.temperature,
+        "attention": "dense",
+        "notes": "global_union uses the unique union of all static cluster-pool candidate ids per layer",
         "rows": rows,
     }
     if args.output:
@@ -6874,6 +7219,142 @@ def cmd_benchmark_static_cluster_pool_ffn_train(args: argparse.Namespace) -> Non
         "iters": args.iters,
         "warmup": args.warmup,
         "grad_check": grad_check,
+        "rows": rows,
+    }
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+    _print_json(report)
+
+
+def cmd_benchmark_active_union_ffn_train(args: argparse.Namespace) -> None:
+    device = default_device()
+    rows: list[dict[str, Any]] = []
+    sizes = args.size or [(512, 2048, 512), (2048, 8192, 128)]
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+    for d_model, d_ff, tokens in sizes:
+        scale = 1.0 / math.sqrt(d_model)
+        active_m = min(int(args.active_m), d_ff)
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(args.seed)
+        ids_cpu = torch.randperm(d_ff, generator=gen)[:active_m]
+        ids = ids_cpu.to(device=device, dtype=torch.long)
+
+        x_dense = torch.randn(tokens, d_model, device=device, dtype=dtype, requires_grad=True)
+        x_indexed = x_dense.detach().clone().requires_grad_()
+        x_packed = x_dense.detach().clone().requires_grad_()
+        w_up = (torch.randn(d_ff, d_model, device=device, dtype=dtype) * scale).requires_grad_()
+        w_gate = (torch.randn(d_ff, d_model, device=device, dtype=dtype) * scale).requires_grad_()
+        w_down = (torch.randn(d_ff, d_model, device=device, dtype=dtype) * scale).requires_grad_()
+        with torch.no_grad():
+            wup_active_init = w_up.index_select(0, ids).detach().clone()
+            wgate_active_init = w_gate.index_select(0, ids).detach().clone()
+            wdown_active_init = w_down.index_select(0, ids).detach().clone()
+        wup_active = wup_active_init.requires_grad_()
+        wgate_active = wgate_active_init.requires_grad_()
+        wdown_active = wdown_active_init.requires_grad_()
+
+        def zero_dense() -> None:
+            for tensor in (x_dense, w_up, w_gate, w_down):
+                tensor.grad = None
+
+        def zero_indexed() -> None:
+            for tensor in (x_indexed, w_up, w_gate, w_down):
+                tensor.grad = None
+
+        def zero_packed() -> None:
+            for tensor in (x_packed, wup_active, wgate_active, wdown_active):
+                tensor.grad = None
+
+        def dense_forward() -> torch.Tensor:
+            return ((x_dense @ w_up.t()) * F.silu(x_dense @ w_gate.t())) @ w_down
+
+        def indexed_forward() -> torch.Tensor:
+            up_w = w_up.index_select(0, ids)
+            gate_w = w_gate.index_select(0, ids)
+            down_w = w_down.index_select(0, ids)
+            return ((x_indexed @ up_w.t()) * F.silu(x_indexed @ gate_w.t())) @ down_w
+
+        def packed_forward() -> torch.Tensor:
+            return ((x_packed @ wup_active.t()) * F.silu(x_packed @ wgate_active.t())) @ wdown_active
+
+        def dense_step() -> torch.Tensor:
+            zero_dense()
+            out = dense_forward()
+            loss = out.square().mean()
+            loss.backward()
+            return loss
+
+        def indexed_step() -> torch.Tensor:
+            zero_indexed()
+            out = indexed_forward()
+            loss = out.square().mean()
+            loss.backward()
+            return loss
+
+        def packed_step() -> torch.Tensor:
+            zero_packed()
+            out = packed_forward()
+            loss = out.square().mean()
+            loss.backward()
+            return loss
+
+        for _ in range(args.warmup):
+            dense_step()
+            indexed_step()
+            packed_step()
+        _sync_device(device)
+
+        def measure(fn) -> float:
+            start = time.perf_counter()
+            for _ in range(args.iters):
+                fn()
+            _sync_device(device)
+            return (time.perf_counter() - start) / max(args.iters, 1)
+
+        dense_fwd_seconds = measure(dense_forward)
+        indexed_fwd_seconds = measure(indexed_forward)
+        packed_fwd_seconds = measure(packed_forward)
+        dense_step_seconds = measure(dense_step)
+        indexed_step_seconds = measure(indexed_step)
+        packed_step_seconds = measure(packed_step)
+        with torch.no_grad():
+            idx_out = indexed_forward()
+            packed_out = packed_forward()
+            max_indexed_packed_abs_diff = float((idx_out - packed_out).abs().max().detach().cpu())
+        rows.append(
+            {
+                "d_model": d_model,
+                "d_ff": d_ff,
+                "tokens": tokens,
+                "active_m": active_m,
+                "active_fraction": active_m / max(d_ff, 1),
+                "dense_forward_ms": dense_fwd_seconds * 1000.0,
+                "active_indexed_forward_ms": indexed_fwd_seconds * 1000.0,
+                "active_packed_forward_ms": packed_fwd_seconds * 1000.0,
+                "dense_forward_backward_ms": dense_step_seconds * 1000.0,
+                "active_indexed_forward_backward_ms": indexed_step_seconds * 1000.0,
+                "active_packed_forward_backward_ms": packed_step_seconds * 1000.0,
+                "active_indexed_forward_speedup": dense_fwd_seconds / max(indexed_fwd_seconds, 1e-12),
+                "active_packed_forward_speedup": dense_fwd_seconds / max(packed_fwd_seconds, 1e-12),
+                "active_indexed_forward_backward_speedup": dense_step_seconds
+                / max(indexed_step_seconds, 1e-12),
+                "active_packed_forward_backward_speedup": dense_step_seconds
+                / max(packed_step_seconds, 1e-12),
+                "max_indexed_packed_abs_diff": max_indexed_packed_abs_diff,
+                "ideal_ffn_flop_ratio": active_m / max(d_ff, 1),
+                "ideal_ffn_math_speedup": d_ff / max(active_m, 1),
+            }
+        )
+        if device.type == "mps":
+            torch.mps.empty_cache()
+    report = {
+        "mode": "benchmark_active_union_ffn_train",
+        "device": str(device),
+        "dtype": str(dtype),
+        "iters": args.iters,
+        "warmup": args.warmup,
         "rows": rows,
     }
     if args.output:
@@ -9055,6 +9536,33 @@ def build_parser() -> argparse.ArgumentParser:
     static_cluster_pool.add_argument("--output")
     static_cluster_pool.set_defaults(func=cmd_deferred_neuron_static_cluster_pool_oracle)
 
+    union_eval = sub.add_parser("static-cluster-pool-union-eval")
+    union_eval.add_argument("--config", required=True)
+    union_eval.add_argument("--dense-checkpoint", required=True)
+    union_eval.add_argument("--eval-batches", type=int)
+    union_eval.add_argument("--batch-size", type=int)
+    union_eval.add_argument("--calibration-tokens", type=int, default=8192)
+    union_eval.add_argument("--rank", type=int, default=64)
+    union_eval.add_argument("--clusters", type=int, default=16)
+    union_eval.add_argument("--candidate-m", type=int, default=192)
+    union_eval.add_argument("--reference-k", type=int, default=64)
+    union_eval.add_argument(
+        "--score-mode",
+        choices=["sum", "upgate", "product"],
+        default="sum",
+    )
+    union_eval.add_argument(
+        "--aggregation",
+        choices=["mean", "max"],
+        default="mean",
+    )
+    union_eval.add_argument("--cluster-iters", type=int, default=4)
+    union_eval.add_argument("--temperature", type=float, default=2.0)
+    union_eval.add_argument("--seed", type=int)
+    union_eval.add_argument("--progress", type=int, default=0)
+    union_eval.add_argument("--output")
+    union_eval.set_defaults(func=cmd_static_cluster_pool_union_eval)
+
     staleness = sub.add_parser("static-cluster-pool-staleness")
     staleness.add_argument("--config", required=True)
     staleness.add_argument("--dense-checkpoint", required=True)
@@ -9196,6 +9704,21 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_pool_train_bench.add_argument("--grad-check-tokens", type=int, default=32)
     cluster_pool_train_bench.add_argument("--output")
     cluster_pool_train_bench.set_defaults(func=cmd_benchmark_static_cluster_pool_ffn_train)
+
+    active_union_train_bench = sub.add_parser("benchmark-active-union-ffn-train")
+    active_union_train_bench.add_argument(
+        "--size",
+        type=_parse_ffn_bench_size,
+        action="append",
+        default=None,
+        help="Benchmark size as d_modelxd_ffxtokens, e.g. 2048x8192x256.",
+    )
+    active_union_train_bench.add_argument("--active-m", type=int, default=320)
+    active_union_train_bench.add_argument("--iters", type=int, default=5)
+    active_union_train_bench.add_argument("--warmup", type=int, default=1)
+    active_union_train_bench.add_argument("--seed", type=int, default=1234)
+    active_union_train_bench.add_argument("--output")
+    active_union_train_bench.set_defaults(func=cmd_benchmark_active_union_ffn_train)
 
     mlx_svd_bench = sub.add_parser("benchmark-mlx-svd-sparse-ffn")
     mlx_svd_bench.add_argument(

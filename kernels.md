@@ -558,3 +558,100 @@ These are the next kernels after the initial Triton forward path.
   - The current implementation is a correctness prototype.
   - Real speed needs packed/fused Metal/CUDA/Triton kernels, not more
     architecture tuning.
+
+## Static Cluster-Pool Union FFN
+
+The `ActiveUnionSwiGLU` path tests the next simplification after static
+cluster-pool training: build the normal `C16 M192` codebook, then use the
+unique union of all candidate neurons in each layer as one global active FFN.
+
+This is **not** the previously failed single global top-M pool. The active set
+is the union of all neurons selected by the cluster pools:
+
+```text
+cluster codebook: C pools × M neurons
+active union:     unique(cluster_candidate_ids)
+hot forward:      X @ W_up[active].T, X @ W_gate[active].T, act @ W_down[active]
+```
+
+### Local MPS Smoke Results
+
+Command:
+
+```bash
+rte static-cluster-pool-union-eval \
+  --config configs/proof_filter_depth4_dense.yaml \
+  --dense-checkpoint runs/proof_d4_dense/checkpoint.pt \
+  --eval-batches 1 \
+  --calibration-tokens 8192 \
+  --rank 64 \
+  --clusters 16 \
+  --candidate-m 192
+```
+
+Results on the small proof model (`d_ff=256`, so the union is nearly dense):
+
+```text
+dense:          3.007499
+static cluster: 3.031404
+global union:   3.007487
+union active:   255.7 / 256 neurons
+```
+
+This validates the union execution math, but it is not a scale-quality proof
+because the small proof model's union covers almost the whole FFN.
+
+### Active Union Forward/Backward Probe
+
+Command:
+
+```bash
+rte benchmark-active-union-ffn-train \
+  --size 512x2048x512 \
+  --size 2048x8192x128 \
+  --active-m 320
+```
+
+MPS results:
+
+```text
+512x2048, active 320:
+  indexed master fwd+bwd: 2.84x dense
+  packed active fwd+bwd:  5.19x dense
+
+2048x8192, active 320:
+  indexed master fwd:     9.25x dense
+  indexed master fwd+bwd: 1.67x dense
+  packed active fwd+bwd:  15.24x dense
+```
+
+Interpretation:
+
+- The active-union forward shape is GPU-friendly.
+- Backward through indexed master weights is still update/scatter-bound.
+- Packed active trainable weights are dramatically faster and are the right
+  next systems shape if union quality passes at larger `H`.
+- A tiny all-neuron active-union MPS check matched dense forward/backward to
+  numerical tolerance (`~1e-8` forward, `~1e-9` grads).
+
+### CUDA/Triton Kernel Wishlist
+
+If union quality passes on larger-H checkpoints, the production kernels should
+be much simpler than per-token sparse retrieval:
+
+1. **Active-union forward GEMM path**
+   - Input: dense token matrix and per-layer active row ids.
+   - Either gather active rows once per refresh or keep packed active weights.
+   - Runtime uses ordinary large GEMMs, not per-token gather.
+
+2. **Packed active-weight backward**
+   - Train `W_up_active`, `W_gate_active`, and `W_down_active` directly.
+   - Avoid per-step scatter into dense master weights.
+
+3. **Periodic reconcile/sync**
+   - If a dense master must exist, fold packed active weights back only on
+     refresh/audit boundaries, not every optimizer step.
+
+4. **Optional fused active optimizer**
+   - Pool/union-native AdamW over packed active weights.
+   - This is the likely path to keep the no-scatter speedup during training.

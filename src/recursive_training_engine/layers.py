@@ -187,6 +187,66 @@ class StaticClusterPoolSwiGLU(nn.Module):
         return out.view(*original_shape, -1)
 
 
+class ActiveUnionSwiGLU(nn.Module):
+    """SwiGLU over the union of static cluster-pool candidate neurons.
+
+    This is the "global union of cluster pools" diagnostic path. It keeps the
+    dense FFN weights as the source of truth, but evaluates only the unique rows
+    requested by the static cluster codebook. Unlike `StaticClusterPoolSwiGLU`,
+    there is no per-token routing or cluster packing in the hot forward:
+
+        X @ W_up[active].T, X @ W_gate[active].T, activation @ W_down[active]
+
+    That makes it a clean systems test for whether the cluster pools' union is
+    good enough to replace clustered execution with one active FFN GEMM.
+    """
+
+    def __init__(
+        self,
+        dense: DenseSwiGLU,
+        active_ids: torch.Tensor,
+        *,
+        sparse_enabled: bool = True,
+    ):
+        super().__init__()
+        self.wug = nn.Linear(dense.wug.in_features, dense.wug.out_features, bias=False)
+        self.wd = nn.Linear(dense.wd.in_features, dense.wd.out_features, bias=False)
+        self.wug.load_state_dict(dense.wug.state_dict())
+        self.wd.load_state_dict(dense.wd.state_dict())
+        self.sparse_enabled = bool(sparse_enabled)
+        self.register_buffer("active_ids", torch.empty(0, dtype=torch.long), persistent=False)
+        self.update_active_ids(active_ids)
+
+    @torch.no_grad()
+    def update_active_ids(self, active_ids: torch.Tensor) -> None:
+        if active_ids.ndim != 1:
+            active_ids = active_ids.reshape(-1)
+        if active_ids.numel() == 0:
+            raise ValueError("active union must contain at least one neuron")
+        active_ids = active_ids.detach().to(device=self.wug.weight.device, dtype=torch.long)
+        self.active_ids = torch.unique(active_ids, sorted=True)
+
+    def dense_forward(self, x: torch.Tensor) -> torch.Tensor:
+        up, gate = self.wug(x).chunk(2, dim=-1)
+        return self.wd(up * F.silu(gate))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.sparse_enabled:
+            return self.dense_forward(x)
+        if self.active_ids.numel() == 0:
+            raise RuntimeError("ActiveUnionSwiGLU has no active neurons")
+        original_shape = x.shape[:-1]
+        flat = x.reshape(-1, x.shape[-1])
+        ids = self.active_ids.to(device=flat.device)
+        up_weight, gate_weight = self.wug.weight.chunk(2, dim=0)
+        up = flat @ up_weight.index_select(0, ids).t().contiguous()
+        gate = flat @ gate_weight.index_select(0, ids).t().contiguous()
+        z = up * F.silu(gate)
+        down_rows = self.wd.weight.t().index_select(0, ids).contiguous()
+        out = z @ down_rows
+        return out.view(*original_shape, -1)
+
+
 class SVDFactorSparseFFN(nn.Module):
     """Token-level sparse SwiGLU FFN with SVD factor candidate retrieval.
 
