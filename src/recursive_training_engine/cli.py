@@ -36,6 +36,7 @@ from recursive_training_engine.kernels.cluster_pool_ffn import (
 )
 from recursive_training_engine.layers import (
     ActiveUnionSwiGLU,
+    PackedDenseSwiGLU,
     PackedActiveUnionSwiGLU,
     SVDFactorSparseFFN,
     StaticClusterPoolSwiGLU,
@@ -4525,6 +4526,24 @@ def _iter_active_union_mlps(model: DenseModel):
             yield block.mlp
 
 
+def _set_triton_swiglu_backward(model: DenseModel, enabled: bool) -> None:
+    use_triton = bool(enabled and triton_swiglu_available())
+    for module in model.modules():
+        if hasattr(module, "use_triton_swiglu_backward"):
+            module.use_triton_swiglu_backward = use_triton
+
+
+def _pack_dense_ffns_for_benchmark(model: DenseModel) -> None:
+    for block in model.blocks:
+        if isinstance(block.mlp, PackedDenseSwiGLU):
+            continue
+        if isinstance(block.mlp, (ActiveUnionSwiGLU, PackedActiveUnionSwiGLU, StaticClusterPoolSwiGLU)):
+            raise RuntimeError("dense benchmark packing expects dense SwiGLU blocks")
+        device = block.mlp.wug.weight.device
+        dtype = block.mlp.wug.weight.dtype
+        block.mlp = PackedDenseSwiGLU(block.mlp).to(device=device, dtype=dtype)
+
+
 def _set_active_union_sparse_enabled(model: DenseModel, enabled: bool) -> None:
     for mlp in _iter_active_union_mlps(model):
         mlp.sparse_enabled = bool(enabled)
@@ -7868,6 +7887,297 @@ def cmd_benchmark_active_union_ffn_train(args: argparse.Namespace) -> None:
     _print_json(report)
 
 
+def _benchmark_dtype(value: str, device: torch.device) -> torch.dtype:
+    normalized = value.lower()
+    if normalized == "fp16":
+        return torch.float16 if device.type == "cuda" else torch.float32
+    if normalized == "bf16":
+        return torch.bfloat16 if device.type == "cuda" else torch.float32
+    if normalized == "fp32":
+        return torch.float32
+    raise ValueError(f"unsupported benchmark dtype: {value}")
+
+
+def _time_model_forward_components(
+    model: DenseModel,
+    tokens: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    device: torch.device,
+    iters: int,
+    warmup: int,
+) -> dict[str, float]:
+    """Forward-only component timing for the full model.
+
+    This is intentionally applied to dense and sparse models through the same
+    hand-unrolled Transformer path. It is a diagnostic split, while the real
+    train-step timing below uses the model's normal forward/backward path.
+    """
+
+    was_training = model.training
+    model.eval()
+
+    def run_once() -> dict[str, float]:
+        times = {
+            "embed_forward_seconds": 0.0,
+            "attention_forward_seconds": 0.0,
+            "ffn_forward_seconds": 0.0,
+            "output_forward_seconds": 0.0,
+        }
+
+        _sync_device(device)
+        start = time.perf_counter()
+        x = model.embed(tokens)
+        _sync_device(device)
+        times["embed_forward_seconds"] += time.perf_counter() - start
+
+        for block in model.blocks:
+            _sync_device(device)
+            start = time.perf_counter()
+            u = x + block.attn(block.norm1(x))
+            _sync_device(device)
+            times["attention_forward_seconds"] += time.perf_counter() - start
+
+            _sync_device(device)
+            start = time.perf_counter()
+            x = u + block.mlp(block.norm2(u))
+            _sync_device(device)
+            times["ffn_forward_seconds"] += time.perf_counter() - start
+
+        _sync_device(device)
+        start = time.perf_counter()
+        hidden = model.final_norm(x)
+        logits = hidden @ model.vocab_weight.t()
+        loss = lm_loss_per_sample(logits, targets).mean() / float(targets.shape[1])
+        _sync_device(device)
+        times["output_forward_seconds"] += time.perf_counter() - start
+        # Keep the scalar live so eager execution cannot discard the loss path.
+        times["loss_value"] = float(loss.detach().float().cpu())
+        return times
+
+    with torch.no_grad():
+        for _ in range(max(0, int(warmup))):
+            run_once()
+        totals: dict[str, float] = {}
+        for _ in range(max(1, int(iters))):
+            row = run_once()
+            for key, value in row.items():
+                totals[key] = totals.get(key, 0.0) + float(value)
+    model.train(was_training)
+    denom = float(max(1, int(iters)))
+    out: dict[str, float] = {}
+    for key, value in totals.items():
+        if key.endswith("_seconds"):
+            out[key.replace("_seconds", "_ms")] = (value / denom) * 1000.0
+        else:
+            out[key] = value / denom
+    return out
+
+
+def _time_model_train_step(
+    model: DenseModel,
+    tokens: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    lr: float,
+    weight_decay: float,
+    device: torch.device,
+    iters: int,
+    warmup: int,
+) -> dict[str, float]:
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    model.train()
+
+    def step_once() -> tuple[float, float, float, float]:
+        _sync_device(device)
+        start = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
+        out = model(tokens, targets, return_loss_per_sample=True)
+        assert out.loss_per_sample is not None
+        loss = out.loss_per_sample.mean() / float(targets.shape[1])
+        loss.backward()
+        _sync_device(device)
+        fwd_bwd_end = time.perf_counter()
+        optimizer.step()
+        _sync_device(device)
+        end = time.perf_counter()
+        return (
+            fwd_bwd_end - start,
+            end - fwd_bwd_end,
+            end - start,
+            float(loss.detach().float().cpu()),
+        )
+
+    for _ in range(max(0, int(warmup))):
+        step_once()
+    fwd_bwd = 0.0
+    optimizer_time = 0.0
+    total = 0.0
+    loss_total = 0.0
+    for _ in range(max(1, int(iters))):
+        fwd_bwd_i, optimizer_i, total_i, loss_i = step_once()
+        fwd_bwd += fwd_bwd_i
+        optimizer_time += optimizer_i
+        total += total_i
+        loss_total += loss_i
+    denom = float(max(1, int(iters)))
+    return {
+        "forward_backward_ms": (fwd_bwd / denom) * 1000.0,
+        "optimizer_ms": (optimizer_time / denom) * 1000.0,
+        "total_step_ms": (total / denom) * 1000.0,
+        "loss": loss_total / denom,
+    }
+
+
+def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> None:
+    config = _model_for_mode(load_config(args.config), "dense_exact")
+    training = config.training
+    if args.batch_size is not None:
+        training = dataclasses.replace(training, batch_size=args.batch_size)
+    if args.seq_len is not None:
+        training = dataclasses.replace(training, seq_len=args.seq_len)
+    config = dataclasses.replace(config, training=training)
+    set_seed(args.seed if args.seed is not None else config.training.seed)
+    device = default_device()
+    dtype = _benchmark_dtype(args.dtype, device)
+    streams = load_token_streams(config.data, config.training, config.model.vocab_size)
+    tokens, targets = next(streams.train_batches(config.training))
+    tokens = tokens.to(device)
+    targets = targets.to(device)
+    tokens_per_batch = int(tokens.numel())
+    calibration_batches = max(1, math.ceil(args.calibration_tokens / tokens_per_batch))
+    caps = [int(value) for value in (args.active_union_cap or [0, 320])]
+    rows: list[dict[str, Any]] = []
+
+    dense = _load_dense_model(config, args.dense_checkpoint, device)
+    if args.pack_dense_ffn:
+        _pack_dense_ffns_for_benchmark(dense)
+    dense.to(dtype=dtype)
+    _set_triton_swiglu_backward(dense, args.triton_swiglu_backward)
+    dense_components = _time_model_forward_components(
+        dense,
+        tokens,
+        targets,
+        device=device,
+        iters=args.component_iters,
+        warmup=args.component_warmup,
+    )
+    dense_train = _time_model_train_step(
+        dense,
+        tokens,
+        targets,
+        lr=args.lr if args.lr is not None else config.training.lr,
+        weight_decay=args.weight_decay if args.weight_decay is not None else config.training.weight_decay,
+        device=device,
+        iters=args.iters,
+        warmup=args.warmup,
+    )
+    dense_param_count_value = sum(param.numel() for param in dense.parameters())
+    del dense
+    if device.type == "mps":
+        torch.mps.empty_cache()
+
+    for cap in caps:
+        sparse = _load_dense_model(config, args.dense_checkpoint, device)
+        refresh_aux = _refresh_active_union_ffns(
+            sparse,
+            streams,
+            config,
+            calibration_batches=calibration_batches,
+            device=device,
+            rank=args.rank,
+            cluster_count=args.clusters,
+            candidate_m=args.candidate_m,
+            score_mode=args.score_mode,
+            aggregation=args.aggregation,
+            cluster_iters=args.cluster_iters,
+            cap=None if cap <= 0 else cap,
+            packed=True,
+        )
+        sparse.to(dtype=dtype)
+        _set_triton_swiglu_backward(sparse, args.triton_swiglu_backward)
+        sparse_components = _time_model_forward_components(
+            sparse,
+            tokens,
+            targets,
+            device=device,
+            iters=args.component_iters,
+            warmup=args.component_warmup,
+        )
+        sparse_train = _time_model_train_step(
+            sparse,
+            tokens,
+            targets,
+            lr=args.lr if args.lr is not None else config.training.lr,
+            weight_decay=args.weight_decay if args.weight_decay is not None else config.training.weight_decay,
+            device=device,
+            iters=args.iters,
+            warmup=args.warmup,
+        )
+        coverage = _active_union_coverage_metrics(sparse)
+        sparse_param_count_value = sum(param.numel() for param in sparse.parameters())
+        row = {
+            "active_union_cap": None if cap <= 0 else cap,
+            "dtype": str(dtype),
+            "batch_size": config.training.batch_size,
+            "seq_len": config.training.seq_len,
+            "tokens": tokens_per_batch,
+            "rank": args.rank,
+            "clusters": args.clusters,
+            "candidate_m": args.candidate_m,
+            "calibration_tokens": calibration_batches * tokens_per_batch,
+            "dense_packed_ffn_baseline": bool(args.pack_dense_ffn),
+            "triton_swiglu_backward_requested": bool(args.triton_swiglu_backward),
+            "triton_swiglu_backward_used": bool(args.triton_swiglu_backward and triton_swiglu_available()),
+            "dense_param_count": dense_param_count_value,
+            "sparse_param_count": sparse_param_count_value,
+            "sparse_param_fraction": sparse_param_count_value / max(dense_param_count_value, 1),
+            "dense_forward_backward_ms": dense_train["forward_backward_ms"],
+            "dense_optimizer_ms": dense_train["optimizer_ms"],
+            "dense_total_step_ms": dense_train["total_step_ms"],
+            "dense_loss": dense_train["loss"],
+            "sparse_forward_backward_ms": sparse_train["forward_backward_ms"],
+            "sparse_optimizer_ms": sparse_train["optimizer_ms"],
+            "sparse_total_step_ms": sparse_train["total_step_ms"],
+            "sparse_loss": sparse_train["loss"],
+            "total_step_speedup": dense_train["total_step_ms"] / max(sparse_train["total_step_ms"], 1e-12),
+            "forward_backward_speedup": dense_train["forward_backward_ms"]
+            / max(sparse_train["forward_backward_ms"], 1e-12),
+            "optimizer_speedup": dense_train["optimizer_ms"] / max(sparse_train["optimizer_ms"], 1e-12),
+            "dense_components": dense_components,
+            "sparse_components": sparse_components,
+            "attention_forward_speedup": dense_components.get("attention_forward_ms", 0.0)
+            / max(sparse_components.get("attention_forward_ms", 0.0), 1e-12),
+            "ffn_forward_speedup": dense_components.get("ffn_forward_ms", 0.0)
+            / max(sparse_components.get("ffn_forward_ms", 0.0), 1e-12),
+            "output_forward_speedup": dense_components.get("output_forward_ms", 0.0)
+            / max(sparse_components.get("output_forward_ms", 0.0), 1e-12),
+            "coverage": coverage,
+            "calibration_avg_cluster_imbalance": refresh_aux["calibration_avg_cluster_imbalance"],
+            "calibration_avg_nonempty_clusters": refresh_aux["calibration_avg_nonempty_clusters"],
+        }
+        rows.append(row)
+        del sparse
+        if device.type == "mps":
+            torch.mps.empty_cache()
+
+    report = {
+        "mode": "benchmark_active_union_model_train_step",
+        "checkpoint": args.dense_checkpoint,
+        "device": str(device),
+        "iters": args.iters,
+        "warmup": args.warmup,
+        "component_iters": args.component_iters,
+        "component_warmup": args.component_warmup,
+        "rows": rows,
+    }
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+    _print_json(report)
+
+
 def cmd_benchmark_mlx_svd_sparse_ffn(args: argparse.Namespace) -> None:
     from recursive_training_engine.mlx_svd_ffn import benchmark_mlx_svd_sparse_ffn
 
@@ -10277,6 +10587,37 @@ def build_parser() -> argparse.ArgumentParser:
     active_union_train_bench.add_argument("--seed", type=int, default=1234)
     active_union_train_bench.add_argument("--output")
     active_union_train_bench.set_defaults(func=cmd_benchmark_active_union_ffn_train)
+
+    active_union_model_bench = sub.add_parser("benchmark-active-union-model-train-step")
+    active_union_model_bench.add_argument("--config", required=True)
+    active_union_model_bench.add_argument("--dense-checkpoint", required=True)
+    active_union_model_bench.add_argument("--active-union-cap", type=int, nargs="+", default=[0, 320])
+    active_union_model_bench.add_argument("--batch-size", type=int)
+    active_union_model_bench.add_argument("--seq-len", type=int)
+    active_union_model_bench.add_argument("--calibration-tokens", type=int, default=8192)
+    active_union_model_bench.add_argument("--rank", type=int, default=64)
+    active_union_model_bench.add_argument("--clusters", type=int, default=16)
+    active_union_model_bench.add_argument("--candidate-m", type=int, default=192)
+    active_union_model_bench.add_argument("--score-mode", choices=["sum", "upgate", "product"], default="sum")
+    active_union_model_bench.add_argument("--aggregation", choices=["mean", "max"], default="mean")
+    active_union_model_bench.add_argument("--cluster-iters", type=int, default=4)
+    active_union_model_bench.add_argument("--dtype", choices=["fp16", "bf16", "fp32"], default="fp16")
+    active_union_model_bench.add_argument("--lr", type=float)
+    active_union_model_bench.add_argument("--weight-decay", type=float)
+    active_union_model_bench.add_argument("--iters", type=int, default=5)
+    active_union_model_bench.add_argument("--warmup", type=int, default=1)
+    active_union_model_bench.add_argument("--component-iters", type=int, default=3)
+    active_union_model_bench.add_argument("--component-warmup", type=int, default=1)
+    active_union_model_bench.add_argument("--pack-dense-ffn", action=argparse.BooleanOptionalAction, default=True)
+    active_union_model_bench.add_argument(
+        "--triton-swiglu-backward",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply the same Triton fused SwiGLU activation/backward helper to packed dense FFNs and packed active-union FFNs.",
+    )
+    active_union_model_bench.add_argument("--seed", type=int)
+    active_union_model_bench.add_argument("--output")
+    active_union_model_bench.set_defaults(func=cmd_benchmark_active_union_model_train_step)
 
     mlx_svd_bench = sub.add_parser("benchmark-mlx-svd-sparse-ffn")
     mlx_svd_bench.add_argument(

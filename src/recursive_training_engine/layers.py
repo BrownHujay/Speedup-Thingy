@@ -15,6 +15,10 @@ from recursive_training_engine.kernels.cluster_pool_ffn import (
     prepare_cluster_pool_weights,
     route_to_static_centers,
 )
+from recursive_training_engine.kernels.active_swiglu_triton import (
+    available as triton_swiglu_available,
+    triton_packed_swiglu_ffn,
+)
 from recursive_training_engine.kernels.svd_sparse_ffn_triton import triton_svd_sparse_ffn_forward
 from recursive_training_engine.recipes import RecipeBank, RecipeSpec, spec_from_factors
 
@@ -81,6 +85,35 @@ class DenseSwiGLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         up, gate = self.wug(x).chunk(2, dim=-1)
         return self.wd(up * F.silu(gate))
+
+
+class PackedDenseSwiGLU(nn.Module):
+    """Dense SwiGLU with row-oriented W_down for fair fused-kernel benchmarks."""
+
+    def __init__(self, dense: DenseSwiGLU):
+        super().__init__()
+        d_model = dense.wug.in_features
+        d_ff = dense.wd.in_features
+        self.wug = nn.Linear(d_model, 2 * d_ff, bias=False)
+        self.wdown_rows = nn.Parameter(torch.empty(d_ff, d_model))
+        self.use_triton_swiglu_backward = False
+        with torch.no_grad():
+            self.wug.weight.copy_(dense.wug.weight.detach())
+            self.wdown_rows.copy_(dense.wd.weight.detach().t().contiguous())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        original_shape = x.shape[:-1]
+        flat = x.reshape(-1, x.shape[-1])
+        if (
+            self.use_triton_swiglu_backward
+            and flat.device.type == "cuda"
+            and triton_swiglu_available()
+        ):
+            out = triton_packed_swiglu_ffn(flat, self.wug.weight, self.wdown_rows)
+        else:
+            up, gate = (flat @ self.wug.weight.t()).chunk(2, dim=-1)
+            out = (up * F.silu(gate)) @ self.wdown_rows
+        return out.view(*original_shape, -1)
 
 
 class StaticClusterPoolSwiGLU(nn.Module):
@@ -272,7 +305,8 @@ class PackedActiveUnionSwiGLU(nn.Module):
         active_m = int(ids.numel())
         self.d_ff_total = int(dense.wd.in_features)
         self.wug_active = nn.Linear(d_model, 2 * active_m, bias=False)
-        self.wd_active = nn.Linear(active_m, d_model, bias=False)
+        self.wdown_active_rows = nn.Parameter(torch.empty(active_m, d_model))
+        self.use_triton_swiglu_backward = False
         self.register_buffer("active_ids", ids, persistent=True)
         with torch.no_grad():
             up_weight, gate_weight = dense.wug.weight.detach().chunk(2, dim=0)
@@ -284,11 +318,25 @@ class PackedActiveUnionSwiGLU(nn.Module):
                 dim=0,
             )
             self.wug_active.weight.copy_(wug_active)
-            self.wd_active.weight.copy_(dense.wd.weight.detach().index_select(1, ids))
+            self.wdown_active_rows.copy_(dense.wd.weight.detach().t().index_select(0, ids).contiguous())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        up, gate = self.wug_active(x).chunk(2, dim=-1)
-        return self.wd_active(up * F.silu(gate))
+        original_shape = x.shape[:-1]
+        flat = x.reshape(-1, x.shape[-1])
+        if (
+            self.use_triton_swiglu_backward
+            and flat.device.type == "cuda"
+            and triton_swiglu_available()
+        ):
+            out = triton_packed_swiglu_ffn(flat, self.wug_active.weight, self.wdown_active_rows)
+        else:
+            up, gate = (flat @ self.wug_active.weight.t()).chunk(2, dim=-1)
+            out = (up * F.silu(gate)) @ self.wdown_active_rows
+        return out.view(*original_shape, -1)
+
+    @property
+    def active_m(self) -> int:
+        return int(self.active_ids.numel())
 
 
 class SVDFactorSparseFFN(nn.Module):

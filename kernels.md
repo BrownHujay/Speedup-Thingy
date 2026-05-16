@@ -718,3 +718,25 @@ sparse active-union packed W_ug forward+backward graph
 The notebook exposes this as `RUN_CUDA_GRAPHS=True` and reports the dense graph
 time next to the sparse graph time, so graph launch reduction cannot silently
 favor only the sparse path.
+
+### Full-Model Active-Union Benchmark Mapping
+
+`benchmark-active-union-model-train-step` measures the full train step with the
+same packed SwiGLU treatment on both sides:
+
+```text
+dense baseline:
+  DenseSwiGLU -> PackedDenseSwiGLU
+  W_ug:       [2H, D]
+  W_down:    [H, D] row-oriented parameter
+
+sparse FFN:
+  DenseSwiGLU -> PackedActiveUnionSwiGLU
+  W_ug_active:    [2M, D]
+  W_down_active:  [M, D] row-oriented parameter
+```
+
+When `--triton-swiglu-backward` is enabled, both packed dense FFNs and packed
+active-union FFNs call `triton_packed_swiglu_ffn`. The sparse-specific change is
+only the active row count `M`; the dense baseline still gets the same fused
+SwiGLU activation/backward helper and row-oriented down projection layout.
