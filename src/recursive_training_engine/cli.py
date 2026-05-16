@@ -7898,6 +7898,10 @@ def _benchmark_dtype(value: str, device: torch.device) -> torch.dtype:
     raise ValueError(f"unsupported benchmark dtype: {value}")
 
 
+def _benchmark_lm_loss_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(logits.float().flatten(0, -2), targets.flatten())
+
+
 def _time_model_forward_components(
     model: DenseModel,
     tokens: torch.Tensor,
@@ -7948,7 +7952,7 @@ def _time_model_forward_components(
         start = time.perf_counter()
         hidden = model.final_norm(x)
         logits = hidden @ model.vocab_weight.t()
-        loss = lm_loss_per_sample(logits, targets).mean() / float(targets.shape[1])
+        loss = _benchmark_lm_loss_from_logits(logits, targets)
         _sync_device(device)
         times["output_forward_seconds"] += time.perf_counter() - start
         # Keep the scalar live so eager execution cannot discard the loss path.
@@ -7992,9 +7996,9 @@ def _time_model_train_step(
         _sync_device(device)
         start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
-        out = model(tokens, targets, return_loss_per_sample=True)
-        assert out.loss_per_sample is not None
-        loss = out.loss_per_sample.mean() / float(targets.shape[1])
+        out = model(tokens, None)
+        assert out.logits is not None
+        loss = _benchmark_lm_loss_from_logits(out.logits, targets)
         loss.backward()
         _sync_device(device)
         fwd_bwd_end = time.perf_counter()
@@ -8120,8 +8124,7 @@ def _event_profile_model_train_step(
             oh_fwd_start.record()
         hidden = model.final_norm(x)
         logits = hidden @ model.vocab_weight.t()
-        loss_per_sample = lm_loss_per_sample(logits, targets)
-        loss = loss_per_sample.mean() / float(targets.shape[1])
+        loss = _benchmark_lm_loss_from_logits(logits, targets)
         if measure:
             oh_fwd_end.record()
             torch.cuda.nvtx.range_pop()

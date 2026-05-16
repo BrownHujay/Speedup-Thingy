@@ -1,0 +1,586 @@
+Larger Random Full-Model Speed Probe
+
+{
+  "checkpoint": null,
+  "component_iters": 3,
+  "component_warmup": 1,
+  "device": "cuda",
+  "event_iters": 3,
+  "event_profile": true,
+  "event_warmup": 1,
+  "iters": 5,
+  "mode": "benchmark_active_union_model_train_step",
+  "random_init": true,
+  "rows": [
+    {
+      "active_union_cap": 192,
+      "attention_forward_speedup": 0.9365447153015277,
+      "batch_size": 16,
+      "calibration_avg_cluster_imbalance": 1.1979166666666667,
+      "calibration_avg_nonempty_clusters": 16.0,
+      "calibration_tokens": 8192,
+      "candidate_m": 192,
+      "clusters": 16,
+      "coverage": {
+        "mean": {
+          "coverage_fraction": 0.046875,
+          "unique_selected_neurons": 192.0
+        },
+        "rows": [
+          {
+            "coverage_fraction": 0.046875,
+            "layer": 0.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.046875,
+            "layer": 1.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.046875,
+            "layer": 2.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.046875,
+            "layer": 3.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.046875,
+            "layer": 4.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.046875,
+            "layer": 5.0,
+            "unique_selected_neurons": 192.0
+          }
+        ]
+      },
+      "dense_components": {
+        "attention_forward_ms": 5.058897999977792,
+        "embed_forward_ms": 0.09628400001323219,
+        "ffn_forward_ms": 6.970550666740867,
+        "loss_value": 482.0,
+        "output_forward_ms": 0.4748286666729958
+      },
+      "dense_event_profile": {
+        "attention_backward_ms": 4.606229345003764,
+        "attention_forward_backward_ms": 9.739413291215897,
+        "attention_forward_ms": 5.1331839462121325,
+        "available": true,
+        "embedding_forward_ms": 0.10833066701889038,
+        "ffn_backward_ms": 8.182122588157654,
+        "ffn_forward_backward_ms": 13.929845313231151,
+        "ffn_forward_ms": 5.747722725073497,
+        "loss": NaN,
+        "misc_overhead_ms": 0.9691514273484536,
+        "optimizer_ms": 6.797087987263997,
+        "output_head_backward_ms": 0.5976320008436838,
+        "output_head_forward_backward_ms": 0.9177706638971964,
+        "output_head_forward_ms": 0.3201386630535126,
+        "total_step_ms": 32.461599349975586
+      },
+      "dense_forward_backward_ms": 28.87365920000775,
+      "dense_loss": NaN,
+      "dense_optimizer_ms": 7.398535400000128,
+      "dense_packed_ffn_baseline": true,
+      "dense_param_count": 45095424,
+      "dense_total_step_ms": 36.27219460000788,
+      "dtype": "torch.float16",
+      "event_attention_fwd_bwd_speedup": 0.7952954812827678,
+      "event_ffn_fwd_bwd_speedup": 1.9906907493642743,
+      "event_output_head_fwd_bwd_speedup": 0.8534289423919469,
+      "event_total_step_speedup": 1.3951989150510433,
+      "ffn_forward_speedup": 2.4669538063896392,
+      "forward_backward_speedup": 1.2952739545720693,
+      "optimizer_speedup": 4.160787678308537,
+      "output_forward_speedup": 1.1962187526969335,
+      "rank": 64,
+      "seq_len": 64,
+      "sparse_components": {
+        "attention_forward_ms": 5.401662000034928,
+        "embed_forward_ms": 0.09970433332758451,
+        "ffn_forward_ms": 2.8255700000083075,
+        "loss_value": 496.25,
+        "output_forward_ms": 0.3969413333493321
+      },
+      "sparse_event_profile": {
+        "attention_backward_ms": 6.640885353088379,
+        "attention_forward_backward_ms": 12.246282696723938,
+        "attention_forward_ms": 5.605397343635559,
+        "available": true,
+        "embedding_forward_ms": 0.09184000144402187,
+        "ffn_backward_ms": 4.145301361878713,
+        "ffn_forward_backward_ms": 6.9974933664004,
+        "ffn_forward_ms": 2.852192004521688,
+        "loss": NaN,
+        "misc_overhead_ms": 1.1528433238466569,
+        "optimizer_ms": 1.7027946710586548,
+        "output_head_backward_ms": 0.6555413405100504,
+        "output_head_forward_backward_ms": 1.0753920078277588,
+        "output_head_forward_ms": 0.4198506673177083,
+        "total_step_ms": 23.266646067301433
+      },
+      "sparse_forward_backward_ms": 22.291546200005996,
+      "sparse_loss": NaN,
+      "sparse_optimizer_ms": 1.7781573999968714,
+      "sparse_param_count": 9116160,
+      "sparse_param_fraction": 0.20215266187540448,
+      "sparse_total_step_ms": 24.069703600002867,
+      "tokens": 1024,
+      "total_step_speedup": 1.5069647388596659,
+      "triton_swiglu_backward_requested": true,
+      "triton_swiglu_backward_used": true
+    },
+    {
+      "active_union_cap": 320,
+      "attention_forward_speedup": 0.5667207346882973,
+      "batch_size": 16,
+      "calibration_avg_cluster_imbalance": 1.1979166666666667,
+      "calibration_avg_nonempty_clusters": 16.0,
+      "calibration_tokens": 8192,
+      "candidate_m": 192,
+      "clusters": 16,
+      "coverage": {
+        "mean": {
+          "coverage_fraction": 0.078125,
+          "unique_selected_neurons": 320.0
+        },
+        "rows": [
+          {
+            "coverage_fraction": 0.078125,
+            "layer": 0.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.078125,
+            "layer": 1.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.078125,
+            "layer": 2.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.078125,
+            "layer": 3.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.078125,
+            "layer": 4.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.078125,
+            "layer": 5.0,
+            "unique_selected_neurons": 320.0
+          }
+        ]
+      },
+      "dense_components": {
+        "attention_forward_ms": 5.058897999977792,
+        "embed_forward_ms": 0.09628400001323219,
+        "ffn_forward_ms": 6.970550666740867,
+        "loss_value": 482.0,
+        "output_forward_ms": 0.4748286666729958
+      },
+      "dense_event_profile": {
+        "attention_backward_ms": 4.606229345003764,
+        "attention_forward_backward_ms": 9.739413291215897,
+        "attention_forward_ms": 5.1331839462121325,
+        "available": true,
+        "embedding_forward_ms": 0.10833066701889038,
+        "ffn_backward_ms": 8.182122588157654,
+        "ffn_forward_backward_ms": 13.929845313231151,
+        "ffn_forward_ms": 5.747722725073497,
+        "loss": NaN,
+        "misc_overhead_ms": 0.9691514273484536,
+        "optimizer_ms": 6.797087987263997,
+        "output_head_backward_ms": 0.5976320008436838,
+        "output_head_forward_backward_ms": 0.9177706638971964,
+        "output_head_forward_ms": 0.3201386630535126,
+        "total_step_ms": 32.461599349975586
+      },
+      "dense_forward_backward_ms": 28.87365920000775,
+      "dense_loss": NaN,
+      "dense_optimizer_ms": 7.398535400000128,
+      "dense_packed_ffn_baseline": true,
+      "dense_param_count": 45095424,
+      "dense_total_step_ms": 36.27219460000788,
+      "dtype": "torch.float16",
+      "event_attention_fwd_bwd_speedup": 0.4919051966177299,
+      "event_ffn_fwd_bwd_speedup": 1.2974841597187088,
+      "event_output_head_fwd_bwd_speedup": 0.5933125480659336,
+      "event_total_step_speedup": 0.8986455655714479,
+      "ffn_forward_speedup": 1.6924403102055212,
+      "forward_backward_speedup": 0.8640354377336207,
+      "optimizer_speedup": 3.402437676140201,
+      "output_forward_speedup": 0.9385548551060721,
+      "rank": 64,
+      "seq_len": 64,
+      "sparse_components": {
+        "attention_forward_ms": 8.926615333317992,
+        "embed_forward_ms": 0.11627366666289163,
+        "ffn_forward_ms": 4.118638999974185,
+        "loss_value": 495.5,
+        "output_forward_ms": 0.5059146666705298
+      },
+      "sparse_event_profile": {
+        "attention_backward_ms": 10.647989312807718,
+        "attention_forward_backward_ms": 19.799370606740315,
+        "attention_forward_ms": 9.151381293932596,
+        "available": true,
+        "embedding_forward_ms": 0.1673173358043035,
+        "ffn_backward_ms": 5.824832042058309,
+        "ffn_forward_backward_ms": 10.73604267835617,
+        "ffn_forward_ms": 4.911210636297862,
+        "loss": NaN,
+        "misc_overhead_ms": 1.7861339102188794,
+        "optimizer_ms": 2.0870827039082847,
+        "output_head_backward_ms": 0.947488009929657,
+        "output_head_forward_backward_ms": 1.5468586782614389,
+        "output_head_forward_ms": 0.599370668331782,
+        "total_step_ms": 36.12280591328939
+      },
+      "sparse_forward_backward_ms": 33.41721639999378,
+      "sparse_loss": NaN,
+      "sparse_optimizer_ms": 2.1744808000107696,
+      "sparse_param_count": 10295808,
+      "sparse_param_fraction": 0.22831159099424367,
+      "sparse_total_step_ms": 35.591697200004546,
+      "tokens": 1024,
+      "total_step_speedup": 1.0191195546584737,
+      "triton_swiglu_backward_requested": true,
+      "triton_swiglu_backward_used": true
+    }
+  ],
+  "warmup": 1
+}
+
+
+Active union cap192 long continuation
+
+$ /usr/bin/python3 -c from recursive_training_engine.cli import main; main() static-cluster-pool-continuation --config /content/Speedup-Thingy/runs/colab_static_cluster_ffn_d256_h2048_20260516_041132/configs/static_cluster_ffn_d256_h2048.yaml --dense-checkpoint /content/Speedup-Thingy/runs/colab_static_cluster_ffn_d256_h2048_20260516_041132/checkpoints/dense_step200.pt --steps 1000 --lr 0.0001 --weight-decay 0.0 --resume-optimizer-state --eval-batches 32 --eval-steps 0 200 400 600 800 1000 --calibration-tokens 8192 --rank 64 --clusters 16 --candidate-m 192 --sparse-ffn-kind active_union_packed --refresh-intervals 0 --cluster-iters 4 --alignment-batches 1 --alignment-batch-size 32 --output /content/Speedup-Thingy/runs/colab_static_cluster_ffn_d256_h2048_20260516_041132/reports/active_union_packed_cap192_1000_steps.json --active-union-cap 192 --run-dense --run-sparse
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory efficient kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:960.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory Efficient attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:552.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:962.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:339.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:964.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:680.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+{
+  "active_union_cap": 192,
+  "active_union_layer_caps": [],
+  "aggregation": "mean",
+  "batch_size": 32,
+  "calibration_tokens": 8192,
+  "candidate_m": 192,
+  "checkpoint": "/content/Speedup-Thingy/runs/colab_static_cluster_ffn_d256_h2048_20260516_041132/checkpoints/dense_step200.pt",
+  "cluster_iters": 4,
+  "clusters": 16,
+  "device": "cuda",
+  "eval_batches": 32,
+  "eval_steps": [
+    0,
+    200,
+    400,
+    600,
+    800,
+    1000
+  ],
+  "eval_tokens": 65536,
+  "lr": 0.0001,
+  "mode": "static_cluster_pool_continuation",
+  "rank": 64,
+  "rows": [
+    {
+      "eval_curve": [
+        {
+          "nll_per_token": 7.76410810649395,
+          "step": 0.0
+        },
+        {
+          "nll_per_token": 7.646083101630211,
+          "step": 200.0
+        },
+        {
+          "nll_per_token": 7.642975375056267,
+          "step": 400.0
+        },
+        {
+          "nll_per_token": 7.643622979521751,
+          "step": 600.0
+        },
+        {
+          "nll_per_token": 7.641099467873573,
+          "step": 800.0
+        },
+        {
+          "nll_per_token": 7.642296180129051,
+          "step": 1000.0
+        }
+      ],
+      "final_nll_per_token": 7.642296180129051,
+      "first_train_nll": 7.73302698135376,
+      "initial_nll_per_token": 7.76410810649395,
+      "last_train_nll": 7.625864028930664,
+      "mean_train_nll": 7.642359773635865,
+      "nll_delta": -0.12181192636489868,
+      "optimizer_state_loaded": true,
+      "refresh_events": [],
+      "steps": 1000,
+      "tokens_per_second": 28946.26201895962,
+      "tokens_trained": 2048000,
+      "train_seconds": 70.751795125,
+      "variant": "dense_continuation"
+    },
+    {
+      "active_union_cap": 192,
+      "active_union_layer_caps": [],
+      "eval_curve": [
+        {
+          "gap_vs_dense": 0.07813283801078796,
+          "nll_per_token": 7.842240944504738,
+          "step": 0.0
+        },
+        {
+          "gap_vs_dense": 0.0041884928941726685,
+          "nll_per_token": 7.6502715945243835,
+          "step": 200.0
+        },
+        {
+          "gap_vs_dense": 0.003959491848945618,
+          "nll_per_token": 7.646934866905212,
+          "step": 400.0
+        },
+        {
+          "gap_vs_dense": 0.005341008305549622,
+          "nll_per_token": 7.648963987827301,
+          "step": 600.0
+        },
+        {
+          "gap_vs_dense": 0.00794193148612976,
+          "nll_per_token": 7.649041399359703,
+          "step": 800.0
+        },
+        {
+          "gap_vs_dense": 0.008918970823287964,
+          "nll_per_token": 7.651215150952339,
+          "step": 1000.0
+        }
+      ],
+      "final_coverage": {
+        "mean": {
+          "coverage_fraction": 0.09375,
+          "unique_selected_neurons": 192.0
+        },
+        "rows": [
+          {
+            "coverage_fraction": 0.09375,
+            "layer": 0.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.09375,
+            "layer": 1.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.09375,
+            "layer": 2.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.09375,
+            "layer": 3.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.09375,
+            "layer": 4.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.09375,
+            "layer": 5.0,
+            "unique_selected_neurons": 192.0
+          }
+        ]
+      },
+      "final_gap_vs_dense": 0.008918970823287964,
+      "final_grad_row_metrics": {},
+      "final_gradient_alignment": {},
+      "final_nll_per_token": 7.651215150952339,
+      "first_train_nll": 7.862297058105469,
+      "initial_calibration_avg_cluster_imbalance": 1.7731119791666667,
+      "initial_calibration_avg_nonempty_clusters": 16.0,
+      "initial_coverage": {
+        "mean": {
+          "coverage_fraction": 0.09375,
+          "unique_selected_neurons": 192.0
+        },
+        "rows": [
+          {
+            "coverage_fraction": 0.09375,
+            "layer": 0.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.09375,
+            "layer": 1.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.09375,
+            "layer": 2.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.09375,
+            "layer": 3.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.09375,
+            "layer": 4.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.09375,
+            "layer": 5.0,
+            "unique_selected_neurons": 192.0
+          }
+        ]
+      },
+      "initial_gap_vs_dense": 0.07813283801078796,
+      "initial_gradient_alignment": {},
+      "initial_nll_per_token": 7.842240944504738,
+      "last_train_nll": 7.638524532318115,
+      "mean_train_nll": 7.649909316539764,
+      "nll_delta": -0.19102579355239868,
+      "optimizer_state_loaded": false,
+      "refresh_events": [],
+      "refresh_interval": 0,
+      "sparse_ffn_kind": "active_union_packed",
+      "steps": 1000,
+      "tokens_per_second": 78680.68037825348,
+      "tokens_trained": 2048000,
+      "train_seconds": 26.029261442000006,
+      "variant": "active_union_packed"
+    }
+  ],
+  "score_mode": "sum",
+  "seq_len": 64,
+  "sparse_ffn_kind": "active_union_packed",
+  "steps": 1000,
+  "tokens_per_batch": 2048,
+  "weight_decay": 0.0
+}
+
+
+BLOCK ONLY:
+
+$ /usr/bin/python3 -c from recursive_training_engine.cli import main; main() benchmark-active-union-block-train-step --config /content/Speedup-Thingy/runs/colab_static_cluster_ffn_d256_h2048_20260516_041132/configs/static_cluster_ffn_d256_h2048.yaml --dense-checkpoint /content/Speedup-Thingy/runs/colab_static_cluster_ffn_d256_h2048_20260516_041132/checkpoints/dense_step400.pt --active-union-cap 192 --layers 0 3 5 --calibration-tokens 8192 --rank 64 --clusters 16 --candidate-m 192 --cluster-iters 4 --dtype fp16 --iters 10 --warmup 3 --output /content/Speedup-Thingy/runs/colab_static_cluster_ffn_d256_h2048_20260516_041132/reports/active_union_block_integration_benchmark.json --triton-swiglu-backward
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory efficient kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:960.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory Efficient attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:552.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:962.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:339.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:964.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:680.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory efficient kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:960.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory Efficient attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:552.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:962.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:339.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:964.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:680.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory efficient kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:960.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory Efficient attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:552.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:962.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:339.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:964.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:680.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+{
+  "checkpoint": "/content/Speedup-Thingy/runs/colab_static_cluster_ffn_d256_h2048_20260516_041132/checkpoints/dense_step400.pt",
+  "device": "cuda",
+  "iters": 10,
+  "mode": "benchmark_active_union_block_train_step",
+  "rows": [
+    {
+      "active_union_cap": 192,
+      "attention_forward_backward_speedup": 0.993922018938631,
+      "block_forward_backward_speedup": 1.1380966809715383,
+      "dense_attention_forward_backward_ms": 2.395091247558594,
+      "dense_block_forward_backward_ms": 4.094992065429688,
+      "dense_ffn_forward_backward_ms": 2.035753631591797,
+      "dtype": "torch.float16",
+      "ffn_forward_backward_speedup": 1.3054817340460072,
+      "layer": 0,
+      "sparse_attention_forward_backward_ms": 2.4097375869750977,
+      "sparse_block_forward_backward_ms": 3.598105621337891,
+      "sparse_ffn_forward_backward_ms": 1.5593888282775878,
+      "tokens": 2048,
+      "triton_swiglu_backward_used": true
+    },
+    {
+      "active_union_cap": 192,
+      "attention_forward_backward_speedup": 0.9907461314864101,
+      "block_forward_backward_speedup": 0.9490629340867723,
+      "dense_attention_forward_backward_ms": 2.31976318359375,
+      "dense_block_forward_backward_ms": 3.4333118438720702,
+      "dense_ffn_forward_backward_ms": 1.4750240325927735,
+      "dtype": "torch.float16",
+      "ffn_forward_backward_speedup": 1.001288159074504,
+      "layer": 3,
+      "sparse_attention_forward_backward_ms": 2.3414304733276365,
+      "sparse_block_forward_backward_ms": 3.617580795288086,
+      "sparse_ffn_forward_backward_ms": 1.4731264114379883,
+      "tokens": 2048,
+      "triton_swiglu_backward_used": true
+    },
+    {
+      "active_union_cap": 192,
+      "attention_forward_backward_speedup": 0.9886820862279591,
+      "block_forward_backward_speedup": 1.3226144381228497,
+      "dense_attention_forward_backward_ms": 2.308700752258301,
+      "dense_block_forward_backward_ms": 4.443916702270508,
+      "dense_ffn_forward_backward_ms": 1.53023681640625,
+      "dtype": "torch.float16",
+      "ffn_forward_backward_speedup": 1.0394861941231575,
+      "layer": 5,
+      "sparse_attention_forward_backward_ms": 2.3351295471191404,
+      "sparse_block_forward_backward_ms": 3.35994873046875,
+      "sparse_ffn_forward_backward_ms": 1.4721088409423828,
+      "tokens": 2048,
+      "triton_swiglu_backward_used": true
+    }
+  ],
+  "warmup": 3
+}
