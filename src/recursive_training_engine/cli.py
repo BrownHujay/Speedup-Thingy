@@ -1221,6 +1221,36 @@ def _dense_attention_heads(block: torch.nn.Module, x: torch.Tensor) -> torch.Ten
     return y.transpose(1, 2).contiguous()
 
 
+def _attention_qkv_tensors(
+    block: torch.nn.Module,
+    x: torch.Tensor,
+    *,
+    apply_rope: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    b, s, d = x.shape
+    n_heads = block.attn.n_heads
+    head_dim = block.attn.head_dim
+    qkv = block.attn.wqkv(x).view(b, s, 3, n_heads, head_dim)
+    q, k, v = qkv.unbind(dim=2)
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    if apply_rope and block.attn.rope is not None:
+        q, k = block.attn.rope(q, k)
+    return q, k, v
+
+
+def _attention_from_qkv(
+    block: torch.nn.Module,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> torch.Tensor:
+    y = optimized.k_flash_causal_dense(q, k, v)
+    y = y.transpose(1, 2).contiguous().view(q.shape[0], q.shape[2], -1)
+    return block.attn.wo(y)
+
+
 def _attention_head_contribs(block: torch.nn.Module, heads: torch.Tensor) -> torch.Tensor:
     cols_per_head = block.attn.head_dim
     pieces = []
@@ -1565,6 +1595,484 @@ def cmd_head_regroup_oracle(args: argparse.Namespace) -> None:
     }
     if args.include_permutations:
         report["permutations"] = [perm.tolist() for perm in permutations]
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        write_json(output, report)
+    _print_json(report)
+
+
+def _head_cosine_from_gram(gram: torch.Tensor, sum_sq: torch.Tensor) -> float:
+    denom = torch.sqrt(torch.clamp(sum_sq.float(), min=1e-12))
+    cos = gram.float() / torch.clamp(denom[:, None] * denom[None, :], min=1e-12)
+    cos = torch.nan_to_num(cos, nan=0.0, posinf=0.0, neginf=0.0)
+    if cos.shape[0] <= 1:
+        return 1.0
+    off_diag = cos.sum() - torch.diagonal(cos).sum()
+    return float((off_diag / (cos.shape[0] * (cos.shape[0] - 1))).cpu())
+
+
+def _group_reconstruction_error_from_gram(
+    gram: torch.Tensor,
+    sum_sq: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    group_count: int,
+) -> float:
+    total = float(sum_sq.float().sum().cpu())
+    if total <= 0.0:
+        return 0.0
+    explained = 0.0
+    gram = gram.float().cpu()
+    labels = labels.cpu()
+    for group in range(group_count):
+        idx = torch.nonzero(labels == group, as_tuple=False).flatten()
+        if idx.numel() == 0:
+            continue
+        sub = gram.index_select(0, idx).index_select(1, idx)
+        explained += float(sub.sum().cpu()) / float(idx.numel())
+    err = max(total - explained, 0.0)
+    return math.sqrt(err / max(total, 1e-12))
+
+
+def _group_heads_by_mean(
+    heads: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    group_count: int,
+) -> torch.Tensor:
+    one_hot = F.one_hot(labels.to(heads.device), num_classes=group_count).to(heads.dtype)
+    denom = one_hot.sum(dim=0).clamp_min(1.0)
+    grouped = torch.einsum("bhsd,hg->bgsd", heads, one_hot) / denom.view(1, -1, 1, 1)
+    return torch.einsum("bgsd,hg->bhsd", grouped, one_hot)
+
+
+@torch.no_grad()
+def _collect_attention_calibration_stats(
+    model: DenseModel,
+    streams,
+    config: ExperimentConfig,
+    *,
+    batches: int,
+    device: torch.device,
+    progress: int,
+) -> tuple[
+    list[dict[str, torch.Tensor]],
+    list[dict[str, torch.Tensor]],
+    list[dict[str, torch.Tensor]],
+    int,
+]:
+    d = config.model.d_model
+    n_heads = config.model.n_heads
+    kv_grams = [
+        {
+            "k": torch.zeros(n_heads, n_heads, dtype=torch.float32, device=device),
+            "v": torch.zeros(n_heads, n_heads, dtype=torch.float32, device=device),
+        }
+        for _ in model.blocks
+    ]
+    kv_sum_sqs = [
+        {
+            "k": torch.zeros(n_heads, dtype=torch.float32, device=device),
+            "v": torch.zeros(n_heads, dtype=torch.float32, device=device),
+        }
+        for _ in model.blocks
+    ]
+    covs = [
+        {
+            "q": torch.zeros(d, d, dtype=torch.float32, device=device),
+            "k": torch.zeros(d, d, dtype=torch.float32, device=device),
+            "v": torch.zeros(d, d, dtype=torch.float32, device=device),
+            "o": torch.zeros(d, d, dtype=torch.float32, device=device),
+        }
+        for _ in model.blocks
+    ]
+    iterator = streams.train_batches(config.training)
+    tokens_seen = 0
+    model.eval()
+    for batch_idx in range(batches):
+        tokens, _ = next(iterator)
+        tokens = tokens.to(device)
+        tokens_seen += int(tokens.numel())
+        x = model.embed(tokens)
+        for layer_idx, block in enumerate(model.blocks):
+            normed = block.norm1(x)
+            q, k, v = _attention_qkv_tensors(block, normed, apply_rope=True)
+            for name, value in (("k", k), ("v", v)):
+                flat_heads = value.detach().float().permute(1, 0, 2, 3).reshape(n_heads, -1)
+                kv_grams[layer_idx][name].add_(flat_heads @ flat_heads.t())
+                kv_sum_sqs[layer_idx][name].add_(flat_heads.square().sum(dim=1))
+            q_pre, k_pre, v_pre = _attention_qkv_tensors(block, normed, apply_rope=False)
+            for name, value in (("q", q_pre), ("k", k_pre), ("v", v_pre)):
+                flat = value.transpose(1, 2).contiguous().view(-1, d).float()
+                covs[layer_idx][name].add_(flat.t() @ flat)
+            heads = optimized.k_flash_causal_dense(q, k, v)
+            o_out = block.attn.wo(heads.transpose(1, 2).contiguous().view(tokens.shape[0], tokens.shape[1], d))
+            flat_o = o_out.detach().reshape(-1, d).float()
+            covs[layer_idx]["o"].add_(flat_o.t() @ flat_o)
+            x = x + o_out
+            x = x + block.mlp(block.norm2(x))
+        if progress and (batch_idx + 1) % progress == 0:
+            print(json.dumps({"event": "attention_diag_calibration_batch", "batch": batch_idx + 1}))
+    return (
+        [{key: value.cpu() for key, value in row.items()} for row in kv_grams],
+        [{key: value.cpu() for key, value in row.items()} for row in kv_sum_sqs],
+        [{key: value.cpu() for key, value in row.items()} for row in covs],
+        tokens_seen,
+    )
+
+
+def _top_basis_from_cov(cov: torch.Tensor, max_rank: int, device: torch.device) -> torch.Tensor:
+    cov = cov.float().cpu()
+    try:
+        eigvals, eigvecs = torch.linalg.eigh(cov)
+        order = torch.argsort(eigvals, descending=True)
+        basis = eigvecs[:, order[:max_rank]].contiguous()
+    except RuntimeError:
+        _, _, vh = torch.linalg.svd(cov)
+        basis = vh[:max_rank].t().contiguous()
+    return basis.to(device)
+
+
+def _project_last_dim(value: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+    dtype = value.dtype
+    projected = (value.float() @ basis.float()) @ basis.float().t()
+    return projected.to(dtype)
+
+
+@torch.no_grad()
+def _attention_forward_with_kv_groups(
+    model: DenseModel,
+    tokens: torch.Tensor,
+    *,
+    labels_by_layer: list[torch.Tensor],
+    group_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = model.embed(tokens)
+    for layer_idx, block in enumerate(model.blocks):
+        normed = block.norm1(x)
+        q, k, v = _attention_qkv_tensors(block, normed, apply_rope=True)
+        labels = labels_by_layer[layer_idx]
+        k_grouped = _group_heads_by_mean(k, labels, group_count=group_count)
+        v_grouped = _group_heads_by_mean(v, labels, group_count=group_count)
+        x = x + _attention_from_qkv(block, q, k_grouped, v_grouped)
+        x = x + block.mlp(block.norm2(x))
+    hidden = model.final_norm(x)
+    logits = hidden @ model.vocab_weight.t()
+    return hidden, logits
+
+
+@torch.no_grad()
+def _attention_forward_with_lowrank(
+    model: DenseModel,
+    tokens: torch.Tensor,
+    *,
+    bases_by_layer: list[dict[str, torch.Tensor]],
+    rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = model.embed(tokens)
+    for layer_idx, block in enumerate(model.blocks):
+        bases = bases_by_layer[layer_idx]
+        b, s, d = x.shape
+        h = block.attn.n_heads
+        hd = block.attn.head_dim
+        normed = block.norm1(x)
+        qkv = block.attn.wqkv(normed).view(b, s, 3, d)
+        q_flat = _project_last_dim(qkv[:, :, 0, :], bases["q"][:, :rank])
+        k_flat = _project_last_dim(qkv[:, :, 1, :], bases["k"][:, :rank])
+        v_flat = _project_last_dim(qkv[:, :, 2, :], bases["v"][:, :rank])
+        q = q_flat.view(b, s, h, hd).transpose(1, 2)
+        k = k_flat.view(b, s, h, hd).transpose(1, 2)
+        v = v_flat.view(b, s, h, hd).transpose(1, 2)
+        if block.attn.rope is not None:
+            q, k = block.attn.rope(q, k)
+        attn = _attention_from_qkv(block, q, k, v)
+        attn = _project_last_dim(attn, bases["o"][:, :rank])
+        x = x + attn
+        x = x + block.mlp(block.norm2(x))
+    hidden = model.final_norm(x)
+    logits = hidden @ model.vocab_weight.t()
+    return hidden, logits
+
+
+@torch.no_grad()
+def _evaluate_attention_diagnostics(
+    model: DenseModel,
+    streams,
+    config: ExperimentConfig,
+    *,
+    kv_labels: dict[int, list[torch.Tensor]],
+    bases_by_layer: list[dict[str, torch.Tensor]],
+    ranks: list[int],
+    eval_batches: int,
+    device: torch.device,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    kv_rows: list[dict[str, Any]] = []
+    lowrank_layer_totals: dict[tuple[int, int, str], dict[str, float]] = {}
+    lowrank_rollout_totals: dict[int, dict[str, float]] = {}
+    kv_totals: dict[int, dict[str, float]] = {}
+    iterator = streams.eval_batches(config.training)
+    model.eval()
+    for _ in range(eval_batches):
+        tokens, targets = next(iterator)
+        tokens = tokens.to(device)
+        targets = targets.to(device)
+        dense_out = model(tokens, targets, return_loss_per_sample=True)
+        assert dense_out.logits is not None
+        assert dense_out.meta.hidden is not None
+        dense_logits = dense_out.logits
+        dense_hidden = dense_out.meta.hidden
+        dense_loss_sum = float(dense_out.loss_per_sample.sum().detach().cpu()) if dense_out.loss_per_sample is not None else 0.0
+        token_count = int(targets.numel())
+
+        for group_count, labels_by_layer in kv_labels.items():
+            hidden, logits = _attention_forward_with_kv_groups(
+                model,
+                tokens,
+                labels_by_layer=labels_by_layer,
+                group_count=group_count,
+            )
+            loss = F.cross_entropy(logits.float().flatten(0, -2), targets.flatten(), reduction="sum")
+            bucket = kv_totals.setdefault(
+                group_count,
+                {"loss": 0.0, "dense_loss": 0.0, "tokens": 0.0, "kl": 0.0, "cos": 0.0, "batches": 0.0},
+            )
+            bucket["loss"] += float(loss.detach().cpu())
+            bucket["dense_loss"] += dense_loss_sum
+            bucket["tokens"] += token_count
+            bucket["kl"] += float(logit_kl(dense_logits, logits).mean().detach().cpu())
+            bucket["cos"] += float(F.cosine_similarity(hidden.flatten(1).float(), dense_hidden.flatten(1).float(), dim=-1).mean().detach().cpu())
+            bucket["batches"] += 1.0
+
+        x = model.embed(tokens)
+        for layer_idx, block in enumerate(model.blocks):
+            normed = block.norm1(x)
+            full_attn = block.attn(normed)
+            b, s, d = normed.shape
+            h = block.attn.n_heads
+            hd = block.attn.head_dim
+            qkv = block.attn.wqkv(normed).view(b, s, 3, d)
+            for rank in ranks:
+                bases = bases_by_layer[layer_idx]
+                q_flat = _project_last_dim(qkv[:, :, 0, :], bases["q"][:, :rank])
+                k_flat = _project_last_dim(qkv[:, :, 1, :], bases["k"][:, :rank])
+                v_flat = _project_last_dim(qkv[:, :, 2, :], bases["v"][:, :rank])
+                q = q_flat.view(b, s, h, hd).transpose(1, 2)
+                k = k_flat.view(b, s, h, hd).transpose(1, 2)
+                v = v_flat.view(b, s, h, hd).transpose(1, 2)
+                if block.attn.rope is not None:
+                    q, k = block.attn.rope(q, k)
+                approx_attn = _attention_from_qkv(block, q, k, v)
+                approx_attn = _project_last_dim(approx_attn, bases["o"][:, :rank])
+                flat_full = full_attn.reshape(-1, d).float()
+                flat_approx = approx_attn.reshape(-1, d).float()
+                key = (layer_idx + 1, rank, "qkvo")
+                bucket = lowrank_layer_totals.setdefault(
+                    key,
+                    {"cos": 0.0, "count": 0.0, "err_sq": 0.0, "full_sq": 0.0},
+                )
+                cos = F.cosine_similarity(flat_approx, flat_full, dim=-1)
+                bucket["cos"] += float(cos.sum().detach().cpu())
+                bucket["count"] += float(cos.numel())
+                bucket["err_sq"] += float((flat_approx - flat_full).square().sum().detach().cpu())
+                bucket["full_sq"] += float(flat_full.square().sum().detach().cpu())
+            x = x + full_attn
+            x = x + block.mlp(block.norm2(x))
+
+        for rank in ranks:
+            hidden, logits = _attention_forward_with_lowrank(
+                model,
+                tokens,
+                bases_by_layer=bases_by_layer,
+                rank=rank,
+            )
+            loss = F.cross_entropy(logits.float().flatten(0, -2), targets.flatten(), reduction="sum")
+            bucket = lowrank_rollout_totals.setdefault(
+                rank,
+                {"loss": 0.0, "dense_loss": 0.0, "tokens": 0.0, "kl": 0.0, "cos": 0.0, "batches": 0.0},
+            )
+            bucket["loss"] += float(loss.detach().cpu())
+            bucket["dense_loss"] += dense_loss_sum
+            bucket["tokens"] += token_count
+            bucket["kl"] += float(logit_kl(dense_logits, logits).mean().detach().cpu())
+            bucket["cos"] += float(F.cosine_similarity(hidden.flatten(1).float(), dense_hidden.flatten(1).float(), dim=-1).mean().detach().cpu())
+            bucket["batches"] += 1.0
+
+    for group_count, values in sorted(kv_totals.items()):
+        kv_rows.append(
+            {
+                "kv_groups": group_count,
+                "nll_per_token": values["loss"] / max(values["tokens"], 1.0),
+                "dense_nll_per_token": values["dense_loss"] / max(values["tokens"], 1.0),
+                "nll_delta": (values["loss"] - values["dense_loss"]) / max(values["tokens"], 1.0),
+                "kl_to_dense": values["kl"] / max(values["batches"], 1.0),
+                "final_hidden_cosine": values["cos"] / max(values["batches"], 1.0),
+            }
+        )
+    lowrank_layer_rows = []
+    for (layer, rank, variant), values in sorted(lowrank_layer_totals.items()):
+        lowrank_layer_rows.append(
+            {
+                "layer": layer,
+                "rank": rank,
+                "variant": variant,
+                "attention_output_cosine": values["cos"] / max(values["count"], 1.0),
+                "attention_output_relative_error": math.sqrt(values["err_sq"] / max(values["full_sq"], 1e-12)),
+            }
+        )
+    lowrank_rollout_rows = []
+    for rank, values in sorted(lowrank_rollout_totals.items()):
+        lowrank_rollout_rows.append(
+            {
+                "rank": rank,
+                "nll_per_token": values["loss"] / max(values["tokens"], 1.0),
+                "dense_nll_per_token": values["dense_loss"] / max(values["tokens"], 1.0),
+                "nll_delta": (values["loss"] - values["dense_loss"]) / max(values["tokens"], 1.0),
+                "kl_to_dense": values["kl"] / max(values["batches"], 1.0),
+                "final_hidden_cosine": values["cos"] / max(values["batches"], 1.0),
+            }
+        )
+    return kv_rows, lowrank_layer_rows, lowrank_rollout_rows
+
+
+def cmd_attention_diagnostics(args: argparse.Namespace) -> None:
+    config = _model_for_mode(load_config(args.config), "dense_exact")
+    model_cfg = config.model
+    if args.random_init:
+        if args.d_model is not None:
+            model_cfg = dataclasses.replace(model_cfg, d_model=args.d_model)
+        if args.d_ff is not None:
+            model_cfg = dataclasses.replace(model_cfg, d_ff=args.d_ff)
+        if args.layers is not None:
+            model_cfg = dataclasses.replace(model_cfg, n_dense_layers=args.layers)
+        if args.heads is not None:
+            model_cfg = dataclasses.replace(model_cfg, n_heads=args.heads)
+        if args.vocab_size is not None:
+            model_cfg = dataclasses.replace(model_cfg, vocab_size=args.vocab_size)
+    if args.batch_size is not None:
+        config = dataclasses.replace(config, training=dataclasses.replace(config.training, batch_size=args.batch_size))
+    if args.seq_len is not None:
+        config = dataclasses.replace(config, training=dataclasses.replace(config.training, seq_len=args.seq_len))
+    config = dataclasses.replace(config, model=dataclasses.replace(model_cfg, topology="dense"))
+    ranks = _topk_list(args.ranks, [32, 64, 128])
+    max_rank = min(max(ranks), config.model.d_model)
+    ranks = [rank for rank in ranks if rank <= config.model.d_model]
+    kv_groups = _topk_list(args.kv_groups, [1, 2, min(4, config.model.n_heads)])
+    kv_groups = [count for count in kv_groups if count <= config.model.n_heads and config.model.n_heads % count == 0]
+    if not kv_groups:
+        raise SystemExit("no valid --kv-groups values for this head count")
+    set_seed(args.seed if args.seed is not None else config.training.seed)
+    device = default_device()
+    dtype = _benchmark_dtype(args.dtype, device)
+    streams = load_token_streams(config.data, config.training, config.model.vocab_size)
+    tokens_per_batch = config.training.batch_size * config.training.seq_len
+    calibration_batches = max(1, math.ceil(args.calibration_tokens / tokens_per_batch))
+    if args.random_init:
+        model = DenseModel(config.model).to(device)
+    else:
+        if not args.dense_checkpoint:
+            raise SystemExit("--dense-checkpoint is required unless --random-init is set")
+        model = _load_dense_model(config, args.dense_checkpoint, device)
+    model.to(dtype=dtype)
+    kv_grams, kv_sum_sqs, covs, calibration_tokens = _collect_attention_calibration_stats(
+        model,
+        streams,
+        config,
+        batches=calibration_batches,
+        device=device,
+        progress=args.progress,
+    )
+    kv_correlation_rows: list[dict[str, Any]] = []
+    kv_grouping_rows: list[dict[str, Any]] = []
+    kv_labels: dict[int, list[torch.Tensor]] = {count: [] for count in kv_groups}
+    for layer_idx in range(len(model.blocks)):
+        gram_k = kv_grams[layer_idx]["k"]
+        gram_v = kv_grams[layer_idx]["v"]
+        sum_k = kv_sum_sqs[layer_idx]["k"]
+        sum_v = kv_sum_sqs[layer_idx]["v"]
+        kv_correlation_rows.append(
+            {
+                "layer": layer_idx + 1,
+                "mean_k_head_cosine": _head_cosine_from_gram(gram_k, sum_k),
+                "mean_v_head_cosine": _head_cosine_from_gram(gram_v, sum_v),
+            }
+        )
+        for group_count in kv_groups:
+            labels = _labels_from_profile_gram(
+                gram_k + gram_v,
+                sum_k + sum_v,
+                group_count=group_count,
+                iters=args.cluster_iters,
+                seed=(args.seed if args.seed is not None else config.training.seed) + 17 * layer_idx + group_count,
+            )
+            kv_labels[group_count].append(labels)
+            k_err = _group_reconstruction_error_from_gram(gram_k, sum_k, labels, group_count=group_count)
+            v_err = _group_reconstruction_error_from_gram(gram_v, sum_v, labels, group_count=group_count)
+            joint_err = _group_reconstruction_error_from_gram(
+                gram_k + gram_v,
+                sum_k + sum_v,
+                labels,
+                group_count=group_count,
+            )
+            kv_grouping_rows.append(
+                {
+                    "layer": layer_idx + 1,
+                    "kv_groups": group_count,
+                    "k_group_relative_error": k_err,
+                    "v_group_relative_error": v_err,
+                    "joint_group_relative_error": joint_err,
+                    "labels": labels.tolist() if args.include_labels else None,
+                }
+            )
+    bases_by_layer = [
+        {name: _top_basis_from_cov(cov, max_rank, device) for name, cov in row.items()}
+        for row in covs
+    ]
+    spectral_rows: list[dict[str, Any]] = []
+    for layer_idx, row in enumerate(covs):
+        for proj, cov in row.items():
+            eigvals = torch.linalg.eigvalsh(cov.float()).clamp_min(0.0)
+            total = float(eigvals.sum().cpu())
+            eigvals = torch.sort(eigvals, descending=True).values
+            for rank in ranks:
+                kept = float(eigvals[:rank].sum().cpu())
+                spectral_rows.append(
+                    {
+                        "layer": layer_idx + 1,
+                        "projection": proj,
+                        "rank": rank,
+                        "activation_energy_retained": kept / max(total, 1e-12),
+                        "activation_relative_error_floor": math.sqrt(max(total - kept, 0.0) / max(total, 1e-12)),
+                    }
+                )
+    kv_eval_rows, lowrank_layer_rows, lowrank_rollout_rows = _evaluate_attention_diagnostics(
+        model,
+        streams,
+        config,
+        kv_labels=kv_labels,
+        bases_by_layer=bases_by_layer,
+        ranks=ranks,
+        eval_batches=args.eval_batches,
+        device=device,
+    )
+    report = {
+        "mode": "attention_diagnostics",
+        "checkpoint": args.dense_checkpoint,
+        "random_init": bool(args.random_init),
+        "device": str(device),
+        "dtype": str(dtype),
+        "calibration_tokens": calibration_tokens,
+        "eval_batches": args.eval_batches,
+        "eval_tokens": args.eval_batches * config.training.batch_size * config.training.seq_len,
+        "ranks": ranks,
+        "kv_groups": kv_groups,
+        "kv_head_correlation": kv_correlation_rows,
+        "kv_grouping_error": kv_grouping_rows,
+        "kv_group_rollout": kv_eval_rows,
+        "lowrank_spectrum": spectral_rows,
+        "lowrank_attention_output": lowrank_layer_rows,
+        "lowrank_rollout": lowrank_rollout_rows,
+    }
     if args.output:
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -7898,8 +8406,38 @@ def _benchmark_dtype(value: str, device: torch.device) -> torch.dtype:
     raise ValueError(f"unsupported benchmark dtype: {value}")
 
 
-def _benchmark_lm_loss_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    return F.cross_entropy(logits.float().flatten(0, -2), targets.flatten())
+def _benchmark_lm_loss_from_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    benchmark_loss: str = "ce",
+) -> torch.Tensor:
+    logits_f = logits.float()
+    if benchmark_loss == "ce":
+        return F.cross_entropy(logits_f.flatten(0, -2), targets.flatten())
+    if benchmark_loss == "clamped_ce":
+        safe = torch.nan_to_num(logits_f, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
+        return F.cross_entropy(safe.flatten(0, -2), targets.flatten())
+    if benchmark_loss == "logit_mse":
+        safe = torch.nan_to_num(logits_f, nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30.0, 30.0)
+        return safe.square().mean()
+    raise ValueError(f"unsupported benchmark loss: {benchmark_loss}")
+
+
+def _scale_random_benchmark_state(
+    state: dict[str, torch.Tensor],
+    *,
+    matrix_scale: float,
+) -> dict[str, torch.Tensor]:
+    if matrix_scale == 1.0:
+        return state
+    scaled: dict[str, torch.Tensor] = {}
+    for name, tensor in state.items():
+        value = tensor.detach().clone()
+        if torch.is_floating_point(value) and value.ndim >= 2:
+            value.mul_(float(matrix_scale))
+        scaled[name] = value
+    return scaled
 
 
 def _time_model_forward_components(
@@ -7910,6 +8448,7 @@ def _time_model_forward_components(
     device: torch.device,
     iters: int,
     warmup: int,
+    benchmark_loss: str = "ce",
 ) -> dict[str, float]:
     """Forward-only component timing for the full model.
 
@@ -7952,7 +8491,7 @@ def _time_model_forward_components(
         start = time.perf_counter()
         hidden = model.final_norm(x)
         logits = hidden @ model.vocab_weight.t()
-        loss = _benchmark_lm_loss_from_logits(logits, targets)
+        loss = _benchmark_lm_loss_from_logits(logits, targets, benchmark_loss=benchmark_loss)
         _sync_device(device)
         times["output_forward_seconds"] += time.perf_counter() - start
         # Keep the scalar live so eager execution cannot discard the loss path.
@@ -7988,6 +8527,7 @@ def _time_model_train_step(
     device: torch.device,
     iters: int,
     warmup: int,
+    benchmark_loss: str = "ce",
 ) -> dict[str, float]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     model.train()
@@ -7998,7 +8538,7 @@ def _time_model_train_step(
         optimizer.zero_grad(set_to_none=True)
         out = model(tokens, None)
         assert out.logits is not None
-        loss = _benchmark_lm_loss_from_logits(out.logits, targets)
+        loss = _benchmark_lm_loss_from_logits(out.logits, targets, benchmark_loss=benchmark_loss)
         loss.backward()
         _sync_device(device)
         fwd_bwd_end = time.perf_counter()
@@ -8043,6 +8583,7 @@ def _event_profile_model_train_step(
     device: torch.device,
     iters: int,
     warmup: int,
+    benchmark_loss: str = "ce",
 ) -> dict[str, Any]:
     """CUDA-event component profile for one full model train step.
 
@@ -8064,7 +8605,9 @@ def _event_profile_model_train_step(
     def run_once(measure: bool) -> tuple[dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]], float]:
         pairs: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {
             "embedding_forward": [],
-            "attention_forward": [],
+            "attention_qkv_projection_forward": [],
+            "attention_score_value_forward": [],
+            "attention_output_projection_forward": [],
             "ffn_forward": [],
             "output_head_forward": [],
             "attention_backward": [],
@@ -8113,7 +8656,29 @@ def _event_profile_model_train_step(
         x = timed_forward("embedding_forward", lambda: model.embed(tokens))
         for block in model.blocks:
             x_in = x
-            u = timed_forward("attention_forward", lambda block=block, x_in=x_in: x_in + block.attn(block.norm1(x_in)))
+            normed = block.norm1(x_in)
+            qkv = timed_forward(
+                "attention_qkv_projection_forward",
+                lambda block=block, normed=normed: block.attn.wqkv(normed),
+            )
+            b, s, d = normed.shape
+            qkv_view = qkv.view(b, s, 3, block.attn.n_heads, block.attn.head_dim)
+            q, k, v = qkv_view.unbind(dim=2)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            if block.attn.rope is not None:
+                q, k = block.attn.rope(q, k)
+            attn_heads = timed_forward(
+                "attention_score_value_forward",
+                lambda q=q, k=k, v=v: optimized.k_flash_causal_dense(q, k, v),
+            )
+            attn_flat = attn_heads.transpose(1, 2).contiguous().view(b, s, d)
+            attn_out = timed_forward(
+                "attention_output_projection_forward",
+                lambda block=block, attn_flat=attn_flat: block.attn.wo(attn_flat),
+            )
+            u = x_in + attn_out
             add_backward_segment("attention_backward", x_in, u)
             x_out = timed_forward("ffn_forward", lambda block=block, u=u: u + block.mlp(block.norm2(u)))
             add_backward_segment("ffn_backward", u, x_out)
@@ -8124,7 +8689,7 @@ def _event_profile_model_train_step(
             oh_fwd_start.record()
         hidden = model.final_norm(x)
         logits = hidden @ model.vocab_weight.t()
-        loss = _benchmark_lm_loss_from_logits(logits, targets)
+        loss = _benchmark_lm_loss_from_logits(logits, targets, benchmark_loss=benchmark_loss)
         if measure:
             oh_fwd_end.record()
             torch.cuda.nvtx.range_pop()
@@ -8173,9 +8738,16 @@ def _event_profile_model_train_step(
             totals[key] = totals.get(key, 0.0) + sum(start.elapsed_time(end) for start, end in ranges)
     denom = float(max(1, int(iters)))
     avg = {f"{key}_ms": value / denom for key, value in totals.items()}
+    avg["attention_forward_ms"] = (
+        avg.get("attention_qkv_projection_forward_ms", 0.0)
+        + avg.get("attention_score_value_forward_ms", 0.0)
+        + avg.get("attention_output_projection_forward_ms", 0.0)
+    )
     known = (
         avg.get("embedding_forward_ms", 0.0)
-        + avg.get("attention_forward_ms", 0.0)
+        + avg.get("attention_qkv_projection_forward_ms", 0.0)
+        + avg.get("attention_score_value_forward_ms", 0.0)
+        + avg.get("attention_output_projection_forward_ms", 0.0)
         + avg.get("attention_backward_ms", 0.0)
         + avg.get("ffn_forward_ms", 0.0)
         + avg.get("ffn_backward_ms", 0.0)
@@ -8235,8 +8807,9 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
         raise SystemExit("--dense-checkpoint is required unless --random-init is set")
     random_state = None
     if args.random_init:
-        random_state = copy.deepcopy(
-            DenseModel(dataclasses.replace(config.model, topology="dense")).state_dict()
+        random_state = _scale_random_benchmark_state(
+            copy.deepcopy(DenseModel(dataclasses.replace(config.model, topology="dense")).state_dict()),
+            matrix_scale=float(args.random_init_matrix_scale),
         )
 
     def make_dense_model() -> DenseModel:
@@ -8260,6 +8833,7 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
         device=device,
         iters=args.component_iters,
         warmup=args.component_warmup,
+        benchmark_loss=args.benchmark_loss,
     )
     dense_train = _time_model_train_step(
         dense,
@@ -8270,6 +8844,7 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
         device=device,
         iters=args.iters,
         warmup=args.warmup,
+        benchmark_loss=args.benchmark_loss,
     )
     dense_event_profile = _event_profile_model_train_step(
         dense,
@@ -8280,6 +8855,7 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
         device=device,
         iters=args.event_iters,
         warmup=args.event_warmup,
+        benchmark_loss=args.benchmark_loss,
     ) if args.event_profile else {}
     dense_param_count_value = sum(param.numel() for param in dense.parameters())
     del dense
@@ -8312,6 +8888,7 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
             device=device,
             iters=args.component_iters,
             warmup=args.component_warmup,
+            benchmark_loss=args.benchmark_loss,
         )
         sparse_train = _time_model_train_step(
             sparse,
@@ -8322,6 +8899,7 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
             device=device,
             iters=args.iters,
             warmup=args.warmup,
+            benchmark_loss=args.benchmark_loss,
         )
         sparse_event_profile = _event_profile_model_train_step(
             sparse,
@@ -8332,6 +8910,7 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
             device=device,
             iters=args.event_iters,
             warmup=args.event_warmup,
+            benchmark_loss=args.benchmark_loss,
         ) if args.event_profile else {}
         coverage = _active_union_coverage_metrics(sparse)
         sparse_param_count_value = sum(param.numel() for param in sparse.parameters())
@@ -8401,6 +8980,8 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
         "mode": "benchmark_active_union_model_train_step",
         "checkpoint": args.dense_checkpoint,
         "random_init": bool(args.random_init),
+        "random_init_matrix_scale": float(args.random_init_matrix_scale),
+        "benchmark_loss": args.benchmark_loss,
         "device": str(device),
         "iters": args.iters,
         "warmup": args.warmup,
@@ -10558,6 +11139,29 @@ def build_parser() -> argparse.ArgumentParser:
     head_regroup.add_argument("--output")
     head_regroup.set_defaults(func=cmd_head_regroup_oracle)
 
+    attention_diag = sub.add_parser("attention-diagnostics")
+    attention_diag.add_argument("--config", required=True)
+    attention_diag.add_argument("--dense-checkpoint")
+    attention_diag.add_argument("--random-init", action="store_true")
+    attention_diag.add_argument("--d-model", type=int)
+    attention_diag.add_argument("--d-ff", type=int)
+    attention_diag.add_argument("--layers", type=int)
+    attention_diag.add_argument("--heads", type=int)
+    attention_diag.add_argument("--vocab-size", type=int)
+    attention_diag.add_argument("--batch-size", type=int)
+    attention_diag.add_argument("--seq-len", type=int)
+    attention_diag.add_argument("--calibration-tokens", type=int, default=8192)
+    attention_diag.add_argument("--eval-batches", type=int, default=4)
+    attention_diag.add_argument("--ranks", type=int, nargs="+", default=[32, 64, 128, 192])
+    attention_diag.add_argument("--kv-groups", type=int, nargs="+", default=[1, 2, 4])
+    attention_diag.add_argument("--cluster-iters", type=int, default=16)
+    attention_diag.add_argument("--dtype", choices=["fp16", "bf16", "fp32"], default="fp32")
+    attention_diag.add_argument("--include-labels", action="store_true")
+    attention_diag.add_argument("--seed", type=int)
+    attention_diag.add_argument("--progress", type=int, default=0)
+    attention_diag.add_argument("--output")
+    attention_diag.set_defaults(func=cmd_attention_diagnostics)
+
     deferred_block = sub.add_parser("deferred-grouped-block-oracle")
     deferred_block.add_argument("--config", required=True)
     deferred_block.add_argument("--dense-checkpoint", required=True)
@@ -11013,6 +11617,24 @@ def build_parser() -> argparse.ArgumentParser:
     active_union_model_bench.add_argument("--config", required=True)
     active_union_model_bench.add_argument("--dense-checkpoint")
     active_union_model_bench.add_argument("--random-init", action="store_true")
+    active_union_model_bench.add_argument(
+        "--random-init-matrix-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Benchmark-only scale for randomly initialized matrix parameters. "
+            "Useful for large fp16 random speed probes where untrained logits can overflow."
+        ),
+    )
+    active_union_model_bench.add_argument(
+        "--benchmark-loss",
+        choices=["ce", "clamped_ce", "logit_mse"],
+        default="ce",
+        help=(
+            "Loss used by train-step benchmarks. Use ce for real checkpoints; "
+            "clamped_ce/logit_mse are synthetic random-init timing safeguards."
+        ),
+    )
     active_union_model_bench.add_argument("--d-model", type=int)
     active_union_model_bench.add_argument("--d-ff", type=int)
     active_union_model_bench.add_argument("--layers", type=int)

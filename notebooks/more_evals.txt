@@ -1,0 +1,358 @@
+$ /usr/bin/python3 -c from recursive_training_engine.cli import main; main() benchmark-active-union-model-train-step --config /content/Speedup-Thingy/runs/colab_static_cluster_ffn_d256_h2048_20260516_045603/configs/static_cluster_ffn_d256_h2048.yaml --random-init --d-model 1024 --d-ff 8192 --heads 8 --layers 6 --vocab-size 2048 --batch-size 16 --seq-len 64 --active-union-cap 192 320 --calibration-tokens 8192 --rank 64 --clusters 16 --candidate-m 192 --cluster-iters 4 --dtype fp16 --lr 0.0001 --weight-decay 0.0 --iters 5 --warmup 1 --component-iters 3 --component-warmup 1 --event-iters 3 --event-warmup 1 --output /content/Speedup-Thingy/runs/colab_static_cluster_ffn_d256_h2048_20260516_045603/reports/active_union_large_random_full_model_benchmark.json --triton-swiglu-backward
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory efficient kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:960.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory Efficient attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:552.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:962.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:339.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:964.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:680.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory efficient kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:960.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory Efficient attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:552.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:962.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:339.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:964.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:680.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory efficient kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:960.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory Efficient attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:552.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:962.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:339.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:964.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:680.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory efficient kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:960.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory Efficient attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:552.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:962.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:339.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:964.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:680.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory efficient kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:960.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory Efficient attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:552.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:962.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:339.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:964.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:680.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory efficient kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:960.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory Efficient attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:552.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:962.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:339.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:964.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:680.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory efficient kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:960.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory Efficient attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:552.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:962.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:339.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:964.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:680.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory efficient kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:960.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Memory Efficient attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/sdp_utils_cpp.h:552.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:962.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: Flash attention only supports gpu architectures in the range [sm80, sm121]. Attempting to run on a sm 7.5 gpu. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:339.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention kernel not used because: (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:964.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+/content/Speedup-Thingy/src/recursive_training_engine/kernels/optimized.py:83: UserWarning: cuDNN attention has been runtime disabled. (Triggered internally at /pytorch/aten/src/ATen/native/transformers/cuda/sdp_utils.cpp:680.)
+  return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+{
+  "checkpoint": null,
+  "component_iters": 3,
+  "component_warmup": 1,
+  "device": "cuda",
+  "event_iters": 3,
+  "event_profile": true,
+  "event_warmup": 1,
+  "iters": 5,
+  "mode": "benchmark_active_union_model_train_step",
+  "random_init": true,
+  "rows": [
+    {
+      "active_union_cap": 192,
+      "attention_forward_speedup": 0.597655047054551,
+      "batch_size": 16,
+      "calibration_avg_cluster_imbalance": 1.1653645833333333,
+      "calibration_avg_nonempty_clusters": 16.0,
+      "calibration_tokens": 8192,
+      "candidate_m": 192,
+      "clusters": 16,
+      "coverage": {
+        "mean": {
+          "coverage_fraction": 0.0234375,
+          "unique_selected_neurons": 192.0
+        },
+        "rows": [
+          {
+            "coverage_fraction": 0.0234375,
+            "layer": 0.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.0234375,
+            "layer": 1.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.0234375,
+            "layer": 2.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.0234375,
+            "layer": 3.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.0234375,
+            "layer": 4.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.0234375,
+            "layer": 5.0,
+            "unique_selected_neurons": 192.0
+          }
+        ]
+      },
+      "dense_components": {
+        "attention_forward_ms": 7.546185666683414,
+        "embed_forward_ms": 0.09907433339625034,
+        "ffn_forward_ms": 18.911735333328277,
+        "loss_value": 963.5505981445312,
+        "output_forward_ms": 0.7216176666891746
+      },
+      "dense_event_profile": {
+        "attention_backward_ms": 8.072362661361694,
+        "attention_forward_backward_ms": 12.557482659816742,
+        "attention_forward_ms": 4.485119998455048,
+        "available": true,
+        "embedding_forward_ms": 0.09739733239014943,
+        "ffn_backward_ms": 18.201120138168335,
+        "ffn_forward_backward_ms": 27.74934415022532,
+        "ffn_forward_ms": 9.548224012056986,
+        "loss": NaN,
+        "misc_overhead_ms": 0.6881484041611401,
+        "optimizer_ms": 26.908341725667317,
+        "output_head_backward_ms": 0.447135994831721,
+        "output_head_forward_backward_ms": 0.8521706561247508,
+        "output_head_forward_ms": 0.4050346612930298,
+        "total_step_ms": 68.85288492838542
+      },
+      "dense_forward_backward_ms": 53.762449599980755,
+      "dense_loss": NaN,
+      "dense_optimizer_ms": 27.31599720000304,
+      "dense_packed_ffn_baseline": true,
+      "dense_param_count": 178271232,
+      "dense_total_step_ms": 81.0784467999838,
+      "dtype": "torch.float16",
+      "event_attention_fwd_bwd_speedup": 0.7201113782132442,
+      "event_ffn_fwd_bwd_speedup": 3.9526337537965084,
+      "event_output_head_fwd_bwd_speedup": 0.6673321163808982,
+      "event_total_step_speedup": 2.140210408397807,
+      "ffn_forward_speedup": 4.272394729702037,
+      "forward_backward_speedup": 1.6388506174217976,
+      "optimizer_speedup": 5.092194378816595,
+      "output_forward_speedup": 0.6940987341444198,
+      "rank": 64,
+      "seq_len": 64,
+      "sparse_components": {
+        "attention_forward_ms": 12.626322999987375,
+        "embed_forward_ms": 0.7804443333346475,
+        "ffn_forward_ms": 4.426495333367105,
+        "loss_value": 992.1978759765625,
+        "output_forward_ms": 1.0396470000462916
+      },
+      "sparse_event_profile": {
+        "attention_backward_ms": 10.371647914250692,
+        "attention_forward_backward_ms": 17.438250581423443,
+        "attention_forward_ms": 7.0666026671727495,
+        "available": true,
+        "embedding_forward_ms": 0.14591999848683676,
+        "ffn_backward_ms": 4.046495993932088,
+        "ffn_forward_backward_ms": 7.020469357570012,
+        "ffn_forward_ms": 2.973973363637924,
+        "loss": NaN,
+        "misc_overhead_ms": 1.3398288985093423,
+        "optimizer_ms": 4.949632008870442,
+        "output_head_backward_ms": 0.660426676273346,
+        "output_head_forward_backward_ms": 1.2769813338915506,
+        "output_head_forward_ms": 0.6165546576182047,
+        "total_step_ms": 32.171082178751625
+      },
+      "sparse_forward_backward_ms": 32.80497259997901,
+      "sparse_loss": NaN,
+      "sparse_optimizer_ms": 5.364288000009765,
+      "sparse_param_count": 30815232,
+      "sparse_param_fraction": 0.17285588737054333,
+      "sparse_total_step_ms": 38.169260599988775,
+      "tokens": 1024,
+      "total_step_speedup": 2.1241817505893117,
+      "triton_swiglu_backward_requested": true,
+      "triton_swiglu_backward_used": true
+    },
+    {
+      "active_union_cap": 320,
+      "attention_forward_speedup": 0.9560632229734999,
+      "batch_size": 16,
+      "calibration_avg_cluster_imbalance": 1.1653645833333333,
+      "calibration_avg_nonempty_clusters": 16.0,
+      "calibration_tokens": 8192,
+      "candidate_m": 192,
+      "clusters": 16,
+      "coverage": {
+        "mean": {
+          "coverage_fraction": 0.0390625,
+          "unique_selected_neurons": 320.0
+        },
+        "rows": [
+          {
+            "coverage_fraction": 0.0390625,
+            "layer": 0.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.0390625,
+            "layer": 1.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.0390625,
+            "layer": 2.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.0390625,
+            "layer": 3.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.0390625,
+            "layer": 4.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.0390625,
+            "layer": 5.0,
+            "unique_selected_neurons": 320.0
+          }
+        ]
+      },
+      "dense_components": {
+        "attention_forward_ms": 7.546185666683414,
+        "embed_forward_ms": 0.09907433339625034,
+        "ffn_forward_ms": 18.911735333328277,
+        "loss_value": 963.5505981445312,
+        "output_forward_ms": 0.7216176666891746
+      },
+      "dense_event_profile": {
+        "attention_backward_ms": 8.072362661361694,
+        "attention_forward_backward_ms": 12.557482659816742,
+        "attention_forward_ms": 4.485119998455048,
+        "available": true,
+        "embedding_forward_ms": 0.09739733239014943,
+        "ffn_backward_ms": 18.201120138168335,
+        "ffn_forward_backward_ms": 27.74934415022532,
+        "ffn_forward_ms": 9.548224012056986,
+        "loss": NaN,
+        "misc_overhead_ms": 0.6881484041611401,
+        "optimizer_ms": 26.908341725667317,
+        "output_head_backward_ms": 0.447135994831721,
+        "output_head_forward_backward_ms": 0.8521706561247508,
+        "output_head_forward_ms": 0.4050346612930298,
+        "total_step_ms": 68.85288492838542
+      },
+      "dense_forward_backward_ms": 53.762449599980755,
+      "dense_loss": NaN,
+      "dense_optimizer_ms": 27.31599720000304,
+      "dense_packed_ffn_baseline": true,
+      "dense_param_count": 178271232,
+      "dense_total_step_ms": 81.0784467999838,
+      "dtype": "torch.float16",
+      "event_attention_fwd_bwd_speedup": 0.807645738017446,
+      "event_ffn_fwd_bwd_speedup": 4.485447121082346,
+      "event_output_head_fwd_bwd_speedup": 0.7082912082865434,
+      "event_total_step_speedup": 1.7838895485136044,
+      "ffn_forward_speedup": 5.881221220530715,
+      "forward_backward_speedup": 1.8651880728894608,
+      "optimizer_speedup": 4.949079733146967,
+      "output_forward_speedup": 1.0229399827653096,
+      "rank": 64,
+      "seq_len": 64,
+      "sparse_components": {
+        "attention_forward_ms": 7.892977666491182,
+        "embed_forward_ms": 0.11278466665013791,
+        "ffn_forward_ms": 3.215613666649612,
+        "loss_value": 991.6734619140625,
+        "output_forward_ms": 0.7054349999483142
+      },
+      "sparse_event_profile": {
+        "attention_backward_ms": 9.460320035616556,
+        "attention_forward_backward_ms": 15.548255960146586,
+        "attention_forward_ms": 6.087935924530029,
+        "available": true,
+        "embedding_forward_ms": 0.11242666840553284,
+        "ffn_backward_ms": 3.7141759991645813,
+        "ffn_forward_backward_ms": 6.1865279873212184,
+        "ffn_forward_ms": 2.4723519881566367,
+        "loss": NaN,
+        "misc_overhead_ms": 10.35688534379005,
+        "optimizer_ms": 5.189824104309082,
+        "output_head_backward_ms": 0.637930671374003,
+        "output_head_forward_backward_ms": 1.2031360069910684,
+        "output_head_forward_ms": 0.5652053356170654,
+        "total_step_ms": 38.59705607096354
+      },
+      "sparse_forward_backward_ms": 28.82414399996378,
+      "sparse_loss": NaN,
+      "sparse_optimizer_ms": 5.519409399903452,
+      "sparse_param_count": 33174528,
+      "sparse_param_fraction": 0.18609019317261463,
+      "sparse_total_step_ms": 34.34355339986723,
+      "tokens": 1024,
+      "total_step_speedup": 2.3608054139295103,
+      "triton_swiglu_backward_requested": true,
+      "triton_swiglu_backward_used": true
+    }
+  ],
+  "warmup": 1
+}
