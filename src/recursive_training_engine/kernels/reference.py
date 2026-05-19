@@ -14,7 +14,7 @@ def k_fused_rmsnorm(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     y = x if residual is None else x + residual
     normed = y * torch.rsqrt(y.float().pow(2).mean(dim=-1, keepdim=True) + eps).to(y.dtype)
-    return normed * weight, y if residual is not None else None
+    return normed * weight.to(normed.dtype), y if residual is not None else None
 
 
 def k_rope_apply(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
