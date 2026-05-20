@@ -4917,30 +4917,12 @@ def _active_union_ids_from_codebook(
     *,
     hidden: int,
     cap: int | None = None,
-    selection: str = "frequency",
-    energy_scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     candidate_ids = candidate_ids.to(dtype=torch.long)
     full_union = torch.unique(candidate_ids.reshape(-1), sorted=True)
     if cap is None or int(cap) <= 0 or full_union.numel() <= int(cap):
         return full_union
     cap = min(int(cap), hidden)
-    selection = str(selection).strip().lower().replace("-", "_")
-    if selection in {"energy", "output_energy"}:
-        if energy_scores is None:
-            raise ValueError("output-energy active-union selection requires calibration energy scores")
-        scores = energy_scores.detach().to(device=full_union.device, dtype=torch.float32)
-        if scores.numel() < hidden:
-            raise ValueError(
-                f"energy score length {scores.numel()} is smaller than hidden size {hidden}"
-            )
-        union_scores = scores.index_select(0, full_union)
-        active = full_union[torch.topk(union_scores, k=cap, dim=0).indices]
-        return torch.sort(active).values
-    if selection in {"residual", "residual_greedy"}:
-        raise ValueError("residual-greedy active-union selection requires precomputed active ids")
-    if selection != "frequency":
-        raise ValueError(f"unknown active-union selection mode: {selection}")
     cluster_count, candidate_m = candidate_ids.shape
     # Candidate ids are sorted within each cluster by aggregate score. Use a
     # simple frequency-plus-rank score so capped union remains tied to the
@@ -4960,288 +4942,6 @@ def _active_union_ids_from_codebook(
 
 
 @torch.no_grad()
-def _build_active_union_output_energy_scores(
-    model: DenseModel,
-    streams,
-    config: ExperimentConfig,
-    *,
-    calibration_batches: int,
-    device: torch.device,
-) -> list[torch.Tensor]:
-    """Score FFN neurons by calibration output energy.
-
-    For neuron j, score_j = sum_i z_ij^2 * ||W_down_j||^2, where z is the
-    dense SwiGLU activation on calibration tokens. This is an offline active-set
-    cap objective; the packed hot path remains unchanged.
-    """
-
-    was_training = model.training
-    model.eval()
-    scores: list[torch.Tensor] = []
-    wd_norm_sq: list[torch.Tensor] = []
-    for layer_idx, block in enumerate(model.blocks):
-        if not hasattr(block.mlp, "wug") or not hasattr(block.mlp, "wd"):
-            raise RuntimeError(
-                "output-energy active selection requires dense/indexed FFN weights; "
-                f"layer {layer_idx} has {type(block.mlp).__name__}"
-            )
-        d_ff = int(block.mlp.wd.in_features)
-        scores.append(torch.zeros(d_ff, device=device, dtype=torch.float32))
-        wd_norm_sq.append(block.mlp.wd.weight.detach().float().pow(2).sum(dim=0).to(device=device))
-
-    batches = streams.train_batches(config.training)
-    for _ in range(max(1, int(calibration_batches))):
-        tokens, _ = next(batches)
-        x = model.embed(tokens.to(device))
-        for layer_idx, block in enumerate(model.blocks):
-            u = x + block.attn(block.norm1(x))
-            normed = block.norm2(u)
-            up, gate = block.mlp.wug(normed).chunk(2, dim=-1)
-            z = up * F.silu(gate)
-            token_energy = z.float().reshape(-1, z.shape[-1]).pow(2).sum(dim=0)
-            scores[layer_idx].add_(token_energy * wd_norm_sq[layer_idx])
-            if hasattr(block.mlp, "dense_forward"):
-                ffn = block.mlp.dense_forward(normed)
-            else:
-                ffn = block.mlp(normed)
-            x = u + ffn
-    model.train(was_training)
-    return scores
-
-
-@torch.no_grad()
-def _build_active_union_residual_greedy_order(
-    model: DenseModel,
-    streams,
-    config: ExperimentConfig,
-    codebook: list[dict[str, torch.Tensor]],
-    *,
-    calibration_batches: int,
-    device: torch.device,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], dict[str, float]]:
-    """Build per-layer active-neuron prefixes by FFN residual reduction.
-
-    For each layer we restrict to the static cluster union, then greedily pick
-    contribution atoms c_j = z_j W_down_j that most reduce dense FFN output
-    error on calibration tokens. The expensive work is offline; the selected
-    ids are still used by the normal packed active-union hot path.
-    """
-
-    was_training = model.training
-    model.eval()
-    union_ids: list[torch.Tensor] = []
-    wd_rows: list[torch.Tensor] = []
-    ztz: list[torch.Tensor] = []
-    zy: list[torch.Tensor] = []
-    y_norm_sq = [0.0 for _ in model.blocks]
-    for layer_idx, block in enumerate(model.blocks):
-        if not hasattr(block.mlp, "wug") or not hasattr(block.mlp, "wd"):
-            raise RuntimeError(
-                "residual-greedy active selection requires dense/indexed FFN weights; "
-                f"layer {layer_idx} has {type(block.mlp).__name__}"
-            )
-        ids = torch.unique(
-            codebook[layer_idx]["candidate_ids"].reshape(-1).to(device=device, dtype=torch.long),
-            sorted=True,
-        )
-        union_ids.append(ids)
-        rows = block.mlp.wd.weight.detach().t().index_select(0, ids).float().to(device=device)
-        wd_rows.append(rows)
-        m = int(ids.numel())
-        d = int(rows.shape[-1])
-        ztz.append(torch.zeros((m, m), device=device, dtype=torch.float32))
-        zy.append(torch.zeros((m, d), device=device, dtype=torch.float32))
-
-    batches = streams.train_batches(config.training)
-    for _ in range(max(1, int(calibration_batches))):
-        tokens, _ = next(batches)
-        x = model.embed(tokens.to(device))
-        for layer_idx, block in enumerate(model.blocks):
-            u = x + block.attn(block.norm1(x))
-            normed = block.norm2(u)
-            up, gate = block.mlp.wug(normed).chunk(2, dim=-1)
-            z = up * F.silu(gate)
-            y = block.mlp.wd(z)
-            ids = union_ids[layer_idx]
-            zc = z.reshape(-1, z.shape[-1]).index_select(1, ids).float()
-            y_flat = y.reshape(-1, y.shape[-1]).float()
-            ztz[layer_idx].add_(zc.t().matmul(zc))
-            zy[layer_idx].add_(zc.t().matmul(y_flat))
-            y_norm_sq[layer_idx] += float(y_flat.square().sum().detach().cpu())
-            x = u + y
-
-    orders: list[torch.Tensor] = []
-    gain_curves: list[torch.Tensor] = []
-    selected_counts: list[int] = []
-    final_gain_fractions: list[float] = []
-    for layer_idx, ids in enumerate(union_ids):
-        rows = wd_rows[layer_idx]
-        gram = ztz[layer_idx] * rows.matmul(rows.t())
-        b = (zy[layer_idx] * rows).sum(dim=1)
-        diag = torch.diagonal(gram)
-        corr = b.clone()
-        selected = torch.zeros(ids.numel(), device=device, dtype=torch.bool)
-        order_positions: list[torch.Tensor] = []
-        gains: list[float] = []
-        cumulative_gain = 0.0
-        denom = max(float(y_norm_sq[layer_idx]), 1e-12)
-        for _ in range(int(ids.numel())):
-            scores = 2.0 * corr - diag
-            scores = scores.masked_fill(selected, float("-inf"))
-            best_score, best_idx = torch.max(scores, dim=0)
-            score_value = float(best_score.detach().cpu())
-            if not math.isfinite(score_value) or score_value <= 0.0:
-                break
-            selected[best_idx] = True
-            order_positions.append(best_idx.detach())
-            cumulative_gain += score_value
-            gains.append(min(max(cumulative_gain / denom, 0.0), 1.0))
-            corr.sub_(gram[:, best_idx])
-        if order_positions:
-            order_pos = torch.stack(order_positions).to(device=device, dtype=torch.long)
-            order_ids = ids.index_select(0, order_pos)
-            gain_curve = torch.tensor(gains, device=device, dtype=torch.float32)
-        else:
-            order_ids = ids[:0]
-            gain_curve = torch.empty(0, device=device, dtype=torch.float32)
-        orders.append(order_ids)
-        gain_curves.append(gain_curve)
-        selected_counts.append(int(order_ids.numel()))
-        final_gain_fractions.append(float(gain_curve[-1].item()) if gain_curve.numel() else 0.0)
-    model.train(was_training)
-    return orders, gain_curves, {
-        "active_union_residual_order_mean": float(sum(selected_counts) / max(len(selected_counts), 1)),
-        "active_union_residual_order_max": float(max(selected_counts) if selected_counts else 0),
-        "active_union_residual_order_min": float(min(selected_counts) if selected_counts else 0),
-        "active_union_residual_gain_fraction_mean": float(
-            sum(final_gain_fractions) / max(len(final_gain_fractions), 1)
-        ),
-    }
-
-
-@torch.no_grad()
-def _active_union_ids_from_residual_order(
-    orders: Sequence[torch.Tensor],
-    gain_curves: Sequence[torch.Tensor],
-    *,
-    cap: int | None = None,
-    layer_caps: Sequence[int] | None = None,
-    retention: float | None = None,
-) -> tuple[list[torch.Tensor], dict[str, float]]:
-    active_ids: list[torch.Tensor] = []
-    caps: list[int] = []
-    retained: list[float] = []
-    for layer_idx, order in enumerate(orders):
-        curve = gain_curves[layer_idx]
-        if retention is not None and float(retention) > 0.0:
-            if curve.numel() == 0:
-                count = 0
-            else:
-                target = torch.tensor(float(retention), device=curve.device, dtype=curve.dtype)
-                count = int(torch.searchsorted(curve, target).item()) + 1
-        elif layer_caps is not None:
-            count = int(layer_caps[layer_idx])
-        elif cap is not None and int(cap) > 0:
-            count = int(cap)
-        else:
-            count = int(order.numel())
-        count = min(max(count, 0), int(order.numel()))
-        ids = torch.sort(order[:count]).values
-        active_ids.append(ids)
-        caps.append(count)
-        retained.append(float(curve[count - 1].item()) if count > 0 and curve.numel() else 0.0)
-    return active_ids, {
-        "active_union_residual_retention_target": float(retention or 0.0),
-        "active_union_residual_retention_mean": float(sum(retained) / max(len(retained), 1)),
-        "active_union_adaptive_cap_mean": float(sum(caps) / max(len(caps), 1)),
-        "active_union_adaptive_cap_max": float(max(caps) if caps else 0),
-        "active_union_adaptive_cap_min": float(min(caps) if caps else 0),
-    }
-
-
-@torch.no_grad()
-def _add_residual_rescue_rows(
-    core_ids_by_layer: Sequence[torch.Tensor],
-    residual_orders: Sequence[torch.Tensor],
-    *,
-    rescue_rows: int,
-) -> tuple[list[torch.Tensor], dict[str, float]]:
-    rescue_rows = max(0, int(rescue_rows))
-    if rescue_rows <= 0:
-        return [ids.detach().clone() for ids in core_ids_by_layer], {
-            "active_union_rescue_rows": 0.0,
-            "active_union_rescue_added_mean": 0.0,
-        }
-    merged: list[torch.Tensor] = []
-    added_counts: list[int] = []
-    for core_ids, order in zip(core_ids_by_layer, residual_orders):
-        core = torch.unique(core_ids.detach().to(device=order.device, dtype=torch.long), sorted=True)
-        rescue: list[torch.Tensor] = []
-        core_cpu = set(int(x) for x in core.detach().cpu().tolist())
-        for idx in order.detach().to(device=order.device, dtype=torch.long):
-            value = int(idx.detach().cpu().item())
-            if value in core_cpu:
-                continue
-            rescue.append(idx.detach())
-            core_cpu.add(value)
-            if len(rescue) >= rescue_rows:
-                break
-        if rescue:
-            rescue_ids = torch.stack(rescue).to(device=core.device, dtype=torch.long)
-            ids = torch.unique(torch.cat([core, rescue_ids], dim=0), sorted=True)
-        else:
-            ids = core
-        merged.append(ids)
-        added_counts.append(max(0, int(ids.numel()) - int(core.numel())))
-    return merged, {
-        "active_union_rescue_rows": float(rescue_rows),
-        "active_union_rescue_added_mean": float(sum(added_counts) / max(len(added_counts), 1)),
-        "active_union_rescue_added_max": float(max(added_counts) if added_counts else 0),
-        "active_union_rescue_added_min": float(min(added_counts) if added_counts else 0),
-    }
-
-
-@torch.no_grad()
-def _active_union_layer_caps_from_energy_retention(
-    codebook: list[dict[str, torch.Tensor]],
-    energy_scores: Sequence[torch.Tensor],
-    *,
-    retention: float,
-) -> tuple[list[int], dict[str, float]]:
-    retention = float(retention)
-    if not (0.0 < retention <= 1.0):
-        raise ValueError("--active-union-energy-retention must be in (0, 1]")
-    caps: list[int] = []
-    retained: list[float] = []
-    union_sizes: list[int] = []
-    for layer_idx, layer_codebook in enumerate(codebook):
-        ids = torch.unique(layer_codebook["candidate_ids"].reshape(-1).to(dtype=torch.long), sorted=True)
-        layer_scores = energy_scores[layer_idx].detach().to(device=ids.device, dtype=torch.float32)
-        values = layer_scores.index_select(0, ids).clamp_min(0.0)
-        union_sizes.append(int(ids.numel()))
-        total = float(values.sum().item())
-        if total <= 0.0:
-            caps.append(int(ids.numel()))
-            retained.append(1.0)
-            continue
-        sorted_values = torch.sort(values, descending=True).values
-        cumulative = torch.cumsum(sorted_values, dim=0)
-        target = total * retention
-        cap = int(torch.searchsorted(cumulative, torch.tensor(target, device=cumulative.device)).item()) + 1
-        cap = min(max(cap, 1), int(ids.numel()))
-        caps.append(cap)
-        retained.append(float(cumulative[cap - 1].item() / max(total, 1e-12)))
-    return caps, {
-        "active_union_energy_retention_target": retention,
-        "active_union_energy_retention_mean": float(sum(retained) / max(len(retained), 1)),
-        "active_union_adaptive_cap_mean": float(sum(caps) / max(len(caps), 1)),
-        "active_union_adaptive_cap_max": float(max(caps) if caps else 0),
-        "active_union_adaptive_cap_min": float(min(caps) if caps else 0),
-        "active_union_union_size_mean": float(sum(union_sizes) / max(len(union_sizes), 1)),
-    }
-
-
-@torch.no_grad()
 def _ffn_neuron_static_union_output(
     block: torch.nn.Module,
     normed: torch.Tensor,
@@ -5249,9 +4949,6 @@ def _ffn_neuron_static_union_output(
     *,
     reference_k: int,
     cap: int | None = None,
-    active_selection: str = "frequency",
-    energy_scores: torch.Tensor | None = None,
-    active_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Evaluate one FFN using the union of all static cluster candidates."""
 
@@ -5259,16 +4956,11 @@ def _ffn_neuron_static_union_output(
     flat = normed.reshape(-1, normed.shape[-1])
     hidden = block.mlp.wd.in_features
     reference_k = min(max(1, int(reference_k)), hidden)
-    if active_ids is None:
-        active_ids = _active_union_ids_from_codebook(
-            codebook["candidate_ids"].to(device=flat.device),
-            hidden=hidden,
-            cap=cap,
-            selection=active_selection,
-            energy_scores=energy_scores,
-        )
-    else:
-        active_ids = torch.unique(active_ids.detach().to(device=flat.device, dtype=torch.long), sorted=True)
+    active_ids = _active_union_ids_from_codebook(
+        codebook["candidate_ids"].to(device=flat.device),
+        hidden=hidden,
+        cap=cap,
+    )
     up_weight, gate_weight = block.mlp.wug.weight.detach().chunk(2, dim=0)
     wd_rows = block.mlp.wd.weight.t().contiguous()
     up = flat @ up_weight.index_select(0, active_ids).t().contiguous()
@@ -5304,9 +4996,6 @@ def _svd_static_union_full_stack_logits(
     reference_k: int,
     cap: int | None = None,
     layer_caps: Sequence[int] | None = None,
-    active_selection: str = "frequency",
-    energy_scores: Sequence[torch.Tensor] | None = None,
-    active_ids_by_layer: Sequence[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     x = dense.embed(tokens)
     aux = {
@@ -5326,9 +5015,6 @@ def _svd_static_union_full_stack_logits(
             codebook[layer_idx],
             reference_k=reference_k,
             cap=layer_cap,
-            active_selection=active_selection,
-            energy_scores=None if energy_scores is None else energy_scores[layer_idx],
-            active_ids=None if active_ids_by_layer is None else active_ids_by_layer[layer_idx],
         )
         for key in aux:
             aux[key] += float(layer_aux.get(key, 0.0))
@@ -5399,28 +5085,17 @@ def _install_active_union_ffns(
     cap: int | None = None,
     layer_caps: Sequence[int] | None = None,
     packed: bool = False,
-    active_selection: str = "frequency",
-    energy_scores: Sequence[torch.Tensor] | None = None,
-    active_ids_by_layer: Sequence[torch.Tensor] | None = None,
 ) -> None:
     for layer_idx, block in enumerate(model.blocks):
         layer_cap = cap if layer_caps is None else int(layer_caps[layer_idx])
         hidden = int(codebook[layer_idx]["candidate_ids"].max().item()) + 1
         if hasattr(block.mlp, "wd"):
             hidden = int(block.mlp.wd.in_features)
-        if active_ids_by_layer is None:
-            active_ids = _active_union_ids_from_codebook(
-                codebook[layer_idx]["candidate_ids"],
-                hidden=hidden,
-                cap=layer_cap,
-                selection=active_selection,
-                energy_scores=None if energy_scores is None else energy_scores[layer_idx],
-            )
-        else:
-            active_ids = torch.unique(
-                active_ids_by_layer[layer_idx].detach().to(dtype=torch.long),
-                sorted=True,
-            )
+        active_ids = _active_union_ids_from_codebook(
+            codebook[layer_idx]["candidate_ids"],
+            hidden=hidden,
+            cap=layer_cap,
+        )
         if packed:
             if isinstance(block.mlp, PackedActiveUnionSwiGLU):
                 if torch.equal(block.mlp.active_ids.detach().cpu(), active_ids.detach().cpu()):
@@ -5526,11 +5201,6 @@ def _refresh_active_union_ffns(
     cap: int | None = None,
     layer_caps: Sequence[int] | None = None,
     packed: bool = False,
-    active_selection: str = "frequency",
-    energy_retention: float | None = None,
-    residual_retention: float | None = None,
-    residual_rel_error: float | None = None,
-    rescue_rows: int = 0,
 ) -> dict[str, float]:
     was_training = model.training
     _set_active_union_sparse_enabled(model, False)
@@ -5549,150 +5219,7 @@ def _refresh_active_union_ffns(
         aggregation=aggregation,
         cluster_iters=cluster_iters,
     )
-    energy_scores = None
-    residual_orders = None
-    residual_gain_curves = None
-    normalized_selection = str(active_selection).strip().lower().replace("-", "_")
-    has_energy_retention = energy_retention is not None and float(energy_retention) > 0.0
-    residual_target = None
-    if residual_retention is not None and float(residual_retention) > 0.0:
-        residual_target = float(residual_retention)
-    if residual_rel_error is not None and float(residual_rel_error) > 0.0:
-        residual_target = max(0.0, min(1.0, 1.0 - float(residual_rel_error) ** 2))
-    has_residual_target = residual_target is not None and residual_target > 0.0
-    rescue_rows = max(0, int(rescue_rows))
-    has_active_cap = (
-        (cap is not None and int(cap) > 0)
-        or bool(layer_caps)
-        or has_energy_retention
-        or has_residual_target
-    )
-    effective_layer_caps = layer_caps
-    effective_cap = cap
-    active_ids_by_layer = None
-    if normalized_selection in {"residual", "residual_greedy"}:
-        if not has_active_cap:
-            active_ids_by_layer = [
-                torch.unique(layer["candidate_ids"].reshape(-1).to(dtype=torch.long), sorted=True)
-                for layer in codebook
-            ]
-        else:
-            residual_orders, residual_gain_curves, residual_aux = _build_active_union_residual_greedy_order(
-                model,
-                streams,
-                config,
-                codebook,
-                calibration_batches=calibration_batches,
-                device=device,
-            )
-            aux.update(residual_aux)
-            if rescue_rows and not has_residual_target:
-                if layer_caps is not None:
-                    residual_layer_caps = [int(value) + rescue_rows for value in layer_caps]
-                    residual_cap = None
-                elif cap is not None and int(cap) > 0:
-                    residual_layer_caps = None
-                    residual_cap = int(cap) + rescue_rows
-                else:
-                    residual_layer_caps = None
-                    residual_cap = None
-            else:
-                residual_layer_caps = layer_caps
-                residual_cap = cap
-            active_ids_by_layer, residual_select_aux = _active_union_ids_from_residual_order(
-                residual_orders,
-                residual_gain_curves,
-                cap=residual_cap,
-                layer_caps=residual_layer_caps,
-                retention=residual_target,
-            )
-            if rescue_rows and has_residual_target:
-                active_ids_by_layer, rescue_aux = _add_residual_rescue_rows(
-                    active_ids_by_layer,
-                    residual_orders,
-                    rescue_rows=rescue_rows,
-                )
-                aux.update(rescue_aux)
-            elif rescue_rows:
-                aux["active_union_rescue_rows"] = float(rescue_rows)
-            aux.update(residual_select_aux)
-        aux["active_union_selection"] = "residual_greedy"
-        aux["active_union_layer_caps"] = [int(ids.numel()) for ids in active_ids_by_layer]
-        effective_cap = None
-        effective_layer_caps = None
-    elif normalized_selection in {"energy", "output_energy"}:
-        if has_active_cap:
-            energy_scores = _build_active_union_output_energy_scores(
-                model,
-                streams,
-                config,
-                calibration_batches=calibration_batches,
-                device=device,
-            )
-        if has_energy_retention:
-            assert energy_scores is not None
-            effective_layer_caps, retention_aux = _active_union_layer_caps_from_energy_retention(
-                codebook,
-                energy_scores,
-                retention=float(energy_retention),
-            )
-            effective_cap = None
-            aux.update(retention_aux)
-            aux["active_union_layer_caps"] = list(effective_layer_caps)
-        if rescue_rows:
-            if residual_orders is None:
-                residual_orders, residual_gain_curves, residual_aux = _build_active_union_residual_greedy_order(
-                    model,
-                    streams,
-                    config,
-                    codebook,
-                    calibration_batches=calibration_batches,
-                    device=device,
-                )
-                aux.update(residual_aux)
-            core_ids: list[torch.Tensor] = []
-            for layer_idx, layer_codebook in enumerate(codebook):
-                hidden = int(layer_codebook["candidate_ids"].max().item()) + 1
-                if hasattr(model.blocks[layer_idx].mlp, "wd"):
-                    hidden = int(model.blocks[layer_idx].mlp.wd.in_features)
-                layer_cap = effective_cap if effective_layer_caps is None else int(effective_layer_caps[layer_idx])
-                core_ids.append(
-                    _active_union_ids_from_codebook(
-                        layer_codebook["candidate_ids"],
-                        hidden=hidden,
-                        cap=layer_cap,
-                        selection=active_selection,
-                        energy_scores=None if energy_scores is None else energy_scores[layer_idx],
-                    )
-                )
-            active_ids_by_layer, rescue_aux = _add_residual_rescue_rows(
-                core_ids,
-                residual_orders,
-                rescue_rows=rescue_rows,
-            )
-            effective_cap = None
-            effective_layer_caps = None
-            aux.update(rescue_aux)
-            aux["active_union_layer_caps"] = [int(ids.numel()) for ids in active_ids_by_layer]
-        aux["active_union_selection"] = "output_energy"
-    else:
-        if has_energy_retention:
-            raise ValueError("--active-union-energy-retention requires output_energy selection")
-        if has_residual_target:
-            raise ValueError("--active-union-residual-* requires residual_greedy selection")
-        if rescue_rows:
-            raise ValueError("--active-union-rescue-rows requires output_energy or residual_greedy selection")
-        aux["active_union_selection"] = "frequency"
-    _install_active_union_ffns(
-        model,
-        codebook,
-        cap=effective_cap,
-        layer_caps=effective_layer_caps,
-        packed=packed,
-        active_selection=active_selection,
-        energy_scores=energy_scores,
-        active_ids_by_layer=active_ids_by_layer,
-    )
+    _install_active_union_ffns(model, codebook, cap=cap, layer_caps=layer_caps, packed=packed)
     _set_active_union_sparse_enabled(model, True)
     model.train(was_training)
     return aux
@@ -5724,38 +5251,6 @@ def _eval_lm_nll(
     return total_loss / max(total_tokens, 1)
 
 
-def _active_union_ffn_distill_loss(
-    sparse: DenseModel,
-    teacher: DenseModel,
-    tokens: torch.Tensor,
-    targets: torch.Tensor,
-    *,
-    lam: float,
-    step: int,
-    decay_steps: int,
-) -> torch.Tensor:
-    x = sparse.embed(tokens)
-    distill_terms: list[torch.Tensor] = []
-    for layer_idx, block in enumerate(sparse.blocks):
-        u = x + block.attn(block.norm1(x))
-        normed = block.norm2(u)
-        sparse_ffn = block.mlp(normed)
-        with torch.no_grad():
-            dense_ffn = teacher.blocks[layer_idx].mlp(normed.detach())
-        distill_terms.append(F.mse_loss(sparse_ffn.float(), dense_ffn.float()))
-        x = u + sparse_ffn
-    hidden = sparse.final_norm(x)
-    logits = hidden @ sparse.vocab_weight.t()
-    ce = lm_loss_per_sample(logits, targets).mean() / float(targets.shape[1])
-    if decay_steps > 0:
-        scale = max(0.0, 1.0 - float(step) / float(max(decay_steps, 1)))
-    else:
-        scale = 1.0
-    if not distill_terms or lam <= 0.0 or scale <= 0.0:
-        return ce
-    return ce + (float(lam) * scale * torch.stack(distill_terms).mean())
-
-
 def _train_lm_continuation(
     model: DenseModel,
     streams,
@@ -5771,7 +5266,6 @@ def _train_lm_continuation(
     optimizer_state: dict[str, Any] | None = None,
     eval_steps: set[int] | None = None,
     eval_callback=None,
-    loss_callback=None,
     progress: int = 0,
     label: str = "model",
 ) -> dict[str, Any]:
@@ -5804,12 +5298,9 @@ def _train_lm_continuation(
         tokens = tokens.to(device)
         targets = targets.to(device)
         optimizer.zero_grad(set_to_none=True)
-        if loss_callback is None:
-            out = model(tokens, targets, return_loss_per_sample=True)
-            assert out.loss_per_sample is not None
-            loss = out.loss_per_sample.mean() / float(targets.shape[1])
-        else:
-            loss = loss_callback(model, tokens, targets, step)
+        out = model(tokens, targets, return_loss_per_sample=True)
+        assert out.loss_per_sample is not None
+        loss = out.loss_per_sample.mean() / float(targets.shape[1])
         loss.backward()
         if grad_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
@@ -6946,23 +6437,6 @@ def _finish_union_eval_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
         "aggregation",
         "active_cap",
         "active_cap_by_layer",
-        "active_union_selection",
-        "active_union_energy_retention",
-        "active_union_energy_retention_mean",
-        "active_union_residual_retention_target",
-        "active_union_residual_retention_mean",
-        "active_union_residual_order_mean",
-        "active_union_residual_order_max",
-        "active_union_residual_order_min",
-        "active_union_residual_gain_fraction_mean",
-        "active_union_adaptive_cap_mean",
-        "active_union_adaptive_cap_max",
-        "active_union_adaptive_cap_min",
-        "active_union_union_size_mean",
-        "active_union_rescue_rows",
-        "active_union_rescue_added_mean",
-        "active_union_rescue_added_max",
-        "active_union_rescue_added_min",
     ):
         if bucket.get(key) is not None:
             row[key] = bucket[key]
@@ -7009,56 +6483,6 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
         aggregation=args.aggregation,
         cluster_iters=args.cluster_iters,
     )
-    active_union_selection = str(args.active_union_selection).strip().lower().replace("-", "_")
-    union_energy_retention = (
-        float(args.union_energy_retention)
-        if args.union_energy_retention is not None and float(args.union_energy_retention) > 0.0
-        else None
-    )
-    union_residual_retention = (
-        float(args.union_residual_retention)
-        if args.union_residual_retention is not None and float(args.union_residual_retention) > 0.0
-        else None
-    )
-    union_residual_rel_error = (
-        float(args.union_residual_rel_error)
-        if args.union_residual_rel_error is not None and float(args.union_residual_rel_error) > 0.0
-        else None
-    )
-    union_residual_target = union_residual_retention
-    if union_residual_rel_error is not None:
-        union_residual_target = max(0.0, min(1.0, 1.0 - union_residual_rel_error**2))
-    union_rescue_rows = max(0, int(args.union_rescue_rows or 0))
-    energy_scores = None
-    if active_union_selection in {"energy", "output_energy"} and (
-        args.union_caps
-        or args.union_layer_caps
-        or union_energy_retention is not None
-        or union_rescue_rows > 0
-    ):
-        energy_scores = _build_active_union_output_energy_scores(
-            dense,
-            streams,
-            config,
-            calibration_batches=calibration_batches,
-            device=device,
-        )
-    residual_orders = None
-    residual_gain_curves = None
-    residual_aux: dict[str, float] = {}
-    if (
-        active_union_selection in {"residual", "residual_greedy"}
-        or union_residual_target is not None
-        or union_rescue_rows > 0
-    ):
-        residual_orders, residual_gain_curves, residual_aux = _build_active_union_residual_greedy_order(
-            dense,
-            streams,
-            config,
-            codebook,
-            calibration_batches=calibration_batches,
-            device=device,
-        )
     buckets: dict[str, dict[str, Any]] = {
         "dense": {
             "variant": "dense",
@@ -7089,8 +6513,6 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
             "reference_k": args.reference_k,
             "score_mode": args.score_mode,
             "aggregation": args.aggregation,
-            "active_union_selection": active_union_selection,
-            "active_union_rescue_rows": float(union_rescue_rows),
             "calibration_tokens": actual_calibration_tokens,
             "tokens": 0,
             "samples": 0,
@@ -7111,91 +6533,6 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
         raise SystemExit(
             f"--union-layer-caps expects {len(dense.blocks)} values for this model, got {len(union_layer_caps)}"
         )
-    energy_retention_layer_caps: list[int] = []
-    energy_retention_aux: dict[str, float] = {}
-    if union_energy_retention is not None:
-        if active_union_selection not in {"energy", "output_energy"}:
-            raise SystemExit("--union-energy-retention requires --active-union-selection output_energy")
-        assert energy_scores is not None
-        energy_retention_layer_caps, energy_retention_aux = _active_union_layer_caps_from_energy_retention(
-            codebook,
-            energy_scores,
-            retention=union_energy_retention,
-        )
-    union_layer_cap_active_ids: list[torch.Tensor] = []
-    if union_layer_caps and (active_union_selection in {"residual", "residual_greedy"} or union_rescue_rows):
-        if active_union_selection in {"residual", "residual_greedy"}:
-            assert residual_orders is not None and residual_gain_curves is not None
-            union_layer_cap_active_ids, _ = _active_union_ids_from_residual_order(
-                residual_orders,
-                residual_gain_curves,
-                layer_caps=union_layer_caps,
-            )
-        else:
-            core_ids = []
-            for layer_idx, layer_codebook in enumerate(codebook):
-                hidden = int(layer_codebook["candidate_ids"].max().item()) + 1
-                if hasattr(dense.blocks[layer_idx].mlp, "wd"):
-                    hidden = int(dense.blocks[layer_idx].mlp.wd.in_features)
-                core_ids.append(
-                    _active_union_ids_from_codebook(
-                        layer_codebook["candidate_ids"],
-                        hidden=hidden,
-                        cap=union_layer_caps[layer_idx],
-                        selection=active_union_selection,
-                        energy_scores=None if energy_scores is None else energy_scores[layer_idx],
-                    )
-                )
-            union_layer_cap_active_ids = core_ids
-        if union_rescue_rows:
-            assert residual_orders is not None
-            union_layer_cap_active_ids, _ = _add_residual_rescue_rows(
-                union_layer_cap_active_ids,
-                residual_orders,
-                rescue_rows=union_rescue_rows,
-            )
-    energy_retention_active_ids: list[torch.Tensor] = []
-    if energy_retention_layer_caps and union_rescue_rows:
-        assert residual_orders is not None
-        assert energy_scores is not None
-        core_ids = []
-        for layer_idx, layer_codebook in enumerate(codebook):
-            hidden = int(layer_codebook["candidate_ids"].max().item()) + 1
-            if hasattr(dense.blocks[layer_idx].mlp, "wd"):
-                hidden = int(dense.blocks[layer_idx].mlp.wd.in_features)
-            core_ids.append(
-                _active_union_ids_from_codebook(
-                    layer_codebook["candidate_ids"],
-                    hidden=hidden,
-                    cap=energy_retention_layer_caps[layer_idx],
-                    selection=active_union_selection,
-                    energy_scores=energy_scores[layer_idx],
-                )
-            )
-        energy_retention_active_ids, rescue_aux = _add_residual_rescue_rows(
-            core_ids,
-            residual_orders,
-            rescue_rows=union_rescue_rows,
-        )
-        energy_retention_aux.update(rescue_aux)
-    residual_retention_active_ids: list[torch.Tensor] = []
-    residual_retention_aux: dict[str, float] = {}
-    if union_residual_target is not None:
-        if active_union_selection not in {"residual", "residual_greedy"}:
-            raise SystemExit("--union-residual-* requires --active-union-selection residual_greedy")
-        assert residual_orders is not None and residual_gain_curves is not None
-        residual_retention_active_ids, residual_retention_aux = _active_union_ids_from_residual_order(
-            residual_orders,
-            residual_gain_curves,
-            retention=union_residual_target,
-        )
-        if union_rescue_rows:
-            residual_retention_active_ids, rescue_aux = _add_residual_rescue_rows(
-                residual_retention_active_ids,
-                residual_orders,
-                rescue_rows=union_rescue_rows,
-            )
-            residual_retention_aux.update(rescue_aux)
     for cap in union_caps:
         name = f"global_union_cap{cap}"
         buckets[name] = {
@@ -7208,36 +6545,6 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
             "reference_k": args.reference_k,
             "score_mode": args.score_mode,
             "aggregation": args.aggregation,
-            "active_union_selection": active_union_selection,
-            "active_union_rescue_rows": float(union_rescue_rows),
-            "calibration_tokens": actual_calibration_tokens,
-            "tokens": 0,
-            "samples": 0,
-            "loss_sum": 0.0,
-            "kl_sum": 0.0,
-            "final_hidden_cosine_sum": 0.0,
-            "active_size_sum": 0.0,
-            "active_fraction_sum": 0.0,
-            "union_recall_sum": 0.0,
-            "union_score_ratio_sum": 0.0,
-            "selection_count": 0.0,
-            "union_metric_count": 0.0,
-        }
-    if residual_retention_active_ids:
-        buckets["global_union_residual_retention"] = {
-            "variant": "global_union_residual_retention",
-            "variant_type": "static_cluster_union_residual_retention",
-            "rank": args.rank,
-            "cluster_count": args.clusters,
-            "candidate_m": args.candidate_m,
-            "active_cap_by_layer": [int(ids.numel()) for ids in residual_retention_active_ids],
-            **residual_aux,
-            **residual_retention_aux,
-            "reference_k": args.reference_k,
-            "score_mode": args.score_mode,
-            "aggregation": args.aggregation,
-            "active_union_selection": active_union_selection,
-            "active_union_rescue_rows": float(union_rescue_rows),
             "calibration_tokens": actual_calibration_tokens,
             "tokens": 0,
             "samples": 0,
@@ -7258,48 +6565,10 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
             "rank": args.rank,
             "cluster_count": args.clusters,
             "candidate_m": args.candidate_m,
-            "active_cap_by_layer": (
-                [int(ids.numel()) for ids in union_layer_cap_active_ids]
-                if union_layer_cap_active_ids
-                else union_layer_caps
-            ),
+            "active_cap_by_layer": union_layer_caps,
             "reference_k": args.reference_k,
             "score_mode": args.score_mode,
             "aggregation": args.aggregation,
-            "active_union_selection": active_union_selection,
-            "active_union_rescue_rows": float(union_rescue_rows),
-            "calibration_tokens": actual_calibration_tokens,
-            "tokens": 0,
-            "samples": 0,
-            "loss_sum": 0.0,
-            "kl_sum": 0.0,
-            "final_hidden_cosine_sum": 0.0,
-            "active_size_sum": 0.0,
-            "active_fraction_sum": 0.0,
-            "union_recall_sum": 0.0,
-            "union_score_ratio_sum": 0.0,
-            "selection_count": 0.0,
-            "union_metric_count": 0.0,
-        }
-    if energy_retention_layer_caps:
-        buckets["global_union_energy_retention"] = {
-            "variant": "global_union_energy_retention",
-            "variant_type": "static_cluster_union_energy_retention",
-            "rank": args.rank,
-            "cluster_count": args.clusters,
-            "candidate_m": args.candidate_m,
-            "active_cap_by_layer": (
-                [int(ids.numel()) for ids in energy_retention_active_ids]
-                if energy_retention_active_ids
-                else energy_retention_layer_caps
-            ),
-            "active_union_energy_retention": union_energy_retention,
-            **energy_retention_aux,
-            "reference_k": args.reference_k,
-            "score_mode": args.score_mode,
-            "aggregation": args.aggregation,
-            "active_union_selection": active_union_selection,
-            "active_union_rescue_rows": float(union_rescue_rows),
             "calibration_tokens": actual_calibration_tokens,
             "tokens": 0,
             "samples": 0,
@@ -7357,71 +6626,21 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
                 ),
             ),
         )
-        cap_variants = []
-        for cap in union_caps:
-            active_ids_by_layer = None
-            variant_cap = cap
-            variant_layer_caps = None
-            variant_selection = active_union_selection
-            if active_union_selection in {"residual", "residual_greedy"}:
-                assert residual_orders is not None and residual_gain_curves is not None
-                active_ids_by_layer, _ = _active_union_ids_from_residual_order(
-                    residual_orders,
-                    residual_gain_curves,
+        cap_variants = tuple(
+            (
+                f"global_union_cap{cap}",
+                _svd_static_union_full_stack_logits(
+                    dense,
+                    codebook,
+                    tokens,
+                    reference_k=args.reference_k,
                     cap=cap,
-                )
-                if union_rescue_rows:
-                    active_ids_by_layer, _ = _add_residual_rescue_rows(
-                        active_ids_by_layer,
-                        residual_orders,
-                        rescue_rows=union_rescue_rows,
-                    )
-                variant_cap = None
-                variant_selection = "frequency"
-            elif union_rescue_rows:
-                assert residual_orders is not None
-                core_ids = []
-                for layer_idx, layer_codebook in enumerate(codebook):
-                    hidden = int(layer_codebook["candidate_ids"].max().item()) + 1
-                    if hasattr(dense.blocks[layer_idx].mlp, "wd"):
-                        hidden = int(dense.blocks[layer_idx].mlp.wd.in_features)
-                    core_ids.append(
-                        _active_union_ids_from_codebook(
-                            layer_codebook["candidate_ids"],
-                            hidden=hidden,
-                            cap=cap,
-                            selection=active_union_selection,
-                            energy_scores=None if energy_scores is None else energy_scores[layer_idx],
-                        )
-                    )
-                active_ids_by_layer, _ = _add_residual_rescue_rows(
-                    core_ids,
-                    residual_orders,
-                    rescue_rows=union_rescue_rows,
-                )
-                variant_cap = None
-                variant_selection = "frequency"
-            cap_variants.append(
-                (
-                    f"global_union_cap{cap}",
-                    _svd_static_union_full_stack_logits(
-                        dense,
-                        codebook,
-                        tokens,
-                        reference_k=args.reference_k,
-                        cap=variant_cap,
-                        layer_caps=variant_layer_caps,
-                        active_selection=variant_selection,
-                        energy_scores=energy_scores,
-                        active_ids_by_layer=active_ids_by_layer,
-                    ),
-                )
+                ),
             )
-        cap_variants = tuple(cap_variants)
+            for cap in union_caps
+        )
         layer_cap_variants = ()
         if union_layer_caps:
-            layer_variant_caps = None if union_layer_cap_active_ids else union_layer_caps
-            layer_variant_selection = "frequency" if union_layer_cap_active_ids else active_union_selection
             layer_cap_variants = (
                 (
                     "global_union_layercaps",
@@ -7430,53 +6649,11 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
                         codebook,
                         tokens,
                         reference_k=args.reference_k,
-                        layer_caps=layer_variant_caps,
-                        active_selection=layer_variant_selection,
-                        energy_scores=energy_scores,
-                        active_ids_by_layer=union_layer_cap_active_ids or None,
+                        layer_caps=union_layer_caps,
                     ),
                 ),
             )
-        energy_retention_variants = ()
-        if energy_retention_layer_caps:
-            energy_variant_caps = None if energy_retention_active_ids else energy_retention_layer_caps
-            energy_variant_selection = "frequency" if energy_retention_active_ids else active_union_selection
-            energy_retention_variants = (
-                (
-                    "global_union_energy_retention",
-                    _svd_static_union_full_stack_logits(
-                        dense,
-                        codebook,
-                        tokens,
-                        reference_k=args.reference_k,
-                        layer_caps=energy_variant_caps,
-                        active_selection=energy_variant_selection,
-                        energy_scores=energy_scores,
-                        active_ids_by_layer=energy_retention_active_ids or None,
-                    ),
-                ),
-            )
-        residual_retention_variants = ()
-        if residual_retention_active_ids:
-            residual_retention_variants = (
-                (
-                    "global_union_residual_retention",
-                    _svd_static_union_full_stack_logits(
-                        dense,
-                        codebook,
-                        tokens,
-                        reference_k=args.reference_k,
-                        active_ids_by_layer=residual_retention_active_ids,
-                    ),
-                ),
-            )
-        for name, (logits, hidden, aux) in (
-            *variants,
-            *cap_variants,
-            *layer_cap_variants,
-            *energy_retention_variants,
-            *residual_retention_variants,
-        ):
+        for name, (logits, hidden, aux) in (*variants, *cap_variants, *layer_cap_variants):
             bucket = buckets[name]
             loss = F.cross_entropy(logits.flatten(0, -2), target_flat, reduction="sum")
             cand_logp = F.log_softmax(logits / args.temperature, dim=-1)
@@ -7527,10 +6704,6 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
     rows.extend(_finish_union_eval_bucket(buckets[f"global_union_cap{cap}"]) for cap in union_caps)
     if union_layer_caps:
         rows.append(_finish_union_eval_bucket(buckets["global_union_layercaps"]))
-    if energy_retention_layer_caps:
-        rows.append(_finish_union_eval_bucket(buckets["global_union_energy_retention"]))
-    if residual_retention_active_ids:
-        rows.append(_finish_union_eval_bucket(buckets["global_union_residual_retention"]))
     for row in rows:
         row["calibration_avg_nonempty_clusters"] = codebook_aux["calibration_avg_nonempty_clusters"]
         row["calibration_avg_cluster_imbalance"] = codebook_aux["calibration_avg_cluster_imbalance"]
@@ -7802,23 +6975,6 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
     sparse_ffn_kind = str(args.sparse_ffn_kind)
     active_union_cap = int(args.active_union_cap) if args.active_union_cap is not None else None
     active_union_layer_caps = [int(value) for value in (args.active_union_layer_caps or [])]
-    active_union_selection = str(args.active_union_selection).strip().lower().replace("-", "_")
-    active_union_energy_retention = (
-        float(args.active_union_energy_retention)
-        if args.active_union_energy_retention is not None and float(args.active_union_energy_retention) > 0.0
-        else None
-    )
-    active_union_residual_retention = (
-        float(args.active_union_residual_retention)
-        if args.active_union_residual_retention is not None and float(args.active_union_residual_retention) > 0.0
-        else None
-    )
-    active_union_residual_rel_error = (
-        float(args.active_union_residual_rel_error)
-        if args.active_union_residual_rel_error is not None and float(args.active_union_residual_rel_error) > 0.0
-        else None
-    )
-    active_union_rescue_rows = max(0, int(args.active_union_rescue_rows or 0))
     if active_union_layer_caps and len(active_union_layer_caps) != config.model.n_dense_layers:
         raise SystemExit(
             f"--active-union-layer-caps expects {config.model.n_dense_layers} values, "
@@ -7826,8 +6982,6 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
         )
     if sparse_ffn_kind == "active_union_packed" and any(int(x) > 0 for x in (args.refresh_intervals or [])):
         raise SystemExit("active_union_packed has no dense master for refresh; use --refresh-intervals 0")
-    ffn_distill_lambda = max(0.0, float(args.ffn_distill_lambda or 0.0))
-    ffn_distill_steps = max(0, int(args.ffn_distill_steps or 0))
 
     if args.run_dense:
         dense = _load_dense_model(config, args.dense_checkpoint, device)
@@ -7919,11 +7073,6 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
                 cap=active_union_cap,
                 layer_caps=active_union_layer_caps or None,
                 packed=sparse_ffn_kind == "active_union_packed",
-                active_selection=active_union_selection,
-                energy_retention=active_union_energy_retention,
-                residual_retention=active_union_residual_retention,
-                residual_rel_error=active_union_residual_rel_error,
-                rescue_rows=active_union_rescue_rows,
             )
         else:
             raise AssertionError(f"unknown sparse FFN kind: {sparse_ffn_kind}")
@@ -7984,11 +7133,6 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
                 cap=active_union_cap,
                 layer_caps=active_union_layer_caps or None,
                 packed=False,
-                active_selection=active_union_selection,
-                energy_retention=active_union_energy_retention,
-                residual_retention=active_union_residual_retention,
-                residual_rel_error=active_union_residual_rel_error,
-                rescue_rows=active_union_rescue_rows,
             )
 
         def sparse_eval_callback() -> float:
@@ -7999,26 +7143,6 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
                 batches=eval_batches,
                 device=device,
             )
-
-        distill_teacher = None
-        sparse_loss_callback = None
-        if ffn_distill_lambda > 0.0:
-            distill_teacher = _load_dense_model(config, args.dense_checkpoint, device)
-            distill_teacher.eval()
-            for param in distill_teacher.parameters():
-                param.requires_grad_(False)
-
-            def sparse_loss_callback(model, tokens, targets, step):
-                assert distill_teacher is not None
-                return _active_union_ffn_distill_loss(
-                    model,
-                    distill_teacher,
-                    tokens,
-                    targets,
-                    lam=ffn_distill_lambda,
-                    step=int(step),
-                    decay_steps=ffn_distill_steps,
-                )
 
         train_metrics = _train_lm_continuation(
             sparse,
@@ -8040,7 +7164,6 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
             ),
             eval_steps=eval_steps,
             eval_callback=sparse_eval_callback,
-            loss_callback=sparse_loss_callback,
             progress=args.progress,
             label=f"{sparse_ffn_kind}_refresh_{refresh_interval}",
         )
@@ -8079,14 +7202,6 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
                 "sparse_ffn_kind": sparse_ffn_kind,
                 "active_union_cap": active_union_cap,
                 "active_union_layer_caps": active_union_layer_caps,
-                "active_union_selection": active_union_selection,
-                "active_union_energy_retention": active_union_energy_retention,
-                "active_union_residual_retention": active_union_residual_retention,
-                "active_union_residual_rel_error": active_union_residual_rel_error,
-                "active_union_rescue_rows": active_union_rescue_rows,
-                "ffn_distill_lambda": ffn_distill_lambda,
-                "ffn_distill_steps": ffn_distill_steps,
-                "effective_active_union_layer_caps": refresh_aux.get("active_union_layer_caps", active_union_layer_caps),
                 "initial_nll_per_token": sparse_initial_nll,
                 "final_nll_per_token": sparse_final_nll,
                 "nll_delta": sparse_final_nll - sparse_initial_nll,
@@ -8119,17 +7234,6 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
                     "refresh_interval": int(refresh_interval),
                     "active_union_cap": active_union_cap,
                     "active_union_layer_caps": active_union_layer_caps,
-                    "active_union_selection": active_union_selection,
-                    "active_union_energy_retention": active_union_energy_retention,
-                    "active_union_residual_retention": active_union_residual_retention,
-                    "active_union_residual_rel_error": active_union_residual_rel_error,
-                    "active_union_rescue_rows": active_union_rescue_rows,
-                    "ffn_distill_lambda": ffn_distill_lambda,
-                    "ffn_distill_steps": ffn_distill_steps,
-                    "effective_active_union_layer_caps": refresh_aux.get(
-                        "active_union_layer_caps",
-                        active_union_layer_caps,
-                    ),
                     "rank": args.rank,
                     "clusters": args.clusters,
                     "candidate_m": args.candidate_m,
@@ -8188,13 +7292,6 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
         "sparse_ffn_kind": sparse_ffn_kind,
         "active_union_cap": active_union_cap,
         "active_union_layer_caps": active_union_layer_caps,
-        "active_union_selection": active_union_selection,
-        "active_union_energy_retention": active_union_energy_retention,
-        "active_union_residual_retention": active_union_residual_retention,
-        "active_union_residual_rel_error": active_union_residual_rel_error,
-        "active_union_rescue_rows": active_union_rescue_rows,
-        "ffn_distill_lambda": ffn_distill_lambda,
-        "ffn_distill_steps": ffn_distill_steps,
         "score_mode": args.score_mode,
         "aggregation": args.aggregation,
         "cluster_iters": args.cluster_iters,
@@ -9905,11 +9002,6 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
                 cluster_iters=args.cluster_iters,
                 cap=None if cap <= 0 else cap,
                 packed=True,
-                active_selection=args.active_union_selection,
-                energy_retention=args.active_union_energy_retention,
-                residual_retention=args.active_union_residual_retention,
-                residual_rel_error=args.active_union_residual_rel_error,
-                rescue_rows=args.active_union_rescue_rows,
             )
         sparse.to(dtype=param_dtype)
         _set_triton_swiglu_backward(sparse, args.triton_swiglu_backward)
@@ -9971,12 +9063,6 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
             "rank": args.rank,
             "clusters": args.clusters,
             "candidate_m": args.candidate_m,
-            "active_union_selection": args.active_union_selection,
-            "active_union_energy_retention": args.active_union_energy_retention,
-            "active_union_residual_retention": args.active_union_residual_retention,
-            "active_union_residual_rel_error": args.active_union_residual_rel_error,
-            "active_union_rescue_rows": args.active_union_rescue_rows,
-            "effective_active_union_layer_caps": refresh_aux.get("active_union_layer_caps", []),
             "calibration_tokens": calibration_batches * tokens_per_batch,
             "dense_packed_ffn_baseline": bool(args.pack_dense_ffn),
             "triton_swiglu_backward_requested": bool(args.triton_swiglu_backward),
@@ -10182,7 +9268,7 @@ def cmd_benchmark_active_union_block_train_step(args: argparse.Namespace) -> Non
     dense = _load_dense_model(config, args.dense_checkpoint, device)
     sparse = _load_dense_model(config, args.dense_checkpoint, device)
     _pack_dense_ffns_for_benchmark(dense)
-    refresh_aux = _refresh_active_union_ffns(
+    _refresh_active_union_ffns(
         sparse,
         streams,
         config,
@@ -10196,11 +9282,6 @@ def cmd_benchmark_active_union_block_train_step(args: argparse.Namespace) -> Non
         cluster_iters=args.cluster_iters,
         cap=None if args.active_union_cap <= 0 else args.active_union_cap,
         packed=True,
-        active_selection=args.active_union_selection,
-        energy_retention=args.active_union_energy_retention,
-        residual_retention=args.active_union_residual_retention,
-        residual_rel_error=args.active_union_residual_rel_error,
-        rescue_rows=args.active_union_rescue_rows,
     )
     dense.to(dtype=dtype)
     sparse.to(dtype=dtype)
@@ -10228,12 +9309,6 @@ def cmd_benchmark_active_union_block_train_step(args: argparse.Namespace) -> Non
             {
                 "layer": layer_idx,
                 "active_union_cap": None if args.active_union_cap <= 0 else args.active_union_cap,
-                "active_union_selection": args.active_union_selection,
-                "active_union_energy_retention": args.active_union_energy_retention,
-                "active_union_residual_retention": args.active_union_residual_retention,
-                "active_union_residual_rel_error": args.active_union_residual_rel_error,
-                "active_union_rescue_rows": args.active_union_rescue_rows,
-                "effective_active_union_layer_caps": refresh_aux.get("active_union_layer_caps", []),
                 "dtype": str(dtype),
                 "tokens": tokens_per_batch,
                 "triton_swiglu_backward_used": bool(args.triton_swiglu_backward and triton_swiglu_available()),
@@ -12479,40 +11554,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Length must match the dense layer count; this is a quality-changing experiment."
         ),
     )
-    union_eval.add_argument(
-        "--active-union-selection",
-        choices=["frequency", "output_energy", "energy", "residual_greedy", "residual"],
-        default="frequency",
-        help=(
-            "How capped active-union variants choose rows from the cluster-pool union. "
-            "frequency is the old frequency/rank policy; output_energy ranks rows by "
-            "calibration z^2 * ||W_down||^2; residual_greedy uses offline residual reduction."
-        ),
-    )
-    union_eval.add_argument(
-        "--union-energy-retention",
-        type=float,
-        help=(
-            "Optional additional capped global-union variant. For output_energy selection, "
-            "derive per-layer caps that retain this fraction of calibration output energy."
-        ),
-    )
-    union_eval.add_argument(
-        "--union-residual-retention",
-        type=float,
-        help="Optional residual-greedy adaptive variant retaining this fraction of calibration FFN output energy.",
-    )
-    union_eval.add_argument(
-        "--union-residual-rel-error",
-        type=float,
-        help="Optional residual-greedy adaptive variant targeting this calibration relative error.",
-    )
-    union_eval.add_argument(
-        "--union-rescue-rows",
-        type=int,
-        default=0,
-        help="Add this many residual-greedy rescue rows per layer on top of capped active sets.",
-    )
     union_eval.add_argument("--reference-k", type=int, default=64)
     union_eval.add_argument(
         "--score-mode",
@@ -12583,52 +11624,6 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         default=[],
         help="Optional per-layer active-neuron caps for active-union continuation.",
-    )
-    continuation.add_argument(
-        "--active-union-selection",
-        choices=["frequency", "output_energy", "energy", "residual_greedy", "residual"],
-        default="frequency",
-        help=(
-            "Active-union cap selection policy. frequency preserves the old behavior; "
-            "output_energy ranks rows by calibration FFN output energy; residual_greedy "
-            "uses offline residual reduction."
-        ),
-    )
-    continuation.add_argument(
-        "--active-union-energy-retention",
-        type=float,
-        help=(
-            "Optional adaptive per-layer cap for output_energy active-union selection. "
-            "Uses the smallest per-layer active set retaining this fraction of calibration output energy."
-        ),
-    )
-    continuation.add_argument(
-        "--active-union-residual-retention",
-        type=float,
-        help="Optional adaptive per-layer cap for residual_greedy selection by retained calibration gain.",
-    )
-    continuation.add_argument(
-        "--active-union-residual-rel-error",
-        type=float,
-        help="Optional adaptive per-layer cap for residual_greedy selection by calibration relative error.",
-    )
-    continuation.add_argument(
-        "--active-union-rescue-rows",
-        type=int,
-        default=0,
-        help="Add this many residual-greedy rescue rows per layer on top of capped output-energy/residual selections.",
-    )
-    continuation.add_argument(
-        "--ffn-distill-lambda",
-        type=float,
-        default=0.0,
-        help="Add dense-FFN local MSE distillation during sparse handoff continuation.",
-    )
-    continuation.add_argument(
-        "--ffn-distill-steps",
-        type=int,
-        default=0,
-        help="Linearly decay FFN distillation to zero over this many steps. 0 keeps it constant.",
     )
     continuation.add_argument("--refresh-intervals", type=int, nargs="+", default=[0])
     continuation.add_argument("--score-mode", choices=["sum", "upgate", "product"], default="sum")
@@ -12808,15 +11803,6 @@ def build_parser() -> argparse.ArgumentParser:
     active_union_model_bench.add_argument("--heads", type=int)
     active_union_model_bench.add_argument("--vocab-size", type=int)
     active_union_model_bench.add_argument("--active-union-cap", type=int, nargs="+", default=[0, 320])
-    active_union_model_bench.add_argument(
-        "--active-union-selection",
-        choices=["frequency", "output_energy", "energy", "residual_greedy", "residual"],
-        default="frequency",
-    )
-    active_union_model_bench.add_argument("--active-union-energy-retention", type=float)
-    active_union_model_bench.add_argument("--active-union-residual-retention", type=float)
-    active_union_model_bench.add_argument("--active-union-residual-rel-error", type=float)
-    active_union_model_bench.add_argument("--active-union-rescue-rows", type=int, default=0)
     active_union_model_bench.add_argument("--batch-size", type=int)
     active_union_model_bench.add_argument("--seq-len", type=int)
     active_union_model_bench.add_argument("--calibration-tokens", type=int, default=8192)
@@ -12867,15 +11853,6 @@ def build_parser() -> argparse.ArgumentParser:
     active_union_block_bench.add_argument("--config", required=True)
     active_union_block_bench.add_argument("--dense-checkpoint", required=True)
     active_union_block_bench.add_argument("--active-union-cap", type=int, default=192)
-    active_union_block_bench.add_argument(
-        "--active-union-selection",
-        choices=["frequency", "output_energy", "energy", "residual_greedy", "residual"],
-        default="frequency",
-    )
-    active_union_block_bench.add_argument("--active-union-energy-retention", type=float)
-    active_union_block_bench.add_argument("--active-union-residual-retention", type=float)
-    active_union_block_bench.add_argument("--active-union-residual-rel-error", type=float)
-    active_union_block_bench.add_argument("--active-union-rescue-rows", type=int, default=0)
     active_union_block_bench.add_argument("--layers", type=int, nargs="+", default=[0])
     active_union_block_bench.add_argument("--batch-size", type=int)
     active_union_block_bench.add_argument("--seq-len", type=int)
