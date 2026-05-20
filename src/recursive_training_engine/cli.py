@@ -4917,12 +4917,28 @@ def _active_union_ids_from_codebook(
     *,
     hidden: int,
     cap: int | None = None,
+    selection: str = "frequency",
+    energy_scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     candidate_ids = candidate_ids.to(dtype=torch.long)
     full_union = torch.unique(candidate_ids.reshape(-1), sorted=True)
     if cap is None or int(cap) <= 0 or full_union.numel() <= int(cap):
         return full_union
     cap = min(int(cap), hidden)
+    selection = str(selection).strip().lower().replace("-", "_")
+    if selection in {"energy", "output_energy"}:
+        if energy_scores is None:
+            raise ValueError("output-energy active-union selection requires calibration energy scores")
+        scores = energy_scores.detach().to(device=full_union.device, dtype=torch.float32)
+        if scores.numel() < hidden:
+            raise ValueError(
+                f"energy score length {scores.numel()} is smaller than hidden size {hidden}"
+            )
+        union_scores = scores.index_select(0, full_union)
+        active = full_union[torch.topk(union_scores, k=cap, dim=0).indices]
+        return torch.sort(active).values
+    if selection != "frequency":
+        raise ValueError(f"unknown active-union selection mode: {selection}")
     cluster_count, candidate_m = candidate_ids.shape
     # Candidate ids are sorted within each cluster by aggregate score. Use a
     # simple frequency-plus-rank score so capped union remains tied to the
@@ -4942,6 +4958,96 @@ def _active_union_ids_from_codebook(
 
 
 @torch.no_grad()
+def _build_active_union_output_energy_scores(
+    model: DenseModel,
+    streams,
+    config: ExperimentConfig,
+    *,
+    calibration_batches: int,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    """Score FFN neurons by calibration output energy.
+
+    For neuron j, score_j = sum_i z_ij^2 * ||W_down_j||^2, where z is the
+    dense SwiGLU activation on calibration tokens. This is an offline active-set
+    cap objective; the packed hot path remains unchanged.
+    """
+
+    was_training = model.training
+    model.eval()
+    scores: list[torch.Tensor] = []
+    wd_norm_sq: list[torch.Tensor] = []
+    for layer_idx, block in enumerate(model.blocks):
+        if not hasattr(block.mlp, "wug") or not hasattr(block.mlp, "wd"):
+            raise RuntimeError(
+                "output-energy active selection requires dense/indexed FFN weights; "
+                f"layer {layer_idx} has {type(block.mlp).__name__}"
+            )
+        d_ff = int(block.mlp.wd.in_features)
+        scores.append(torch.zeros(d_ff, device=device, dtype=torch.float32))
+        wd_norm_sq.append(block.mlp.wd.weight.detach().float().pow(2).sum(dim=0).to(device=device))
+
+    batches = streams.train_batches(config.training)
+    for _ in range(max(1, int(calibration_batches))):
+        tokens, _ = next(batches)
+        x = model.embed(tokens.to(device))
+        for layer_idx, block in enumerate(model.blocks):
+            u = x + block.attn(block.norm1(x))
+            normed = block.norm2(u)
+            up, gate = block.mlp.wug(normed).chunk(2, dim=-1)
+            z = up * F.silu(gate)
+            token_energy = z.float().reshape(-1, z.shape[-1]).pow(2).sum(dim=0)
+            scores[layer_idx].add_(token_energy * wd_norm_sq[layer_idx])
+            if hasattr(block.mlp, "dense_forward"):
+                ffn = block.mlp.dense_forward(normed)
+            else:
+                ffn = block.mlp(normed)
+            x = u + ffn
+    model.train(was_training)
+    return scores
+
+
+@torch.no_grad()
+def _active_union_layer_caps_from_energy_retention(
+    codebook: list[dict[str, torch.Tensor]],
+    energy_scores: Sequence[torch.Tensor],
+    *,
+    retention: float,
+) -> tuple[list[int], dict[str, float]]:
+    retention = float(retention)
+    if not (0.0 < retention <= 1.0):
+        raise ValueError("--active-union-energy-retention must be in (0, 1]")
+    caps: list[int] = []
+    retained: list[float] = []
+    union_sizes: list[int] = []
+    for layer_idx, layer_codebook in enumerate(codebook):
+        ids = torch.unique(layer_codebook["candidate_ids"].reshape(-1).to(dtype=torch.long), sorted=True)
+        layer_scores = energy_scores[layer_idx].detach().to(device=ids.device, dtype=torch.float32)
+        values = layer_scores.index_select(0, ids).clamp_min(0.0)
+        union_sizes.append(int(ids.numel()))
+        total = float(values.sum().item())
+        if total <= 0.0:
+            caps.append(int(ids.numel()))
+            retained.append(1.0)
+            continue
+        sorted_values = torch.sort(values, descending=True).values
+        cumulative = torch.cumsum(sorted_values, dim=0)
+        target = total * retention
+        cap = int(torch.searchsorted(cumulative, torch.tensor(target, device=cumulative.device)).item()) + 1
+        cap = min(max(cap, 1), int(ids.numel()))
+        caps.append(cap)
+        retained.append(float(cumulative[cap - 1].item() / max(total, 1e-12)))
+    return caps, {
+        "active_union_energy_retention_target": retention,
+        "active_union_energy_retention_mean": float(sum(retained) / max(len(retained), 1)),
+        "active_union_adaptive_cap_mean": float(sum(caps) / max(len(caps), 1)),
+        "active_union_adaptive_cap_max": float(max(caps) if caps else 0),
+        "active_union_adaptive_cap_min": float(min(caps) if caps else 0),
+        "active_union_union_size_mean": float(sum(union_sizes) / max(len(union_sizes), 1)),
+    }
+
+
+@torch.no_grad()
 def _ffn_neuron_static_union_output(
     block: torch.nn.Module,
     normed: torch.Tensor,
@@ -4949,6 +5055,8 @@ def _ffn_neuron_static_union_output(
     *,
     reference_k: int,
     cap: int | None = None,
+    active_selection: str = "frequency",
+    energy_scores: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Evaluate one FFN using the union of all static cluster candidates."""
 
@@ -4960,6 +5068,8 @@ def _ffn_neuron_static_union_output(
         codebook["candidate_ids"].to(device=flat.device),
         hidden=hidden,
         cap=cap,
+        selection=active_selection,
+        energy_scores=energy_scores,
     )
     up_weight, gate_weight = block.mlp.wug.weight.detach().chunk(2, dim=0)
     wd_rows = block.mlp.wd.weight.t().contiguous()
@@ -4996,6 +5106,8 @@ def _svd_static_union_full_stack_logits(
     reference_k: int,
     cap: int | None = None,
     layer_caps: Sequence[int] | None = None,
+    active_selection: str = "frequency",
+    energy_scores: Sequence[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     x = dense.embed(tokens)
     aux = {
@@ -5015,6 +5127,8 @@ def _svd_static_union_full_stack_logits(
             codebook[layer_idx],
             reference_k=reference_k,
             cap=layer_cap,
+            active_selection=active_selection,
+            energy_scores=None if energy_scores is None else energy_scores[layer_idx],
         )
         for key in aux:
             aux[key] += float(layer_aux.get(key, 0.0))
@@ -5085,6 +5199,8 @@ def _install_active_union_ffns(
     cap: int | None = None,
     layer_caps: Sequence[int] | None = None,
     packed: bool = False,
+    active_selection: str = "frequency",
+    energy_scores: Sequence[torch.Tensor] | None = None,
 ) -> None:
     for layer_idx, block in enumerate(model.blocks):
         layer_cap = cap if layer_caps is None else int(layer_caps[layer_idx])
@@ -5095,6 +5211,8 @@ def _install_active_union_ffns(
             codebook[layer_idx]["candidate_ids"],
             hidden=hidden,
             cap=layer_cap,
+            selection=active_selection,
+            energy_scores=None if energy_scores is None else energy_scores[layer_idx],
         )
         if packed:
             if isinstance(block.mlp, PackedActiveUnionSwiGLU):
@@ -5201,6 +5319,8 @@ def _refresh_active_union_ffns(
     cap: int | None = None,
     layer_caps: Sequence[int] | None = None,
     packed: bool = False,
+    active_selection: str = "frequency",
+    energy_retention: float | None = None,
 ) -> dict[str, float]:
     was_training = model.training
     _set_active_union_sparse_enabled(model, False)
@@ -5219,7 +5339,45 @@ def _refresh_active_union_ffns(
         aggregation=aggregation,
         cluster_iters=cluster_iters,
     )
-    _install_active_union_ffns(model, codebook, cap=cap, layer_caps=layer_caps, packed=packed)
+    energy_scores = None
+    normalized_selection = str(active_selection).strip().lower().replace("-", "_")
+    has_energy_retention = energy_retention is not None and float(energy_retention) > 0.0
+    has_active_cap = (cap is not None and int(cap) > 0) or bool(layer_caps) or has_energy_retention
+    effective_layer_caps = layer_caps
+    effective_cap = cap
+    if normalized_selection in {"energy", "output_energy"}:
+        if has_active_cap:
+            energy_scores = _build_active_union_output_energy_scores(
+                model,
+                streams,
+                config,
+                calibration_batches=calibration_batches,
+                device=device,
+            )
+        if has_energy_retention:
+            assert energy_scores is not None
+            effective_layer_caps, retention_aux = _active_union_layer_caps_from_energy_retention(
+                codebook,
+                energy_scores,
+                retention=float(energy_retention),
+            )
+            effective_cap = None
+            aux.update(retention_aux)
+            aux["active_union_layer_caps"] = list(effective_layer_caps)
+        aux["active_union_selection"] = "output_energy"
+    else:
+        if has_energy_retention:
+            raise ValueError("--active-union-energy-retention requires output_energy selection")
+        aux["active_union_selection"] = "frequency"
+    _install_active_union_ffns(
+        model,
+        codebook,
+        cap=effective_cap,
+        layer_caps=effective_layer_caps,
+        packed=packed,
+        active_selection=active_selection,
+        energy_scores=energy_scores,
+    )
     _set_active_union_sparse_enabled(model, True)
     model.train(was_training)
     return aux
@@ -6437,6 +6595,13 @@ def _finish_union_eval_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
         "aggregation",
         "active_cap",
         "active_cap_by_layer",
+        "active_union_selection",
+        "active_union_energy_retention",
+        "active_union_energy_retention_mean",
+        "active_union_adaptive_cap_mean",
+        "active_union_adaptive_cap_max",
+        "active_union_adaptive_cap_min",
+        "active_union_union_size_mean",
     ):
         if bucket.get(key) is not None:
             row[key] = bucket[key]
@@ -6483,6 +6648,23 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
         aggregation=args.aggregation,
         cluster_iters=args.cluster_iters,
     )
+    active_union_selection = str(args.active_union_selection).strip().lower().replace("-", "_")
+    union_energy_retention = (
+        float(args.union_energy_retention)
+        if args.union_energy_retention is not None and float(args.union_energy_retention) > 0.0
+        else None
+    )
+    energy_scores = None
+    if active_union_selection in {"energy", "output_energy"} and (
+        args.union_caps or args.union_layer_caps or union_energy_retention is not None
+    ):
+        energy_scores = _build_active_union_output_energy_scores(
+            dense,
+            streams,
+            config,
+            calibration_batches=calibration_batches,
+            device=device,
+        )
     buckets: dict[str, dict[str, Any]] = {
         "dense": {
             "variant": "dense",
@@ -6513,6 +6695,7 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
             "reference_k": args.reference_k,
             "score_mode": args.score_mode,
             "aggregation": args.aggregation,
+            "active_union_selection": active_union_selection,
             "calibration_tokens": actual_calibration_tokens,
             "tokens": 0,
             "samples": 0,
@@ -6533,6 +6716,17 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
         raise SystemExit(
             f"--union-layer-caps expects {len(dense.blocks)} values for this model, got {len(union_layer_caps)}"
         )
+    energy_retention_layer_caps: list[int] = []
+    energy_retention_aux: dict[str, float] = {}
+    if union_energy_retention is not None:
+        if active_union_selection not in {"energy", "output_energy"}:
+            raise SystemExit("--union-energy-retention requires --active-union-selection output_energy")
+        assert energy_scores is not None
+        energy_retention_layer_caps, energy_retention_aux = _active_union_layer_caps_from_energy_retention(
+            codebook,
+            energy_scores,
+            retention=union_energy_retention,
+        )
     for cap in union_caps:
         name = f"global_union_cap{cap}"
         buckets[name] = {
@@ -6545,6 +6739,7 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
             "reference_k": args.reference_k,
             "score_mode": args.score_mode,
             "aggregation": args.aggregation,
+            "active_union_selection": active_union_selection,
             "calibration_tokens": actual_calibration_tokens,
             "tokens": 0,
             "samples": 0,
@@ -6569,6 +6764,34 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
             "reference_k": args.reference_k,
             "score_mode": args.score_mode,
             "aggregation": args.aggregation,
+            "active_union_selection": active_union_selection,
+            "calibration_tokens": actual_calibration_tokens,
+            "tokens": 0,
+            "samples": 0,
+            "loss_sum": 0.0,
+            "kl_sum": 0.0,
+            "final_hidden_cosine_sum": 0.0,
+            "active_size_sum": 0.0,
+            "active_fraction_sum": 0.0,
+            "union_recall_sum": 0.0,
+            "union_score_ratio_sum": 0.0,
+            "selection_count": 0.0,
+            "union_metric_count": 0.0,
+        }
+    if energy_retention_layer_caps:
+        buckets["global_union_energy_retention"] = {
+            "variant": "global_union_energy_retention",
+            "variant_type": "static_cluster_union_energy_retention",
+            "rank": args.rank,
+            "cluster_count": args.clusters,
+            "candidate_m": args.candidate_m,
+            "active_cap_by_layer": energy_retention_layer_caps,
+            "active_union_energy_retention": union_energy_retention,
+            **energy_retention_aux,
+            "reference_k": args.reference_k,
+            "score_mode": args.score_mode,
+            "aggregation": args.aggregation,
+            "active_union_selection": active_union_selection,
             "calibration_tokens": actual_calibration_tokens,
             "tokens": 0,
             "samples": 0,
@@ -6635,6 +6858,8 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
                     tokens,
                     reference_k=args.reference_k,
                     cap=cap,
+                    active_selection=active_union_selection,
+                    energy_scores=energy_scores,
                 ),
             )
             for cap in union_caps
@@ -6650,10 +6875,33 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
                         tokens,
                         reference_k=args.reference_k,
                         layer_caps=union_layer_caps,
+                        active_selection=active_union_selection,
+                        energy_scores=energy_scores,
                     ),
                 ),
             )
-        for name, (logits, hidden, aux) in (*variants, *cap_variants, *layer_cap_variants):
+        energy_retention_variants = ()
+        if energy_retention_layer_caps:
+            energy_retention_variants = (
+                (
+                    "global_union_energy_retention",
+                    _svd_static_union_full_stack_logits(
+                        dense,
+                        codebook,
+                        tokens,
+                        reference_k=args.reference_k,
+                        layer_caps=energy_retention_layer_caps,
+                        active_selection=active_union_selection,
+                        energy_scores=energy_scores,
+                    ),
+                ),
+            )
+        for name, (logits, hidden, aux) in (
+            *variants,
+            *cap_variants,
+            *layer_cap_variants,
+            *energy_retention_variants,
+        ):
             bucket = buckets[name]
             loss = F.cross_entropy(logits.flatten(0, -2), target_flat, reduction="sum")
             cand_logp = F.log_softmax(logits / args.temperature, dim=-1)
@@ -6704,6 +6952,8 @@ def cmd_static_cluster_pool_union_eval(args: argparse.Namespace) -> None:
     rows.extend(_finish_union_eval_bucket(buckets[f"global_union_cap{cap}"]) for cap in union_caps)
     if union_layer_caps:
         rows.append(_finish_union_eval_bucket(buckets["global_union_layercaps"]))
+    if energy_retention_layer_caps:
+        rows.append(_finish_union_eval_bucket(buckets["global_union_energy_retention"]))
     for row in rows:
         row["calibration_avg_nonempty_clusters"] = codebook_aux["calibration_avg_nonempty_clusters"]
         row["calibration_avg_cluster_imbalance"] = codebook_aux["calibration_avg_cluster_imbalance"]
@@ -6975,6 +7225,12 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
     sparse_ffn_kind = str(args.sparse_ffn_kind)
     active_union_cap = int(args.active_union_cap) if args.active_union_cap is not None else None
     active_union_layer_caps = [int(value) for value in (args.active_union_layer_caps or [])]
+    active_union_selection = str(args.active_union_selection).strip().lower().replace("-", "_")
+    active_union_energy_retention = (
+        float(args.active_union_energy_retention)
+        if args.active_union_energy_retention is not None and float(args.active_union_energy_retention) > 0.0
+        else None
+    )
     if active_union_layer_caps and len(active_union_layer_caps) != config.model.n_dense_layers:
         raise SystemExit(
             f"--active-union-layer-caps expects {config.model.n_dense_layers} values, "
@@ -7073,6 +7329,8 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
                 cap=active_union_cap,
                 layer_caps=active_union_layer_caps or None,
                 packed=sparse_ffn_kind == "active_union_packed",
+                active_selection=active_union_selection,
+                energy_retention=active_union_energy_retention,
             )
         else:
             raise AssertionError(f"unknown sparse FFN kind: {sparse_ffn_kind}")
@@ -7133,6 +7391,8 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
                 cap=active_union_cap,
                 layer_caps=active_union_layer_caps or None,
                 packed=False,
+                active_selection=active_union_selection,
+                energy_retention=active_union_energy_retention,
             )
 
         def sparse_eval_callback() -> float:
@@ -7202,6 +7462,9 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
                 "sparse_ffn_kind": sparse_ffn_kind,
                 "active_union_cap": active_union_cap,
                 "active_union_layer_caps": active_union_layer_caps,
+                "active_union_selection": active_union_selection,
+                "active_union_energy_retention": active_union_energy_retention,
+                "effective_active_union_layer_caps": refresh_aux.get("active_union_layer_caps", active_union_layer_caps),
                 "initial_nll_per_token": sparse_initial_nll,
                 "final_nll_per_token": sparse_final_nll,
                 "nll_delta": sparse_final_nll - sparse_initial_nll,
@@ -7234,6 +7497,12 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
                     "refresh_interval": int(refresh_interval),
                     "active_union_cap": active_union_cap,
                     "active_union_layer_caps": active_union_layer_caps,
+                    "active_union_selection": active_union_selection,
+                    "active_union_energy_retention": active_union_energy_retention,
+                    "effective_active_union_layer_caps": refresh_aux.get(
+                        "active_union_layer_caps",
+                        active_union_layer_caps,
+                    ),
                     "rank": args.rank,
                     "clusters": args.clusters,
                     "candidate_m": args.candidate_m,
@@ -7292,6 +7561,8 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
         "sparse_ffn_kind": sparse_ffn_kind,
         "active_union_cap": active_union_cap,
         "active_union_layer_caps": active_union_layer_caps,
+        "active_union_selection": active_union_selection,
+        "active_union_energy_retention": active_union_energy_retention,
         "score_mode": args.score_mode,
         "aggregation": args.aggregation,
         "cluster_iters": args.cluster_iters,
@@ -9002,6 +9273,7 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
                 cluster_iters=args.cluster_iters,
                 cap=None if cap <= 0 else cap,
                 packed=True,
+                active_selection=args.active_union_selection,
             )
         sparse.to(dtype=param_dtype)
         _set_triton_swiglu_backward(sparse, args.triton_swiglu_backward)
@@ -9063,6 +9335,7 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
             "rank": args.rank,
             "clusters": args.clusters,
             "candidate_m": args.candidate_m,
+            "active_union_selection": args.active_union_selection,
             "calibration_tokens": calibration_batches * tokens_per_batch,
             "dense_packed_ffn_baseline": bool(args.pack_dense_ffn),
             "triton_swiglu_backward_requested": bool(args.triton_swiglu_backward),
@@ -9282,6 +9555,7 @@ def cmd_benchmark_active_union_block_train_step(args: argparse.Namespace) -> Non
         cluster_iters=args.cluster_iters,
         cap=None if args.active_union_cap <= 0 else args.active_union_cap,
         packed=True,
+        active_selection=args.active_union_selection,
     )
     dense.to(dtype=dtype)
     sparse.to(dtype=dtype)
@@ -9309,6 +9583,7 @@ def cmd_benchmark_active_union_block_train_step(args: argparse.Namespace) -> Non
             {
                 "layer": layer_idx,
                 "active_union_cap": None if args.active_union_cap <= 0 else args.active_union_cap,
+                "active_union_selection": args.active_union_selection,
                 "dtype": str(dtype),
                 "tokens": tokens_per_batch,
                 "triton_swiglu_backward_used": bool(args.triton_swiglu_backward and triton_swiglu_available()),
@@ -11554,6 +11829,24 @@ def build_parser() -> argparse.ArgumentParser:
             "Length must match the dense layer count; this is a quality-changing experiment."
         ),
     )
+    union_eval.add_argument(
+        "--active-union-selection",
+        choices=["frequency", "output_energy", "energy"],
+        default="frequency",
+        help=(
+            "How capped active-union variants choose rows from the cluster-pool union. "
+            "frequency is the old frequency/rank policy; output_energy ranks rows by "
+            "calibration z^2 * ||W_down||^2."
+        ),
+    )
+    union_eval.add_argument(
+        "--union-energy-retention",
+        type=float,
+        help=(
+            "Optional additional capped global-union variant. For output_energy selection, "
+            "derive per-layer caps that retain this fraction of calibration output energy."
+        ),
+    )
     union_eval.add_argument("--reference-k", type=int, default=64)
     union_eval.add_argument(
         "--score-mode",
@@ -11624,6 +11917,23 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         default=[],
         help="Optional per-layer active-neuron caps for active-union continuation.",
+    )
+    continuation.add_argument(
+        "--active-union-selection",
+        choices=["frequency", "output_energy", "energy"],
+        default="frequency",
+        help=(
+            "Active-union cap selection policy. frequency preserves the old behavior; "
+            "output_energy ranks candidate-union rows by calibration FFN output energy."
+        ),
+    )
+    continuation.add_argument(
+        "--active-union-energy-retention",
+        type=float,
+        help=(
+            "Optional adaptive per-layer cap for output_energy active-union selection. "
+            "Uses the smallest per-layer active set retaining this fraction of calibration output energy."
+        ),
     )
     continuation.add_argument("--refresh-intervals", type=int, nargs="+", default=[0])
     continuation.add_argument("--score-mode", choices=["sum", "upgate", "product"], default="sum")
@@ -11803,6 +12113,11 @@ def build_parser() -> argparse.ArgumentParser:
     active_union_model_bench.add_argument("--heads", type=int)
     active_union_model_bench.add_argument("--vocab-size", type=int)
     active_union_model_bench.add_argument("--active-union-cap", type=int, nargs="+", default=[0, 320])
+    active_union_model_bench.add_argument(
+        "--active-union-selection",
+        choices=["frequency", "output_energy", "energy"],
+        default="frequency",
+    )
     active_union_model_bench.add_argument("--batch-size", type=int)
     active_union_model_bench.add_argument("--seq-len", type=int)
     active_union_model_bench.add_argument("--calibration-tokens", type=int, default=8192)
@@ -11853,6 +12168,11 @@ def build_parser() -> argparse.ArgumentParser:
     active_union_block_bench.add_argument("--config", required=True)
     active_union_block_bench.add_argument("--dense-checkpoint", required=True)
     active_union_block_bench.add_argument("--active-union-cap", type=int, default=192)
+    active_union_block_bench.add_argument(
+        "--active-union-selection",
+        choices=["frequency", "output_energy", "energy"],
+        default="frequency",
+    )
     active_union_block_bench.add_argument("--layers", type=int, nargs="+", default=[0])
     active_union_block_bench.add_argument("--batch-size", type=int)
     active_union_block_bench.add_argument("--seq-len", type=int)
