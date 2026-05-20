@@ -1,0 +1,275 @@
+{
+  "benchmark_loss": "clamped_ce",
+  "checkpoint": null,
+  "component_iters": 1,
+  "component_warmup": 1,
+  "device": "cuda",
+  "event_iters": 2,
+  "event_profile": true,
+  "event_warmup": 1,
+  "iters": 3,
+  "mode": "benchmark_active_union_model_train_step",
+  "random_init": true,
+  "random_init_matrix_scale": 0.25,
+  "rows": [
+    {
+      "active_union_cap": 192,
+      "attention_forward_speedup": 1.3650650569476415,
+      "batch_size": 8,
+      "calibration_avg_cluster_imbalance": 1.1705729166666667,
+      "calibration_avg_nonempty_clusters": 16.0,
+      "calibration_tokens": 8192,
+      "candidate_m": 192,
+      "clusters": 16,
+      "coverage": {
+        "mean": {
+          "coverage_fraction": 0.01171875,
+          "unique_selected_neurons": 192.0
+        },
+        "rows": [
+          {
+            "coverage_fraction": 0.01171875,
+            "layer": 0.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.01171875,
+            "layer": 1.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.01171875,
+            "layer": 2.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.01171875,
+            "layer": 3.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.01171875,
+            "layer": 4.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.01171875,
+            "layer": 5.0,
+            "unique_selected_neurons": 192.0
+          }
+        ]
+      },
+      "dense_components": {
+        "attention_forward_ms": 1.7536240000026737,
+        "embed_forward_ms": 0.10037100003046362,
+        "ffn_forward_ms": 2.6860119999128074,
+        "loss_value": 32.54866027832031,
+        "output_forward_ms": 0.16978000007839
+      },
+      "dense_event_profile": {
+        "attention_backward_ms": 2.002096012234688,
+        "attention_forward_backward_ms": 2.6633600126951933,
+        "attention_forward_ms": 0.6612640004605055,
+        "attention_output_projection_forward_ms": 0.15144000109285116,
+        "attention_qkv_projection_forward_ms": 0.38977600261569023,
+        "attention_score_value_forward_ms": 0.12004799675196409,
+        "available": true,
+        "embedding_forward_ms": 0.045023998245596886,
+        "ffn_backward_ms": 4.719536006450653,
+        "ffn_forward_backward_ms": 7.056144014000893,
+        "ffn_forward_ms": 2.3366080075502396,
+        "loss": 8.317765235900879,
+        "misc_overhead_ms": 1.147936075925827,
+        "optimizer_ms": 17.519760131835938,
+        "output_head_backward_ms": 0.2017119973897934,
+        "output_head_forward_backward_ms": 0.3024959973990917,
+        "output_head_forward_ms": 0.10078400000929832,
+        "total_step_ms": 28.73472023010254
+      },
+      "dense_forward_backward_ms": 10.825586000009935,
+      "dense_loss": 8.317765235900879,
+      "dense_optimizer_ms": 17.780634333348644,
+      "dense_packed_ffn_baseline": true,
+      "dense_param_count": 713058304,
+      "dense_total_step_ms": 28.60622033335858,
+      "dtype": "torch.float16",
+      "event_attention_fwd_bwd_speedup": 0.7744847223130756,
+      "event_ffn_fwd_bwd_speedup": 3.3252077254129384,
+      "event_output_head_fwd_bwd_speedup": 0.6666666584565519,
+      "event_total_step_speedup": 2.724223702782284,
+      "ffn_forward_speedup": 3.5457125591871677,
+      "forward_backward_speedup": 1.6915458277416595,
+      "optimizer_speedup": 5.727800758671489,
+      "output_forward_speedup": 1.118415851818507,
+      "rank": 64,
+      "seq_len": 64,
+      "sparse_components": {
+        "attention_forward_ms": 1.28464499994152,
+        "embed_forward_ms": 0.025491000087640714,
+        "ffn_forward_ms": 0.7575379997888376,
+        "loss_value": 32.544273376464844,
+        "output_forward_ms": 0.1518040000973997
+      },
+      "sparse_event_profile": {
+        "attention_backward_ms": 2.5505279898643494,
+        "attention_forward_backward_ms": 3.438879988156259,
+        "attention_forward_ms": 0.8883519982919097,
+        "attention_output_projection_forward_ms": 0.22785599902272224,
+        "attention_qkv_projection_forward_ms": 0.4636959992349148,
+        "attention_score_value_forward_ms": 0.19680000003427267,
+        "available": true,
+        "embedding_forward_ms": 0.04116799868643284,
+        "ffn_backward_ms": 1.1545919999480247,
+        "ffn_forward_backward_ms": 2.122016005218029,
+        "ffn_forward_ms": 0.9674240052700043,
+        "loss": 8.317765235900879,
+        "misc_overhead_ms": 1.4209762355312705,
+        "optimizer_ms": 3.0710721015930176,
+        "output_head_backward_ms": 0.3113600015640259,
+        "output_head_forward_backward_ms": 0.45374400168657303,
+        "output_head_forward_ms": 0.14238400012254715,
+        "total_step_ms": 10.547856330871582
+      },
+      "sparse_forward_backward_ms": 6.399818333306939,
+      "sparse_loss": 8.317765235900879,
+      "sparse_optimizer_ms": 3.1042690000049333,
+      "sparse_param_count": 116156416,
+      "sparse_param_fraction": 0.1628989037059163,
+      "sparse_total_step_ms": 9.504087333311872,
+      "tokens": 512,
+      "total_step_speedup": 3.009886097436588,
+      "triton_swiglu_backward_requested": true,
+      "triton_swiglu_backward_used": true
+    },
+    {
+      "active_union_cap": 320,
+      "attention_forward_speedup": 1.364920558467429,
+      "batch_size": 8,
+      "calibration_avg_cluster_imbalance": 1.1705729166666667,
+      "calibration_avg_nonempty_clusters": 16.0,
+      "calibration_tokens": 8192,
+      "candidate_m": 192,
+      "clusters": 16,
+      "coverage": {
+        "mean": {
+          "coverage_fraction": 0.01953125,
+          "unique_selected_neurons": 320.0
+        },
+        "rows": [
+          {
+            "coverage_fraction": 0.01953125,
+            "layer": 0.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.01953125,
+            "layer": 1.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.01953125,
+            "layer": 2.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.01953125,
+            "layer": 3.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.01953125,
+            "layer": 4.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.01953125,
+            "layer": 5.0,
+            "unique_selected_neurons": 320.0
+          }
+        ]
+      },
+      "dense_components": {
+        "attention_forward_ms": 1.7536240000026737,
+        "embed_forward_ms": 0.10037100003046362,
+        "ffn_forward_ms": 2.6860119999128074,
+        "loss_value": 32.54866027832031,
+        "output_forward_ms": 0.16978000007839
+      },
+      "dense_event_profile": {
+        "attention_backward_ms": 2.002096012234688,
+        "attention_forward_backward_ms": 2.6633600126951933,
+        "attention_forward_ms": 0.6612640004605055,
+        "attention_output_projection_forward_ms": 0.15144000109285116,
+        "attention_qkv_projection_forward_ms": 0.38977600261569023,
+        "attention_score_value_forward_ms": 0.12004799675196409,
+        "available": true,
+        "embedding_forward_ms": 0.045023998245596886,
+        "ffn_backward_ms": 4.719536006450653,
+        "ffn_forward_backward_ms": 7.056144014000893,
+        "ffn_forward_ms": 2.3366080075502396,
+        "loss": 8.317765235900879,
+        "misc_overhead_ms": 1.147936075925827,
+        "optimizer_ms": 17.519760131835938,
+        "output_head_backward_ms": 0.2017119973897934,
+        "output_head_forward_backward_ms": 0.3024959973990917,
+        "output_head_forward_ms": 0.10078400000929832,
+        "total_step_ms": 28.73472023010254
+      },
+      "dense_forward_backward_ms": 10.825586000009935,
+      "dense_loss": 8.317765235900879,
+      "dense_optimizer_ms": 17.780634333348644,
+      "dense_packed_ffn_baseline": true,
+      "dense_param_count": 713058304,
+      "dense_total_step_ms": 28.60622033335858,
+      "dtype": "torch.float16",
+      "event_attention_fwd_bwd_speedup": 0.7769283228813569,
+      "event_ffn_fwd_bwd_speedup": 3.3460470216779497,
+      "event_output_head_fwd_bwd_speedup": 0.6636478369544758,
+      "event_total_step_speedup": 2.704992120605482,
+      "ffn_forward_speedup": 3.773967607886051,
+      "forward_backward_speedup": 1.6829102371087645,
+      "optimizer_speedup": 5.545777229518689,
+      "output_forward_speedup": 1.3183519448852934,
+      "rank": 64,
+      "seq_len": 64,
+      "sparse_components": {
+        "attention_forward_ms": 1.2847809999811943,
+        "embed_forward_ms": 0.02676000008250412,
+        "ffn_forward_ms": 0.7117210000160412,
+        "loss_value": 32.544952392578125,
+        "output_forward_ms": 0.12878199993338058
+      },
+      "sparse_event_profile": {
+        "attention_backward_ms": 2.542623996734619,
+        "attention_forward_backward_ms": 3.4280639979988337,
+        "attention_forward_ms": 0.8854400012642145,
+        "attention_output_projection_forward_ms": 0.22566399723291397,
+        "attention_qkv_projection_forward_ms": 0.4599680043756962,
+        "attention_score_value_forward_ms": 0.19980799965560436,
+        "available": true,
+        "embedding_forward_ms": 0.04270400106906891,
+        "ffn_backward_ms": 1.1421760097146034,
+        "ffn_forward_backward_ms": 2.1088000163435936,
+        "ffn_forward_ms": 0.9666240066289902,
+        "loss": 8.317765235900879,
+        "misc_overhead_ms": 1.4147520568221807,
+        "optimizer_ms": 3.172719955444336,
+        "output_head_backward_ms": 0.31411200761795044,
+        "output_head_forward_backward_ms": 0.45580800622701645,
+        "output_head_forward_ms": 0.141695998609066,
+        "total_step_ms": 10.62284803390503
+      },
+      "sparse_forward_backward_ms": 6.432657999994262,
+      "sparse_loss": 8.317765235900879,
+      "sparse_optimizer_ms": 3.206157333314271,
+      "sparse_param_count": 120875008,
+      "sparse_param_fraction": 0.16951630367662054,
+      "sparse_total_step_ms": 9.638815333308534,
+      "tokens": 512,
+      "total_step_speedup": 2.96781495901317,
+      "triton_swiglu_backward_requested": true,
+      "triton_swiglu_backward_used": true
+    }
+  ],
+  "warmup": 1
+}

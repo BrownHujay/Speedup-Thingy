@@ -1,0 +1,45 @@
+{
+  "checkpoint": "runs/blackwell_20260519_190504/repro_old_synthetic_d256_h2048_ffng64/checkpoints/dense_step200.pt",
+  "calibration_tokens": 8192,
+  "rows": [
+    {
+      "variant": "dense",
+      "nll": 7.763702809810638
+    },
+    {
+      "variant": "exact_calib_top128",
+      "nll": 8.053141593933105,
+      "gap": 0.28943878412246704
+    },
+    {
+      "variant": "exact_calib_top160",
+      "nll": 8.013294205069542,
+      "gap": 0.2495913952589035
+    },
+    {
+      "variant": "exact_calib_top192",
+      "nll": 7.969173714518547,
+      "gap": 0.20547090470790863
+    },
+    {
+      "variant": "exact_calib_top224",
+      "nll": 7.9047944992780685,
+      "gap": 0.14109168946743011
+    },
+    {
+      "variant": "exact_calib_top256",
+      "nll": 7.8782629519701,
+      "gap": 0.11456014215946198
+    },
+    {
+      "variant": "exact_calib_top320",
+      "nll": 7.845392152667046,
+      "gap": 0.08168934285640717
+    },
+    {
+      "variant": "exact_calib_top512",
+      "nll": 7.80786395072937,
+      "gap": 0.04416114091873169
+    }
+  ]
+}

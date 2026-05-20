@@ -1694,5 +1694,8 @@ class TrainEngine:
         if "torch_rng_state" in payload:
             torch.set_rng_state(payload["torch_rng_state"].detach().cpu())
         if torch.cuda.is_available() and "cuda_rng_state_all" in payload:
-            torch.cuda.set_rng_state_all(payload["cuda_rng_state_all"])
+            cuda_rng_state_all = [
+                state.detach().cpu().to(torch.uint8) for state in payload["cuda_rng_state_all"]
+            ]
+            torch.cuda.set_rng_state_all(cuda_rng_state_all)
         return payload.get("data_cursor")

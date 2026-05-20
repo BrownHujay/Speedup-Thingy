@@ -1,0 +1,57 @@
+{
+  "checkpoint": "runs/blackwell_20260519_190504/ffnv2_synthetic_d512_h4096/checkpoints/dense_step400.pt",
+  "device": "cuda",
+  "iters": 20,
+  "mode": "benchmark_active_union_block_train_step",
+  "rows": [
+    {
+      "active_union_cap": 320,
+      "attention_forward_backward_speedup": 1.0025137662722654,
+      "block_forward_backward_speedup": 2.239194564689361,
+      "dense_attention_forward_backward_ms": 0.6534143924713135,
+      "dense_block_forward_backward_ms": 2.259916877746582,
+      "dense_ffn_forward_backward_ms": 1.6093183517456056,
+      "dtype": "torch.float32",
+      "ffn_forward_backward_speedup": 4.299899904261513,
+      "layer": 0,
+      "sparse_attention_forward_backward_ms": 0.6517759799957276,
+      "sparse_block_forward_backward_ms": 1.0092543601989745,
+      "sparse_ffn_forward_backward_ms": 0.37426879405975344,
+      "tokens": 2048,
+      "triton_swiglu_backward_used": true
+    },
+    {
+      "active_union_cap": 320,
+      "attention_forward_backward_speedup": 1.0004734890594407,
+      "block_forward_backward_speedup": 2.242490139133156,
+      "dense_attention_forward_backward_ms": 0.6490623950958252,
+      "dense_block_forward_backward_ms": 2.249350357055664,
+      "dense_ffn_forward_backward_ms": 1.580288028717041,
+      "dtype": "torch.float32",
+      "ffn_forward_backward_speedup": 4.199319754396936,
+      "layer": 3,
+      "sparse_attention_forward_backward_ms": 0.6487552165985108,
+      "sparse_block_forward_backward_ms": 1.003059196472168,
+      "sparse_ffn_forward_backward_ms": 0.3763200044631958,
+      "tokens": 2048,
+      "triton_swiglu_backward_used": true
+    },
+    {
+      "active_union_cap": 320,
+      "attention_forward_backward_speedup": 1.0025290638084419,
+      "block_forward_backward_speedup": 2.184034107780564,
+      "dense_attention_forward_backward_ms": 0.6494719982147217,
+      "dense_block_forward_backward_ms": 2.187808036804199,
+      "dense_ffn_forward_backward_ms": 1.5577456474304199,
+      "dtype": "torch.float32",
+      "ffn_forward_backward_speedup": 4.176906802550872,
+      "layer": 5,
+      "sparse_attention_forward_backward_ms": 0.6478335857391357,
+      "sparse_block_forward_backward_ms": 1.0017279624938964,
+      "sparse_ffn_forward_backward_ms": 0.3729423999786377,
+      "tokens": 2048,
+      "triton_swiglu_backward_used": true
+    }
+  ],
+  "warmup": 5
+}

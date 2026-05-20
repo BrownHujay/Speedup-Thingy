@@ -30,6 +30,39 @@ replace the same call sites with Triton/CUDA kernels.
 | `k_sample_audit_mask` | Torch Bernoulli sampling. | Lightweight CUDA random/audit mask kernel. |
 | `k_metrics_reduce` | CPU-readable reductions. | Device-side metric reductions with compact host copy. |
 
+## Packed Active-Union SwiGLU
+
+`src/recursive_training_engine/kernels/active_swiglu_triton.py` implements the
+Triton fused activation path used by `PackedDenseSwiGLU` and
+`PackedActiveUnionSwiGLU`:
+
+```text
+X @ W_ug.T
+→ fused SwiGLU activation kernel
+→ Z @ W_down_rows
+```
+
+Backward keeps the two activation derivatives fused in Triton, then uses GEMMs
+for `dX`, `dW_ug`, and `dW_down`. The current implementation supports AMP
+benchmarking with fp32 parameters and fp16/bf16 autocast activations: gradient
+matmuls cast explicitly at the boundary so mixed precision does not crash or
+silently compare fp16 sparse training against fp32 dense training.
+
+Current Blackwell sanity results for the working FFNv2 shape:
+
+```text
+d=2048, H=8192, tokens=8192, active=192:
+  packed active FFN forward:       24.6x dense
+  packed active FFN fwd+bwd:       17.6x dense
+
+d=512, H=4096, batch=128, seq=64, active=192:
+  full model train step:            3.54x dense
+  FFN event slice:                  7.22x dense
+```
+
+The remaining gap to the ideal FLOP ratio is mostly small-GEMM/backward
+efficiency and launch/graph capture behavior, not per-token gather/scatter.
+
 ## New FFN Prototype: `SVDFactorSparseFFN`
 
 The new hot-path prototype lives in `src/recursive_training_engine/layers.py`.

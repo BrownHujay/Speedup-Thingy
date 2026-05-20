@@ -1,0 +1,57 @@
+{
+  "checkpoint": "runs/blackwell_20260519_190504/ffnv2_synthetic_d512_h4096/checkpoints/dense_step400.pt",
+  "device": "cuda",
+  "iters": 20,
+  "mode": "benchmark_active_union_block_train_step",
+  "rows": [
+    {
+      "active_union_cap": 192,
+      "attention_forward_backward_speedup": 0.9876420793063104,
+      "block_forward_backward_speedup": 1.8656115152781767,
+      "dense_attention_forward_backward_ms": 0.7855120182037354,
+      "dense_block_forward_backward_ms": 2.259404754638672,
+      "dense_ffn_forward_backward_ms": 1.6226144790649415,
+      "dtype": "torch.float32",
+      "ffn_forward_backward_speedup": 3.2124566164800545,
+      "layer": 0,
+      "sparse_attention_forward_backward_ms": 0.7953407764434814,
+      "sparse_block_forward_backward_ms": 1.211079978942871,
+      "sparse_ffn_forward_backward_ms": 0.5051008224487304,
+      "tokens": 2048,
+      "triton_swiglu_backward_used": true
+    },
+    {
+      "active_union_cap": 192,
+      "attention_forward_backward_speedup": 1.0179290014661386,
+      "block_forward_backward_speedup": 1.8813999651672197,
+      "dense_attention_forward_backward_ms": 0.796673583984375,
+      "dense_block_forward_backward_ms": 2.249964714050293,
+      "dense_ffn_forward_backward_ms": 1.6123903274536133,
+      "dtype": "torch.float32",
+      "ffn_forward_backward_speedup": 3.202643850233344,
+      "layer": 3,
+      "sparse_attention_forward_backward_ms": 0.7826416015625,
+      "sparse_block_forward_backward_ms": 1.195899200439453,
+      "sparse_ffn_forward_backward_ms": 0.5034560203552246,
+      "tokens": 2048,
+      "triton_swiglu_backward_used": true
+    },
+    {
+      "active_union_cap": 192,
+      "attention_forward_backward_speedup": 1.0,
+      "block_forward_backward_speedup": 1.8747740492255411,
+      "dense_attention_forward_backward_ms": 0.7819263935089111,
+      "dense_block_forward_backward_ms": 2.2484479904174806,
+      "dense_ffn_forward_backward_ms": 1.6125808715820313,
+      "dtype": "torch.float32",
+      "ffn_forward_backward_speedup": 3.237219628049156,
+      "layer": 5,
+      "sparse_attention_forward_backward_ms": 0.7819263935089111,
+      "sparse_block_forward_backward_ms": 1.1993167877197266,
+      "sparse_ffn_forward_backward_ms": 0.4981376171112061,
+      "tokens": 2048,
+      "triton_swiglu_backward_used": true
+    }
+  ],
+  "warmup": 5
+}

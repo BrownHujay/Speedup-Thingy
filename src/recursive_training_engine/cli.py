@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import dataclasses
 import json
@@ -5041,6 +5042,26 @@ def _set_triton_swiglu_backward(model: DenseModel, enabled: bool) -> None:
             module.use_triton_swiglu_backward = use_triton
 
 
+def _install_packed_active_union_from_state(
+    model: DenseModel,
+    state: dict[str, torch.Tensor],
+    *,
+    device: torch.device,
+) -> bool:
+    installed = False
+    for layer_idx, block in enumerate(model.blocks):
+        active_ids = state.get(f"blocks.{layer_idx}.mlp.active_ids")
+        if active_ids is None:
+            continue
+        if not isinstance(block.mlp, PackedActiveUnionSwiGLU):
+            block.mlp = PackedActiveUnionSwiGLU(
+                block.mlp,
+                active_ids.detach().to(device=device, dtype=torch.long),
+            ).to(device=device)
+        installed = True
+    return installed
+
+
 def _pack_dense_ffns_for_benchmark(model: DenseModel) -> None:
     for block in model.blocks:
         if isinstance(block.mlp, PackedDenseSwiGLU):
@@ -6948,6 +6969,9 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
             training=dataclasses.replace(config.training, batch_size=args.alignment_batch_size),
         )
     rows: list[dict[str, Any]] = []
+    save_checkpoint_dir = Path(args.save_checkpoint_dir) if args.save_checkpoint_dir else None
+    if save_checkpoint_dir is not None:
+        save_checkpoint_dir.mkdir(parents=True, exist_ok=True)
     sparse_ffn_kind = str(args.sparse_ffn_kind)
     active_union_cap = int(args.active_union_cap) if args.active_union_cap is not None else None
     active_union_layer_caps = [int(value) for value in (args.active_union_layer_caps or [])]
@@ -6998,6 +7022,18 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
                 **train_metrics,
             }
         )
+        if save_checkpoint_dir is not None:
+            torch.save(
+                {
+                    "model": dense.state_dict(),
+                    "variant": "dense_continuation",
+                    "source_checkpoint": args.dense_checkpoint,
+                    "steps": args.steps,
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                },
+                save_checkpoint_dir / "dense_continuation.pt",
+            )
         del dense
         if device.type == "mps":
             torch.mps.empty_cache()
@@ -7183,6 +7219,32 @@ def cmd_static_cluster_pool_continuation(args: argparse.Namespace) -> None:
                 **train_metrics,
             }
         )
+        if save_checkpoint_dir is not None:
+            sparse_name = (
+                f"{sparse_ffn_kind}_cap{active_union_cap}_refresh{int(refresh_interval)}.pt"
+                if active_union_cap is not None
+                else f"{sparse_ffn_kind}_refresh{int(refresh_interval)}.pt"
+            )
+            torch.save(
+                {
+                    "model": sparse.state_dict(),
+                    "variant": sparse_ffn_kind,
+                    "source_checkpoint": args.dense_checkpoint,
+                    "steps": args.steps,
+                    "refresh_interval": int(refresh_interval),
+                    "active_union_cap": active_union_cap,
+                    "active_union_layer_caps": active_union_layer_caps,
+                    "rank": args.rank,
+                    "clusters": args.clusters,
+                    "candidate_m": args.candidate_m,
+                    "score_mode": args.score_mode,
+                    "aggregation": args.aggregation,
+                    "cluster_iters": args.cluster_iters,
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                },
+                save_checkpoint_dir / sparse_name,
+            )
         del sparse
         if device.type == "mps":
             torch.mps.empty_cache()
@@ -8424,6 +8486,15 @@ def _benchmark_lm_loss_from_logits(
     raise ValueError(f"unsupported benchmark loss: {benchmark_loss}")
 
 
+def _benchmark_autocast_context(
+    device: torch.device,
+    dtype: torch.dtype | None,
+) -> contextlib.AbstractContextManager:
+    if device.type == "cuda" and dtype in (torch.float16, torch.bfloat16):
+        return torch.autocast(device_type="cuda", dtype=dtype)
+    return contextlib.nullcontext()
+
+
 def _scale_random_benchmark_state(
     state: dict[str, torch.Tensor],
     *,
@@ -8449,6 +8520,7 @@ def _time_model_forward_components(
     iters: int,
     warmup: int,
     benchmark_loss: str = "ce",
+    autocast_dtype: torch.dtype | None = None,
 ) -> dict[str, float]:
     """Forward-only component timing for the full model.
 
@@ -8470,28 +8542,32 @@ def _time_model_forward_components(
 
         _sync_device(device)
         start = time.perf_counter()
-        x = model.embed(tokens)
+        with _benchmark_autocast_context(device, autocast_dtype):
+            x = model.embed(tokens)
         _sync_device(device)
         times["embed_forward_seconds"] += time.perf_counter() - start
 
         for block in model.blocks:
             _sync_device(device)
             start = time.perf_counter()
-            u = x + block.attn(block.norm1(x))
+            with _benchmark_autocast_context(device, autocast_dtype):
+                u = x + block.attn(block.norm1(x))
             _sync_device(device)
             times["attention_forward_seconds"] += time.perf_counter() - start
 
             _sync_device(device)
             start = time.perf_counter()
-            x = u + block.mlp(block.norm2(u))
+            with _benchmark_autocast_context(device, autocast_dtype):
+                x = u + block.mlp(block.norm2(u))
             _sync_device(device)
             times["ffn_forward_seconds"] += time.perf_counter() - start
 
         _sync_device(device)
         start = time.perf_counter()
-        hidden = model.final_norm(x)
-        logits = hidden @ model.vocab_weight.t()
-        loss = _benchmark_lm_loss_from_logits(logits, targets, benchmark_loss=benchmark_loss)
+        with _benchmark_autocast_context(device, autocast_dtype):
+            hidden = model.final_norm(x)
+            logits = hidden @ model.vocab_weight.t()
+            loss = _benchmark_lm_loss_from_logits(logits, targets, benchmark_loss=benchmark_loss)
         _sync_device(device)
         times["output_forward_seconds"] += time.perf_counter() - start
         # Keep the scalar live so eager execution cannot discard the loss path.
@@ -8528,6 +8604,7 @@ def _time_model_train_step(
     iters: int,
     warmup: int,
     benchmark_loss: str = "ce",
+    autocast_dtype: torch.dtype | None = None,
 ) -> dict[str, float]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     model.train()
@@ -8536,9 +8613,10 @@ def _time_model_train_step(
         _sync_device(device)
         start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
-        out = model(tokens, None)
-        assert out.logits is not None
-        loss = _benchmark_lm_loss_from_logits(out.logits, targets, benchmark_loss=benchmark_loss)
+        with _benchmark_autocast_context(device, autocast_dtype):
+            out = model(tokens, None)
+            assert out.logits is not None
+            loss = _benchmark_lm_loss_from_logits(out.logits, targets, benchmark_loss=benchmark_loss)
         loss.backward()
         _sync_device(device)
         fwd_bwd_end = time.perf_counter()
@@ -8584,6 +8662,7 @@ def _event_profile_model_train_step(
     iters: int,
     warmup: int,
     benchmark_loss: str = "ce",
+    autocast_dtype: torch.dtype | None = None,
 ) -> dict[str, Any]:
     """CUDA-event component profile for one full model train step.
 
@@ -8653,43 +8732,45 @@ def _event_profile_model_train_step(
             total_start, total_end = event_pair()
             total_start.record()
         optimizer.zero_grad(set_to_none=True)
-        x = timed_forward("embedding_forward", lambda: model.embed(tokens))
-        for block in model.blocks:
-            x_in = x
-            normed = block.norm1(x_in)
-            qkv = timed_forward(
-                "attention_qkv_projection_forward",
-                lambda block=block, normed=normed: block.attn.wqkv(normed),
-            )
-            b, s, d = normed.shape
-            qkv_view = qkv.view(b, s, 3, block.attn.n_heads, block.attn.head_dim)
-            q, k, v = qkv_view.unbind(dim=2)
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            if block.attn.rope is not None:
-                q, k = block.attn.rope(q, k)
-            attn_heads = timed_forward(
-                "attention_score_value_forward",
-                lambda q=q, k=k, v=v: optimized.k_flash_causal_dense(q, k, v),
-            )
-            attn_flat = attn_heads.transpose(1, 2).contiguous().view(b, s, d)
-            attn_out = timed_forward(
-                "attention_output_projection_forward",
-                lambda block=block, attn_flat=attn_flat: block.attn.wo(attn_flat),
-            )
-            u = x_in + attn_out
-            add_backward_segment("attention_backward", x_in, u)
-            x_out = timed_forward("ffn_forward", lambda block=block, u=u: u + block.mlp(block.norm2(u)))
-            add_backward_segment("ffn_backward", u, x_out)
-            x = x_out
+        with _benchmark_autocast_context(device, autocast_dtype):
+            x = timed_forward("embedding_forward", lambda: model.embed(tokens))
+            for block in model.blocks:
+                x_in = x
+                normed = block.norm1(x_in)
+                qkv = timed_forward(
+                    "attention_qkv_projection_forward",
+                    lambda block=block, normed=normed: block.attn.wqkv(normed),
+                )
+                b, s, d = normed.shape
+                qkv_view = qkv.view(b, s, 3, block.attn.n_heads, block.attn.head_dim)
+                q, k, v = qkv_view.unbind(dim=2)
+                q = q.transpose(1, 2)
+                k = k.transpose(1, 2)
+                v = v.transpose(1, 2)
+                if block.attn.rope is not None:
+                    q, k = block.attn.rope(q, k)
+                attn_heads = timed_forward(
+                    "attention_score_value_forward",
+                    lambda q=q, k=k, v=v: optimized.k_flash_causal_dense(q, k, v),
+                )
+                attn_flat = attn_heads.transpose(1, 2).contiguous().view(b, s, d)
+                attn_out = timed_forward(
+                    "attention_output_projection_forward",
+                    lambda block=block, attn_flat=attn_flat: block.attn.wo(attn_flat),
+                )
+                u = x_in + attn_out
+                add_backward_segment("attention_backward", x_in, u)
+                x_out = timed_forward("ffn_forward", lambda block=block, u=u: u + block.mlp(block.norm2(u)))
+                add_backward_segment("ffn_backward", u, x_out)
+                x = x_out
         if measure:
             oh_fwd_start, oh_fwd_end = event_pair()
             torch.cuda.nvtx.range_push("output_head_forward")
             oh_fwd_start.record()
-        hidden = model.final_norm(x)
-        logits = hidden @ model.vocab_weight.t()
-        loss = _benchmark_lm_loss_from_logits(logits, targets, benchmark_loss=benchmark_loss)
+        with _benchmark_autocast_context(device, autocast_dtype):
+            hidden = model.final_norm(x)
+            logits = hidden @ model.vocab_weight.t()
+            loss = _benchmark_lm_loss_from_logits(logits, targets, benchmark_loss=benchmark_loss)
         if measure:
             oh_fwd_end.record()
             torch.cuda.nvtx.range_pop()
@@ -8794,6 +8875,8 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
     set_seed(args.seed if args.seed is not None else config.training.seed)
     device = default_device()
     dtype = _benchmark_dtype(args.dtype, device)
+    amp_dtype = dtype if bool(args.amp) and device.type == "cuda" and dtype in (torch.float16, torch.bfloat16) else None
+    param_dtype = torch.float32 if amp_dtype is not None else dtype
     streams = load_token_streams(config.data, config.training, config.model.vocab_size)
     tokens, targets = next(streams.train_batches(config.training))
     tokens = tokens.to(device)
@@ -8824,8 +8907,19 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
     dense = make_dense_model()
     if args.pack_dense_ffn:
         _pack_dense_ffns_for_benchmark(dense)
-    dense.to(dtype=dtype)
+    dense.to(dtype=param_dtype)
     _set_triton_swiglu_backward(dense, args.triton_swiglu_backward)
+    dense_quality_nll = (
+        _eval_lm_nll(
+            dense,
+            streams,
+            config,
+            batches=args.quality_eval_batches,
+            device=device,
+        )
+        if args.quality_eval_batches and args.quality_eval_batches > 0
+        else None
+    )
     dense_components = _time_model_forward_components(
         dense,
         tokens,
@@ -8834,6 +8928,7 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
         iters=args.component_iters,
         warmup=args.component_warmup,
         benchmark_loss=args.benchmark_loss,
+        autocast_dtype=amp_dtype,
     )
     dense_train = _time_model_train_step(
         dense,
@@ -8845,6 +8940,7 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
         iters=args.iters,
         warmup=args.warmup,
         benchmark_loss=args.benchmark_loss,
+        autocast_dtype=amp_dtype,
     )
     dense_event_profile = _event_profile_model_train_step(
         dense,
@@ -8856,6 +8952,7 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
         iters=args.event_iters,
         warmup=args.event_warmup,
         benchmark_loss=args.benchmark_loss,
+        autocast_dtype=amp_dtype,
     ) if args.event_profile else {}
     dense_param_count_value = sum(param.numel() for param in dense.parameters())
     del dense
@@ -8864,23 +8961,61 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
 
     for cap in caps:
         sparse = make_dense_model()
-        refresh_aux = _refresh_active_union_ffns(
-            sparse,
-            streams,
-            config,
-            calibration_batches=calibration_batches,
-            device=device,
-            rank=args.rank,
-            cluster_count=args.clusters,
-            candidate_m=args.candidate_m,
-            score_mode=args.score_mode,
-            aggregation=args.aggregation,
-            cluster_iters=args.cluster_iters,
-            cap=None if cap <= 0 else cap,
-            packed=True,
-        )
-        sparse.to(dtype=dtype)
+        sparse_checkpoint_payload = None
+        sparse_checkpoint_state = None
+        if args.sparse_checkpoint:
+            sparse_checkpoint_payload = torch.load(args.sparse_checkpoint, map_location=device, weights_only=False)
+            sparse_checkpoint_state = (
+                sparse_checkpoint_payload["model"]
+                if isinstance(sparse_checkpoint_payload, dict) and "model" in sparse_checkpoint_payload
+                else sparse_checkpoint_payload
+            )
+            if not _install_packed_active_union_from_state(sparse, sparse_checkpoint_state, device=device):
+                raise SystemExit(f"sparse checkpoint has no packed active-union active_ids: {args.sparse_checkpoint}")
+            sparse.load_state_dict(sparse_checkpoint_state, strict=True)
+            refresh_aux = {
+                "calibration_avg_cluster_imbalance": sparse_checkpoint_payload.get(
+                    "calibration_avg_cluster_imbalance",
+                    float("nan"),
+                )
+                if isinstance(sparse_checkpoint_payload, dict)
+                else float("nan"),
+                "calibration_avg_nonempty_clusters": sparse_checkpoint_payload.get(
+                    "calibration_avg_nonempty_clusters",
+                    float("nan"),
+                )
+                if isinstance(sparse_checkpoint_payload, dict)
+                else float("nan"),
+            }
+        else:
+            refresh_aux = _refresh_active_union_ffns(
+                sparse,
+                streams,
+                config,
+                calibration_batches=calibration_batches,
+                device=device,
+                rank=args.rank,
+                cluster_count=args.clusters,
+                candidate_m=args.candidate_m,
+                score_mode=args.score_mode,
+                aggregation=args.aggregation,
+                cluster_iters=args.cluster_iters,
+                cap=None if cap <= 0 else cap,
+                packed=True,
+            )
+        sparse.to(dtype=param_dtype)
         _set_triton_swiglu_backward(sparse, args.triton_swiglu_backward)
+        sparse_quality_nll = (
+            _eval_lm_nll(
+                sparse,
+                streams,
+                config,
+                batches=args.quality_eval_batches,
+                device=device,
+            )
+            if args.quality_eval_batches and args.quality_eval_batches > 0
+            else None
+        )
         sparse_components = _time_model_forward_components(
             sparse,
             tokens,
@@ -8889,6 +9024,7 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
             iters=args.component_iters,
             warmup=args.component_warmup,
             benchmark_loss=args.benchmark_loss,
+            autocast_dtype=amp_dtype,
         )
         sparse_train = _time_model_train_step(
             sparse,
@@ -8900,6 +9036,7 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
             iters=args.iters,
             warmup=args.warmup,
             benchmark_loss=args.benchmark_loss,
+            autocast_dtype=amp_dtype,
         )
         sparse_event_profile = _event_profile_model_train_step(
             sparse,
@@ -8911,12 +9048,15 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
             iters=args.event_iters,
             warmup=args.event_warmup,
             benchmark_loss=args.benchmark_loss,
+            autocast_dtype=amp_dtype,
         ) if args.event_profile else {}
         coverage = _active_union_coverage_metrics(sparse)
         sparse_param_count_value = sum(param.numel() for param in sparse.parameters())
         row = {
             "active_union_cap": None if cap <= 0 else cap,
             "dtype": str(dtype),
+            "amp_enabled": amp_dtype is not None,
+            "param_dtype": str(param_dtype),
             "batch_size": config.training.batch_size,
             "seq_len": config.training.seq_len,
             "tokens": tokens_per_batch,
@@ -8938,6 +9078,13 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
             "sparse_optimizer_ms": sparse_train["optimizer_ms"],
             "sparse_total_step_ms": sparse_train["total_step_ms"],
             "sparse_loss": sparse_train["loss"],
+            "dense_eval_nll": dense_quality_nll,
+            "sparse_eval_nll": sparse_quality_nll,
+            "eval_nll_gap": (
+                sparse_quality_nll - dense_quality_nll
+                if dense_quality_nll is not None and sparse_quality_nll is not None
+                else None
+            ),
             "total_step_speedup": dense_train["total_step_ms"] / max(sparse_train["total_step_ms"], 1e-12),
             "forward_backward_speedup": dense_train["forward_backward_ms"]
             / max(sparse_train["forward_backward_ms"], 1e-12),
@@ -8979,10 +9126,13 @@ def cmd_benchmark_active_union_model_train_step(args: argparse.Namespace) -> Non
     report = {
         "mode": "benchmark_active_union_model_train_step",
         "checkpoint": args.dense_checkpoint,
+        "sparse_checkpoint": args.sparse_checkpoint,
         "random_init": bool(args.random_init),
         "random_init_matrix_scale": float(args.random_init_matrix_scale),
         "benchmark_loss": args.benchmark_loss,
         "device": str(device),
+        "amp_enabled": amp_dtype is not None,
+        "param_dtype": str(param_dtype),
         "iters": args.iters,
         "warmup": args.warmup,
         "component_iters": args.component_iters,
@@ -11491,6 +11641,10 @@ def build_parser() -> argparse.ArgumentParser:
     continuation.add_argument("--seed", type=int)
     continuation.add_argument("--progress", type=int, default=0)
     continuation.add_argument("--output")
+    continuation.add_argument(
+        "--save-checkpoint-dir",
+        help="Optional directory to save final dense/sparse continuation checkpoints.",
+    )
     continuation.set_defaults(func=cmd_static_cluster_pool_continuation)
 
     grad_align = sub.add_parser("static-cluster-pool-gradient-alignment")
@@ -11616,6 +11770,14 @@ def build_parser() -> argparse.ArgumentParser:
     active_union_model_bench = sub.add_parser("benchmark-active-union-model-train-step")
     active_union_model_bench.add_argument("--config", required=True)
     active_union_model_bench.add_argument("--dense-checkpoint")
+    active_union_model_bench.add_argument(
+        "--sparse-checkpoint",
+        help=(
+            "Optional checkpoint for the sparse active-union model after its modules "
+            "are installed. This tests trained packed sparse weights instead of a "
+            "fresh handoff from the dense checkpoint."
+        ),
+    )
     active_union_model_bench.add_argument("--random-init", action="store_true")
     active_union_model_bench.add_argument(
         "--random-init-matrix-scale",
@@ -11651,12 +11813,28 @@ def build_parser() -> argparse.ArgumentParser:
     active_union_model_bench.add_argument("--aggregation", choices=["mean", "max"], default="mean")
     active_union_model_bench.add_argument("--cluster-iters", type=int, default=4)
     active_union_model_bench.add_argument("--dtype", choices=["fp16", "bf16", "fp32"], default="fp16")
+    active_union_model_bench.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For fp16/bf16 CUDA benchmarks, keep parameters/optimizer in fp32 and "
+            "autocast forward/backward. Disable only to benchmark raw low-precision "
+            "parameter updates."
+        ),
+    )
     active_union_model_bench.add_argument("--lr", type=float)
     active_union_model_bench.add_argument("--weight-decay", type=float)
     active_union_model_bench.add_argument("--iters", type=int, default=5)
     active_union_model_bench.add_argument("--warmup", type=int, default=1)
     active_union_model_bench.add_argument("--component-iters", type=int, default=3)
     active_union_model_bench.add_argument("--component-warmup", type=int, default=1)
+    active_union_model_bench.add_argument(
+        "--quality-eval-batches",
+        type=int,
+        default=0,
+        help="Optional eval batches for real dense/sparse NLL before speed timing. Does not affect timing.",
+    )
     active_union_model_bench.add_argument("--event-profile", action=argparse.BooleanOptionalAction, default=True)
     active_union_model_bench.add_argument("--event-iters", type=int, default=3)
     active_union_model_bench.add_argument("--event-warmup", type=int, default=1)

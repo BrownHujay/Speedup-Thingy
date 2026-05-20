@@ -1,0 +1,139 @@
+{
+  "active_union_cap": 320,
+  "active_union_layer_caps": [],
+  "aggregation": "mean",
+  "batch_size": 32,
+  "calibration_tokens": 8192,
+  "candidate_m": 192,
+  "checkpoint": "runs/blackwell_20260519_190504/ffnv2_synthetic_d512_h4096/checkpoints/dense_step400.pt",
+  "cluster_iters": 4,
+  "clusters": 16,
+  "device": "cuda",
+  "eval_batches": 32,
+  "eval_steps": [
+    0,
+    300
+  ],
+  "eval_tokens": 65536,
+  "lr": 0.0001,
+  "mode": "static_cluster_pool_continuation",
+  "rank": 64,
+  "rows": [
+    {
+      "active_union_cap": 320,
+      "active_union_layer_caps": [],
+      "eval_curve": [
+        {
+          "nll_per_token": 7.890487790107727,
+          "step": 0.0
+        },
+        {
+          "nll_per_token": 7.655830606818199,
+          "step": 300.0
+        }
+      ],
+      "final_coverage": {
+        "mean": {
+          "coverage_fraction": 0.052327473958333336,
+          "unique_selected_neurons": 214.33333333333334
+        },
+        "rows": [
+          {
+            "coverage_fraction": 0.078125,
+            "layer": 0.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.0478515625,
+            "layer": 1.0,
+            "unique_selected_neurons": 196.0
+          },
+          {
+            "coverage_fraction": 0.04736328125,
+            "layer": 2.0,
+            "unique_selected_neurons": 194.0
+          },
+          {
+            "coverage_fraction": 0.046875,
+            "layer": 3.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.046875,
+            "layer": 4.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.046875,
+            "layer": 5.0,
+            "unique_selected_neurons": 192.0
+          }
+        ]
+      },
+      "final_grad_row_metrics": {},
+      "final_gradient_alignment": {},
+      "final_nll_per_token": 7.655830606818199,
+      "first_train_nll": 7.863929271697998,
+      "initial_calibration_avg_cluster_imbalance": 2.048828125,
+      "initial_calibration_avg_nonempty_clusters": 16.0,
+      "initial_coverage": {
+        "mean": {
+          "coverage_fraction": 0.052327473958333336,
+          "unique_selected_neurons": 214.33333333333334
+        },
+        "rows": [
+          {
+            "coverage_fraction": 0.078125,
+            "layer": 0.0,
+            "unique_selected_neurons": 320.0
+          },
+          {
+            "coverage_fraction": 0.0478515625,
+            "layer": 1.0,
+            "unique_selected_neurons": 196.0
+          },
+          {
+            "coverage_fraction": 0.04736328125,
+            "layer": 2.0,
+            "unique_selected_neurons": 194.0
+          },
+          {
+            "coverage_fraction": 0.046875,
+            "layer": 3.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.046875,
+            "layer": 4.0,
+            "unique_selected_neurons": 192.0
+          },
+          {
+            "coverage_fraction": 0.046875,
+            "layer": 5.0,
+            "unique_selected_neurons": 192.0
+          }
+        ]
+      },
+      "initial_gradient_alignment": {},
+      "initial_nll_per_token": 7.890487790107727,
+      "last_train_nll": 7.641623497009277,
+      "mean_train_nll": 7.6621841033299765,
+      "nll_delta": -0.2346571832895279,
+      "optimizer_state_loaded": false,
+      "refresh_events": [],
+      "refresh_interval": 0,
+      "sparse_ffn_kind": "active_union_packed",
+      "steps": 300,
+      "tokens_per_second": 285321.4806703971,
+      "tokens_trained": 614400,
+      "train_seconds": 2.1533604779997404,
+      "variant": "active_union_packed"
+    }
+  ],
+  "score_mode": "sum",
+  "seq_len": 64,
+  "sparse_ffn_kind": "active_union_packed",
+  "steps": 300,
+  "tokens_per_batch": 2048,
+  "weight_decay": 0.0
+}

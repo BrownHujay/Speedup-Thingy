@@ -76,16 +76,6 @@ def _flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch
     _require_cuda_tensor(q, k, v)
     if not q.is_cuda:
         return reference.k_flash_causal_dense(q, k, v)
-    flash_dtypes = {torch.float16, torch.bfloat16}
-    if q.dtype not in flash_dtypes or k.dtype != q.dtype or v.dtype != q.dtype:
-        if STRICT_CUDA and REQUIRE_FLASH:
-            raise RuntimeError(
-                "FlashAttention requires q/k/v to all be fp16 or bf16; "
-                f"got q={q.dtype}, k={k.dtype}, v={v.dtype}"
-            )
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
-    if not (STRICT_CUDA and REQUIRE_FLASH):
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
     try:
         from torch.nn.attention import SDPBackend, sdpa_kernel
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import islice
+import os
 from pathlib import Path
 
 import torch
@@ -70,6 +71,14 @@ def _load_texts(config: DataConfig) -> list[str]:
             sample_count = max(1024, min(100_000, config.max_tokens // 80 + 2_048))
             return [str(x["text"]) for x in islice(ds, sample_count)]
     except Exception:
+        if os.environ.get("RTE_STRICT_DATASET", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }:
+            raise
         return [
             "Once upon a time, a small model learned to predict the next token.",
             "The training stream is deterministic, packed, and shared by every run.",

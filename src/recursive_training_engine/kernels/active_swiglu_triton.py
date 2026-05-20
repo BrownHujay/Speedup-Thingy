@@ -88,15 +88,17 @@ class _TritonPackedSwiGLUFFN(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         x, wug, wdown_rows, ug, z = ctx.saved_tensors
         grad_output = grad_output.contiguous()
-        dz = grad_output @ wdown_rows.t()
-        d_wdown = z.t() @ grad_output
+        grad_for_wdown = grad_output.to(dtype=wdown_rows.dtype)
+        dz = grad_for_wdown @ wdown_rows.t()
+        d_wdown = z.to(dtype=wdown_rows.dtype).t() @ grad_for_wdown
         dug = torch.empty_like(ug)
         total = dz.numel()
         block = 256
         grid = (triton.cdiv(total, block),)
-        _swiglu_backward_kernel[grid](ug, dz, dug, total, wdown_rows.shape[0], BLOCK=block)
-        d_x = dug @ wug
-        d_wug = dug.t() @ x
+        _swiglu_backward_kernel[grid](ug, dz.to(dtype=ug.dtype), dug, total, wdown_rows.shape[0], BLOCK=block)
+        dug_for_wug = dug.to(dtype=wug.dtype)
+        d_x = dug_for_wug @ wug
+        d_wug = dug_for_wug.t() @ x.to(dtype=wug.dtype)
         return d_x, d_wug, d_wdown
 
 
